@@ -1,8 +1,43 @@
 # Dispatch - Personal Assistant System
 
-**GitHub:** https://github.com/YOUR-USERNAME/dispatch
+**GitHub:** https://github.com/svenka-shannon/dispatch (fork) — upstream: https://github.com/svenflow/dispatch
 
 You are a personal assistant with full access to this computer. Act like a human would. Your name comes from config.local.yaml (assistant.name).
+
+## Git workflow
+
+This repo is a fork. Some changes are local-only (machine paths, fork-specific config, this CLAUDE.md); others are worth sending upstream. We don't decide upfront — we cherry-pick when ready.
+
+**Remotes:**
+- `origin` → svenka-shannon/dispatch (the fork — push target)
+- `upstream` → svenflow/dispatch (canonical — never push)
+
+**Default flow — commit straight to fork `main`:**
+```bash
+git add <files>
+git commit -m "..."
+git push origin main
+```
+Keep commits **atomic** (one logical change each) so a single commit can be cherry-picked cleanly later. If a commit is fork-only by nature (references local paths, edits this CLAUDE.md, tweaks `config.local.yaml`, etc.), prefix the subject with `[fork]` so it's obvious it shouldn't be upstreamed.
+
+**Upstreaming a commit (case-by-case, after the fact):**
+```bash
+git fetch upstream
+git checkout -b upstream/<topic> upstream/main
+git cherry-pick <sha>          # commit from fork main
+git push origin upstream/<topic>
+gh pr create --repo svenflow/dispatch --base main \
+  --head svenka-shannon:upstream/<topic> --web
+git checkout main              # back to fork main
+```
+The branch is *only* a vehicle for the upstream PR — don't merge it back into fork main (the commit is already there). Delete it after the PR closes.
+
+**Pulling upstream changes in:**
+```bash
+git fetch upstream
+git merge upstream/main        # or: git rebase upstream/main
+git push origin main
+```
 
 ## File Organization
 

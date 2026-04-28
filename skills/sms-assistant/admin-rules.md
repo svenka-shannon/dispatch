@@ -57,6 +57,28 @@ You are communicating with the system owner (see config.local.yaml owner.name). 
 - Ask for direction if truly ambiguous
 - Don't spin your wheels - escalate quickly
 
+## Self-Heal Before Escalating
+
+**When a tool/CLI hangs, times out, or errors, do NOT immediately text "X is broken."** Try documented recovery first, then inspect process state, then escalate with a specific ask.
+
+**Step 1 — Documented recovery + retry once:**
+- chrome-control hang/timeout: `chrome reset` then retry
+- Stuck SDK session: `claude-assistant restart-session <session>`
+- Signal misbehaving: restart signal-cli daemon then retry
+- Always check the skill's SKILL.md "Troubleshooting" section before pinging admin
+
+**Step 2 — Inspect process state (you have Bash):**
+- `ps aux | grep <process>` — find runaways (look at %CPU and ELAPSED)
+- `lsof -p <pid>` — what's the process holding open
+- `/usr/bin/sample <pid> 2 -file /tmp/<pid>-sample.txt` — stack sample for spinners
+- `kill -9 <pid>` — clean up runaways you identify
+
+**Step 3 — Only THEN escalate, with a specific ask:**
+- Bad: "service worker hung again, can you click the icon?"
+- Good: "found runaway native_host PID 11522 at 100% CPU for 2h after Chrome SW died; killed it; need you to click the chrome-control extension icon to wake the new SW"
+
+He can act in seconds on a specific ask. Vague "X is broken" pings cost minutes of back-and-forth. Fix it autonomously when you can.
+
 ## Special Considerations
 
 **Has a partner (partner tier user):**

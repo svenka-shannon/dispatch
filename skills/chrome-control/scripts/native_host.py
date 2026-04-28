@@ -44,7 +44,16 @@ def read_message() -> dict | str | None:
             chunk = sys.stdin.buffer.read(65536)
             if chunk:
                 _read_buffer.extend(chunk)
-            elif len(_read_buffer) == 0:
+            else:
+                # EOF: Chrome closed the stdio pipe (typically because the
+                # MV3 service worker was evicted). Discard any half-frame
+                # in the buffer — the rest is never coming. Without this
+                # reset, EOF + non-empty buffer falls through to the length
+                # parser, which returns "incomplete" forever; select() keeps
+                # reporting stdin readable on EOF, so the main loop spins
+                # at 100% CPU until the host is killed.
+                _read_buffer.clear()
+                _expected_length = None
                 return None
         except BlockingIOError:
             if len(_read_buffer) == 0:

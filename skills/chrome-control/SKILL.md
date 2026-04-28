@@ -73,6 +73,26 @@ The CLI talks to a Chrome extension via a native messaging host. One-time setup:
 
 **Gotcha — `allowed_origins` does NOT accept wildcards.** Chrome's native messaging spec requires `allowed_origins` to be exact `chrome-extension://<id>/` URLs. If you write `chrome-extension://*` the manifest parses but every `connectNative()` call fails with the misleading error `Specified native messaging host not found` (background.js will log this in a tight reconnect loop). The installer above requires the ID up front to prevent this.
 
+## Recovery: `chrome reset` (when commands hang)
+
+If `chrome ping` or any other command **times out** — even though `/tmp/chrome_control.log` shows happy heartbeats and Chrome looks fine — the extension's MV3 service worker has gone unresponsive. This typically happens after a long-running flow (signups, OAuth, captchas) where Chrome evicts the SW mid-stream. The native host on the other end can end up pegged at 100% CPU.
+
+**Symptoms (recognize these, don't ask the user to debug):**
+- `chrome ping` hangs / times out
+- `ps aux | grep native_host` shows a `native_host.py` process at high CPU (`%CPU` ≥ 50)
+- `/tmp/chrome_control.log` keeps showing heartbeats, no errors — log alone won't reveal it
+- Multiple `/tmp/chrome_control_*.sock` files exist
+
+**Recovery (do this BEFORE asking the user):**
+
+```bash
+chrome reset
+```
+
+That subcommand kills any native_host.py processes, clears orphaned sockets, and wipes the registry. Then ask the user to **click the chrome-control extension's toolbar icon** (or the refresh button on its tile in `chrome://extensions/`). That gesture re-runs `connectNative()`, which spawns a fresh host and re-registers the profile.
+
+`chrome reset` is safe to run anytime — Chrome will respawn a host the next time the extension calls `connectNative()`. There is no way to wake a dead MV3 service worker from outside Chrome without a user gesture (or a navigation/alarm/etc.), so the click is unavoidable. Just don't make the user troubleshoot the wedge first.
+
 ## Multi-Profile Support
 
 The extension supports multiple Chrome profiles simultaneously. Each profile is identified by a unique UUID stored in `chrome.storage.local`.
@@ -398,6 +418,39 @@ chrome iframe-click <tab_id> 'text:Next'
 security find-generic-password -s "service-name" -w
 security find-generic-password -a "account@gmail.com" -w
 ```
+
+### When clicks fail on auth/SSO pages — escalate, don't retry-poll
+
+If a click on a login, SSO, captcha, or "verify it's you" page fails (`err=1`,
+no navigation, account-chooser tile doesn't take, captcha won't dismiss), **do
+not enter a poll loop** waiting for a navigation that isn't going to happen.
+That just burns turns and leaves the admin's screen with a stuck modal.
+
+**Rule of thumb:** at most **two click attempts** on an auth-related page.
+If the second one doesn't produce a state change within ~5s:
+
+1. Take a screenshot — `chrome screenshot <tab_id> /tmp/auth-stuck.jpg`
+2. Try `chrome iframe-click` once if you haven't already (it dispatches the
+   full mouse-event sequence and works around Google/Apple/Microsoft SSO bot
+   detection — see the OAuth section above).
+3. If still stuck, **SMS the admin** with the screenshot path and a one-line
+   ask, e.g. "stuck on Google account chooser — can you click your account
+   and reply done?"
+4. Wait for the admin reply, then continue. Don't keep polling tabs/URL
+   while you wait — go idle.
+
+**Why:** auth pages are precisely where automation fails most: hardened DOM
+(account tiles in cross-origin iframes), invisible reCAPTCHA risk scoring,
+"this browser may not be supported" interstitials, device-trust prompts. The
+admin can clear all of these in two seconds; the assistant can spend an hour
+retrying and never get past it.
+
+**Signals that you're on an auth page where this rule applies:**
+- URL contains `accounts.google.com`, `appleid.apple.com`, `login.microsoft`,
+  `oauth`, `signin`, `auth`, `verify`
+- Page text mentions "Choose an account", "Verify it's you", "I'm not a robot",
+  "Continue with Google/Apple", "Two-step verification"
+- A `chrome click` returned `err=1` and the next page-read shows no URL change
 
 ## Extension Reload
 

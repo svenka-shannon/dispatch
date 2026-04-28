@@ -33,6 +33,7 @@ Usage:
     chrome [-p PROFILE] console <tab_id>  Read console messages
     chrome [-p PROFILE] network <tab_id>  Read network requests
     chrome [-p PROFILE] ping              Test connection
+    chrome reset                          Kill stuck native_host processes
 
 Options:
     -p, --profile PROFILE    Target profile (name, email prefix, or index)
@@ -145,6 +146,29 @@ def parse_tab_id(value: str) -> int:
         sys.exit(1)
 
 
+# Schemes that are valid Chrome navigation targets without needing https:// prepended.
+# Without this list, `chrome open about:blank` becomes `https://about:blank` which
+# the extension rejects with "Invalid url" — the actual error users hit in 2026-04.
+_VALID_URL_SCHEMES = (
+    "http://", "https://", "file://",
+    "about:", "chrome:", "chrome-extension:", "edge:", "view-source:",
+    "data:", "javascript:", "blob:", "ftp:", "mailto:",
+)
+
+
+def normalize_url(url: str) -> str:
+    """Add https:// only when the URL has no recognized scheme.
+
+    Preserves about:, chrome:, data:, javascript:, file://, etc. so internal
+    pages and special URIs aren't mangled into 'https://about:blank' style
+    nonsense.
+    """
+    lowered = url.lower()
+    if any(lowered.startswith(s) for s in _VALID_URL_SCHEMES):
+        return url
+    return "https://" + url
+
+
 def get_result(response):
     """Extract result from response, handling errors."""
     if "error" in response:
@@ -172,9 +196,7 @@ def cmd_open(client, args):
     if len(args) < 1:
         print("Usage: chrome open <url>", file=sys.stderr)
         sys.exit(1)
-    url = args[0]
-    if not url.startswith(("http://", "https://", "file://")):
-        url = "https://" + url
+    url = normalize_url(args[0])
     result = get_result(client.send("open_tab", url=url))
     print(f"Opened tab {result.get('tabId')}: {url}")
 
@@ -206,8 +228,8 @@ def cmd_navigate(client, args):
         sys.exit(1)
     tab_id = parse_tab_id(args[0])
     url = args[1]
-    if url not in ("back", "forward") and not url.startswith(("http://", "https://", "file://")):
-        url = "https://" + url
+    if url not in ("back", "forward"):
+        url = normalize_url(url)
     get_result(client.send("navigate", tabId=tab_id, url=url))
     print(f"Navigated tab {tab_id} to {url}")
 
@@ -585,6 +607,69 @@ def cmd_ping(client, args):
         sys.exit(1)
 
 
+def cmd_reset(client, args):
+    """Kill any stuck native_host.py processes and clear orphaned sockets.
+
+    Use when `chrome ping` hangs or commands time out: typically means the
+    Chrome extension's MV3 service worker was evicted while the native host
+    had a half-frame buffered, leaving the host pegged at 100% CPU. Killing
+    it here is safe — Chrome respawns a fresh host the next time the
+    extension calls connectNative().
+
+    After running this, the user must wake the extension by clicking its
+    toolbar icon (or the reload button on its tile in chrome://extensions/).
+    """
+    # Find all native_host.py processes under this user
+    try:
+        out = subprocess.check_output(
+            ["pgrep", "-u", str(os.getuid()), "-f", "chrome-control/scripts/native_host"],
+            text=True,
+        ).strip()
+        pids = [int(p) for p in out.splitlines() if p.strip()]
+    except subprocess.CalledProcessError:
+        pids = []
+
+    killed = []
+    for pid in pids:
+        try:
+            os.kill(pid, 15)  # SIGTERM
+            killed.append(pid)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            print(f"Skipped pid {pid}: permission denied", file=sys.stderr)
+
+    # Give them a moment, then SIGKILL anything still alive
+    if killed:
+        import time as _t
+        _t.sleep(0.3)
+        for pid in killed:
+            try:
+                os.kill(pid, 0)
+                os.kill(pid, 9)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    # Clear orphaned sockets and registry
+    socket_count = 0
+    for sock_path in Path("/tmp").glob("chrome_control_*.sock"):
+        try:
+            sock_path.unlink()
+            socket_count += 1
+        except FileNotFoundError:
+            pass
+
+    try:
+        Path(REGISTRY_PATH).unlink()
+    except FileNotFoundError:
+        pass
+
+    print(f"Killed {len(killed)} native_host process(es), removed {socket_count} socket(s).")
+    print("Now click the chrome-control extension's toolbar icon (or its")
+    print("refresh button in chrome://extensions/) to wake it up. The next")
+    print("`chrome` command will reconnect.")
+
+
 def cmd_profiles(client, args):
     """List available Chrome profiles."""
     profiles = get_profiles()
@@ -640,6 +725,7 @@ COMMANDS = {
     "network": cmd_network,
     "ping": cmd_ping,
     "click-by-name": cmd_click_by_name,
+    "reset": None,  # Special case - handled before client creation
 }
 
 
@@ -669,6 +755,11 @@ def main():
     # Handle profiles command (no client needed)
     if command == "profiles":
         cmd_profiles(None, cmd_args)
+        return
+
+    # Handle reset command (no client needed; runs even when host is wedged)
+    if command == "reset":
+        cmd_reset(None, cmd_args)
         return
 
     if command not in COMMANDS:

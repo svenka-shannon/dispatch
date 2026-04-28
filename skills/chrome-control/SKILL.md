@@ -57,7 +57,21 @@ chrome close 123456
 
 ## Setup
 
-Requires Chrome with the Chrome Control extension loaded and native messaging host running.
+The CLI talks to a Chrome extension via a native messaging host. One-time setup:
+
+1. **Load the extension** — open `chrome://extensions/`, enable Developer Mode, click "Load unpacked", and select `~/.claude/skills/chrome-control/extension/`.
+2. **Copy the extension ID** — Chrome shows a 32-character ID under the loaded extension (e.g. `cpmffhepnhgdhdamobkamndnfndilngo`). The ID is deterministic from the unpacked path, so it stays stable across reloads.
+3. **Install the native messaging host manifest**, passing the ID:
+   ```bash
+   ~/.claude/skills/chrome-control/scripts/install_native_host.sh <extension_id>
+   ```
+4. **Reload the extension** in `chrome://extensions/` once (so it picks up the manifest), then verify:
+   ```bash
+   ~/.claude/skills/chrome-control/scripts/chrome ping
+   # → Connected to Chrome Control extension
+   ```
+
+**Gotcha — `allowed_origins` does NOT accept wildcards.** Chrome's native messaging spec requires `allowed_origins` to be exact `chrome-extension://<id>/` URLs. If you write `chrome-extension://*` the manifest parses but every `connectNative()` call fails with the misleading error `Specified native messaging host not found` (background.js will log this in a tight reconnect loop). The installer above requires the ID up front to prevent this.
 
 ## Multi-Profile Support
 

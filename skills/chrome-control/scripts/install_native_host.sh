@@ -6,6 +6,19 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 HOST_NAME="com.dispatch.chrome_control"
 
+EXTENSION_ID="${1:-}"
+if [ -z "$EXTENSION_ID" ]; then
+  echo "Usage: $0 <extension_id>" >&2
+  echo "" >&2
+  echo "Chrome's native messaging manifest does NOT accept wildcards in" >&2
+  echo "allowed_origins — it must be the exact extension ID." >&2
+  echo "" >&2
+  echo "To find the ID: load $SCRIPT_DIR/../extension as an unpacked" >&2
+  echo "extension at chrome://extensions/ (Developer Mode), then copy the" >&2
+  echo "32-char ID shown under the extension." >&2
+  exit 1
+fi
+
 # Create native host manifest
 MANIFEST_DIR="$HOME/Library/Application Support/Google/Chrome/NativeMessagingHosts"
 mkdir -p "$MANIFEST_DIR"
@@ -17,7 +30,7 @@ cat > "$MANIFEST_DIR/$HOST_NAME.json" << EOF
   "path": "$SCRIPT_DIR/native_host",
   "type": "stdio",
   "allowed_origins": [
-    "chrome-extension://*"
+    "chrome-extension://$EXTENSION_ID/"
   ]
 }
 EOF

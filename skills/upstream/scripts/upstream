@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+# Cherry-pick one or more commits from your fork's main onto a fresh branch
+# from upstream/main, push the branch, and publish a PR against upstream.
+# See ~/.claude/skills/upstream/SKILL.md for full docs.
+
+set -euo pipefail
+
+UPSTREAM_REMOTE="upstream"
+ORIGIN_REMOTE="origin"
+
+SHAS=()
+BRANCH_NAME=""
+PUBLISH_MODE="create"   # create | web
+DRAFT=0
+TITLE=""
+BODY=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --name)
+            [[ $# -ge 2 ]] || { echo "Error: --name requires a value" >&2; exit 1; }
+            BRANCH_NAME="$2"; shift 2
+            ;;
+        --web)
+            PUBLISH_MODE="web"; shift
+            ;;
+        --draft)
+            DRAFT=1; shift
+            ;;
+        --title)
+            [[ $# -ge 2 ]] || { echo "Error: --title requires a value" >&2; exit 1; }
+            TITLE="$2"; shift 2
+            ;;
+        --body)
+            [[ $# -ge 2 ]] || { echo "Error: --body requires a value" >&2; exit 1; }
+            BODY="$2"; shift 2
+            ;;
+        --help|-h)
+            cat <<'EOF'
+upstream — cherry-pick fork commits onto upstream/main and PR them.
+
+Usage:
+  upstream <sha> [<sha>...] [options]
+
+Options:
+  --name <branch>    Override auto-generated branch name (default: upstream/<slug>)
+  --draft            Open the PR as a draft
+  --web              Open browser PR composer instead of publishing immediately
+  --title <title>    Override PR title (default: first commit subject)
+  --body <body>      Override PR body (default: first commit body, or generated)
+
+If no SHA is given, defaults to HEAD.
+
+Requires:
+  - 'origin' remote = your fork
+  - 'upstream' remote = canonical repo
+  - gh CLI authenticated (unless --web is used)
+EOF
+            exit 0
+            ;;
+        -*)
+            echo "Unknown option: $1" >&2
+            exit 1
+            ;;
+        *)
+            SHAS+=("$1"); shift
+            ;;
+    esac
+done
+
+# Default to HEAD if no SHA provided
+[[ ${#SHAS[@]} -gt 0 ]] || SHAS=("HEAD")
+
+# --- Validation ----------------------------------------------------------
+
+git rev-parse --git-dir >/dev/null 2>&1 || {
+    echo "Error: not in a git repository" >&2; exit 1; }
+
+git remote get-url "$UPSTREAM_REMOTE" >/dev/null 2>&1 || {
+    echo "Error: no '$UPSTREAM_REMOTE' remote configured." >&2
+    echo "  Add it: git remote add upstream <url>" >&2
+    exit 1; }
+
+git remote get-url "$ORIGIN_REMOTE" >/dev/null 2>&1 || {
+    echo "Error: no '$ORIGIN_REMOTE' remote (this should be your fork)." >&2
+    exit 1; }
+
+if [[ "$PUBLISH_MODE" == "create" ]] && ! command -v gh >/dev/null 2>&1; then
+    echo "Error: gh CLI not found and --web not specified." >&2
+    echo "  Install: brew install gh && gh auth login" >&2
+    echo "  Or pass --web to skip gh and just open the browser composer." >&2
+    exit 1
+fi
+
+if ! git diff --quiet || ! git diff --cached --quiet; then
+    echo "Error: working tree has uncommitted changes. Commit or stash first." >&2
+    exit 1
+fi
+
+# Resolve all SHAs
+RESOLVED=()
+for sha in "${SHAS[@]}"; do
+    r=$(git rev-parse --verify "$sha^{commit}" 2>/dev/null) || {
+        echo "Error: commit '$sha' not found" >&2; exit 1; }
+    RESOLVED+=("$r")
+done
+
+FIRST_SHA="${RESOLVED[0]}"
+FIRST_SUBJECT=$(git log -1 --format=%s "$FIRST_SHA")
+
+echo "Upstreaming ${#RESOLVED[@]} commit(s):"
+for r in "${RESOLVED[@]}"; do
+    echo "  ${r:0:12}  $(git log -1 --format=%s "$r")"
+done
+
+# --- Fetch upstream and figure out its default branch --------------------
+
+echo "→ Fetching $UPSTREAM_REMOTE..."
+git fetch --quiet "$UPSTREAM_REMOTE"
+
+UPSTREAM_DEFAULT=""
+if upstream_head=$(git symbolic-ref "refs/remotes/$UPSTREAM_REMOTE/HEAD" 2>/dev/null); then
+    UPSTREAM_DEFAULT="${upstream_head#refs/remotes/$UPSTREAM_REMOTE/}"
+fi
+if [[ -z "$UPSTREAM_DEFAULT" ]]; then
+    if git rev-parse --verify "$UPSTREAM_REMOTE/main" >/dev/null 2>&1; then
+        UPSTREAM_DEFAULT="main"
+    elif git rev-parse --verify "$UPSTREAM_REMOTE/master" >/dev/null 2>&1; then
+        UPSTREAM_DEFAULT="master"
+    else
+        echo "Error: cannot determine $UPSTREAM_REMOTE's default branch." >&2
+        echo "  Try: git remote set-head $UPSTREAM_REMOTE -a" >&2
+        exit 1
+    fi
+fi
+echo "  Upstream base: $UPSTREAM_REMOTE/$UPSTREAM_DEFAULT"
+
+# Refuse if all commits are already in upstream
+ALL_ANCESTORS=1
+for r in "${RESOLVED[@]}"; do
+    if ! git merge-base --is-ancestor "$r" "$UPSTREAM_REMOTE/$UPSTREAM_DEFAULT"; then
+        ALL_ANCESTORS=0; break
+    fi
+done
+if [[ $ALL_ANCESTORS -eq 1 ]]; then
+    echo "Nothing to do: all commits are already in $UPSTREAM_REMOTE/$UPSTREAM_DEFAULT." >&2
+    exit 0
+fi
+
+# --- Branch name ---------------------------------------------------------
+
+if [[ -z "$BRANCH_NAME" ]]; then
+    SLUG=$(printf '%s' "$FIRST_SUBJECT" \
+        | sed -E 's/^\[[^]]+\][[:space:]]*//' \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g' \
+        | cut -c1-50)
+    [[ -n "$SLUG" ]] || SLUG="commit-${FIRST_SHA:0:8}"
+    BRANCH_NAME="upstream/$SLUG"
+fi
+echo "  New branch:    $BRANCH_NAME"
+
+if git rev-parse --verify "$BRANCH_NAME" >/dev/null 2>&1; then
+    echo "Error: branch '$BRANCH_NAME' already exists locally. Pass --name to override." >&2
+    exit 1
+fi
+
+# --- Save where we were so we can return ---------------------------------
+
+if ORIG_BRANCH=$(git symbolic-ref --short -q HEAD); then
+    RETURN_REF="$ORIG_BRANCH"
+else
+    RETURN_REF=$(git rev-parse HEAD)
+fi
+
+# --- Branch + cherry-pick ------------------------------------------------
+
+echo "→ Creating branch $BRANCH_NAME from $UPSTREAM_REMOTE/$UPSTREAM_DEFAULT..."
+git checkout --quiet -b "$BRANCH_NAME" "$UPSTREAM_REMOTE/$UPSTREAM_DEFAULT"
+
+for r in "${RESOLVED[@]}"; do
+    echo "→ Cherry-picking ${r:0:12}..."
+    if ! git cherry-pick "$r"; then
+        cat >&2 <<EOF
+
+Cherry-pick conflict on ${r:0:12}.
+The commit likely depends on other fork-only changes not yet upstream.
+
+You're now on branch '$BRANCH_NAME'. Options:
+
+  # Resolve in your editor, stage, then continue:
+  git cherry-pick --continue
+  # ...repeat for any remaining commits, then:
+  git push $ORIGIN_REMOTE $BRANCH_NAME
+  gh pr create --repo <upstream-org/repo> --base $UPSTREAM_DEFAULT \\
+    --head <fork-org>:$BRANCH_NAME
+
+  # Or bail out:
+  git cherry-pick --abort
+  git checkout $RETURN_REF
+  git branch -D $BRANCH_NAME
+EOF
+        exit 1
+    fi
+done
+
+# --- Push ----------------------------------------------------------------
+
+echo "→ Pushing $BRANCH_NAME to $ORIGIN_REMOTE..."
+git push --quiet "$ORIGIN_REMOTE" "$BRANCH_NAME"
+
+# --- Parse remote URLs ---------------------------------------------------
+
+parse_repo() {
+    echo "$1" | sed -E 's|\.git$||; s|.*[:/]([^/]+/[^/]+)$|\1|'
+}
+parse_org() {
+    parse_repo "$1" | cut -d/ -f1
+}
+
+UPSTREAM_REPO=$(parse_repo "$(git remote get-url "$UPSTREAM_REMOTE")")
+FORK_ORG=$(parse_org "$(git remote get-url "$ORIGIN_REMOTE")")
+
+# --- PR title/body defaults ----------------------------------------------
+
+[[ -n "$TITLE" ]] || TITLE="$FIRST_SUBJECT"
+
+if [[ -z "$BODY" ]]; then
+    if [[ ${#RESOLVED[@]} -eq 1 ]]; then
+        BODY=$(git log -1 --format=%b "$FIRST_SHA")
+    else
+        BODY="Cherry-picked commits:"$'\n\n'
+        for r in "${RESOLVED[@]}"; do
+            BODY+="- $(git log -1 --format='%h %s' "$r")"$'\n'
+        done
+    fi
+fi
+
+# --- Open or publish PR --------------------------------------------------
+
+GH_ARGS=(--repo "$UPSTREAM_REPO" --base "$UPSTREAM_DEFAULT" --head "$FORK_ORG:$BRANCH_NAME")
+[[ $DRAFT -eq 1 ]] && GH_ARGS+=(--draft)
+
+PR_URL=""
+if [[ "$PUBLISH_MODE" == "web" ]]; then
+    echo "→ Opening PR composer in browser..."
+    gh pr create "${GH_ARGS[@]}" --web
+else
+    echo "→ Publishing PR..."
+    PR_URL=$(gh pr create "${GH_ARGS[@]}" --title "$TITLE" --body "$BODY")
+fi
+
+# --- Cleanup -------------------------------------------------------------
+
+echo "→ Returning to $RETURN_REF..."
+git checkout --quiet "$RETURN_REF"
+
+echo
+echo "✓ Done."
+[[ -n "$PR_URL" ]] && echo "  PR: $PR_URL"
+echo "  Cleanup when PR closes:"
+echo "    git push $ORIGIN_REMOTE --delete $BRANCH_NAME && git branch -D $BRANCH_NAME"

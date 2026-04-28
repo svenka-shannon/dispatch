@@ -83,8 +83,8 @@ if TYPE_CHECKING:
         PreCompactHookInput | NotificationHookInput
     )
 
-from assistant.common import SKILLS_DIR, UV
-from assistant import perf
+from assistant.common import SESSION_EFFORT, SKILLS_DIR, UV
+from assistant import perf, auth_mode
 from assistant.bus_helpers import produce_event, produce_session_event, compaction_triggered_payload
 
 # Script path fragments that indicate a message send
@@ -108,6 +108,29 @@ def _is_send_command(cmd: str) -> bool:
     return any(first_token.endswith(pattern) for pattern in _SEND_SCRIPT_PATTERNS)
 
 log = logging.getLogger(__name__)
+
+# Pin model aliases to current full model IDs. The SDK forwards both `model`
+# and `betas` to the `claude` CLI as `--model` / `--betas`, which works
+# identically for OAuth (Max plan) and ANTHROPIC_API_KEY auth modes.
+_MODEL_ALIASES = {
+    "opus": "claude-opus-4-7",
+    "sonnet": "claude-sonnet-4-6",
+    "haiku": "claude-haiku-4-5",
+}
+
+
+def _resolve_model_and_betas(model: str) -> tuple[str, list[str]]:
+    """Resolve a model alias or full ID to (model_id, betas).
+
+    Opus 4.7 and Sonnet 4.x get the 1M-context beta header. Other models
+    (Haiku, older versions) pass through with no betas.
+    """
+    model_id = _MODEL_ALIASES.get(model, model)
+    betas: list[str] = []
+    if model_id.startswith("claude-opus-4-7") or model_id.startswith("claude-sonnet-4"):
+        betas.append("context-1m-2025-08-07")
+    return model_id, betas
+
 
 # Per-session log directory
 SESSION_LOG_DIR = Path.home() / "dispatch/logs/sessions"
@@ -162,6 +185,10 @@ class SDKSession:
         model: str = "opus",
         producer=None,
         resume_id: Optional[str] = None,
+        *,
+        system_prompt_override: str | None = None,
+        extra_disallowed_tools: tuple[str, ...] = (),
+        bash_deny_regex: tuple[str, ...] = (),
     ):
         self.chat_id = chat_id
         self.contact_name = contact_name
@@ -172,6 +199,13 @@ class SDKSession:
         self.model = model
         self._producer = producer
         self.resume_id = resume_id
+
+        self._sp_override: str | None = system_prompt_override
+        self._extra_disallowed: tuple[str, ...] = tuple(extra_disallowed_tools)
+        # Pre-compile bash deny regexes; failures are skipped with a warning at first use.
+        self._bash_deny_regex: tuple[re.Pattern[str], ...] = tuple(
+            re.compile(pat) for pat in bash_deny_regex
+        )
 
         # Cached session_name using get_session_name (properly strips registry prefix)
         from assistant.common import get_session_name
@@ -193,6 +227,7 @@ class SDKSession:
         self.last_tool_activity_at: Optional[datetime] = None  # When last ToolResultBlock received
         self._error_count = 0
         self._consecutive_error_turns = 0
+        self.last_assistant_text: str | None = None
 
         # Heartbeat tracking
         self._last_heartbeat_at: float = time.time()
@@ -410,6 +445,52 @@ class SDKSession:
         self._block_limit_notified = True
         self._log.info(f"BLOCK_LIMIT | suppressing for {self.BLOCK_LIMIT_SUPPRESS_SECONDS}s until {self._block_limit_until.isoformat()}")
 
+    def _maybe_handle_oauth_quota_error(self, error_text: str) -> bool:
+        """If error_text indicates OAuth quota exhaustion, switch to API key.
+
+        Promotes ANTHROPIC_API_KEY_FALLBACK into ANTHROPIC_API_KEY (so the
+        next subprocess spawned by the SDK uses API credits), persists the
+        switch to state/auth_mode.json, and fires a health.quota_alert event.
+
+        Returns True if the error was an OAuth quota error (caller should
+        mark session for restart so the new subprocess inherits the key).
+        Returns False otherwise — caller handles the error normally.
+        """
+        if not auth_mode.is_oauth_quota_error(error_text):
+            return False
+        if auth_mode.is_api_key_mode():
+            # Already switched — this error came from API credits, not OAuth.
+            return False
+
+        self._log.warning(f"OAUTH_QUOTA_EXHAUSTED | falling back to API key | {error_text[:200]}")
+        log.warning(f"[{self.contact_name}] OAuth quota exhausted, falling back to API key")
+
+        promoted = auth_mode.promote_fallback_key()
+        auth_mode.write_mode(
+            "api_key" if promoted else "oauth",
+            reason="oauth_quota_exhausted" if promoted else "oauth_quota_exhausted_no_fallback",
+            error_text=error_text,
+            session_name=self._session_name,
+        )
+
+        if self._producer:
+            try:
+                produce_event(self._producer, "system", "health.quota_alert", {
+                    "schema_v": 1,
+                    "source": "oauth",
+                    "quota_type": "oauth_exhausted",
+                    "session_name": self._session_name,
+                    "chat_id": self.chat_id,
+                    "contact_name": self.contact_name,
+                    "error_text": error_text[:500],
+                    "auth_mode_after": "api_key" if promoted else "oauth",
+                    "fallback_promoted": promoted,
+                }, key=self._session_name, source="sdk_session")
+            except Exception as bus_err:
+                self._log.warning(f"OAUTH_QUOTA_BUS_WRITE_FAILED | {bus_err}")
+
+        return True
+
     def is_alive(self) -> bool:
         return self.running and self._task is not None and not self._task.done()
 
@@ -537,6 +618,12 @@ class SDKSession:
                     self._error_count += 1
                     self._log.error(f"ERROR #{self._error_count} | {e}")
                     log.error(f"[{self.contact_name}] Query error #{self._error_count}: {e}")
+                    # If this is OAuth quota exhaustion, switch to API-key mode
+                    # and exit the loop immediately so the manager respawns the
+                    # subprocess with ANTHROPIC_API_KEY set.
+                    if self._maybe_handle_oauth_quota_error(str(e)):
+                        self.running = False
+                        break
                     if self._error_count >= 3:
                         self._log.error("MAX_ERRORS | Session dead")
                         self.running = False
@@ -603,12 +690,23 @@ class SDKSession:
             # Buffer overflow is fatal - the SDK connection is broken
             error_str = str(e).lower()
             is_fatal = "buffer" in error_str or "1048576" in error_str
+            # OAuth quota exhaustion: also fatal, but we want a clean restart
+            # so the new subprocess inherits ANTHROPIC_API_KEY.
+            quota_handled = self._maybe_handle_oauth_quota_error(str(e))
             produce_session_event(self._producer, self.chat_id, "session.receive_error", {
                 "error": str(e), "error_count": self._error_count,
-                "is_fatal": is_fatal,
+                "is_fatal": is_fatal or quota_handled,
+                "oauth_quota_fallback": quota_handled,
                 "contact_name": self.contact_name,
             }, source="sdk")
-            if is_fatal:
+            if quota_handled:
+                self._log.error("RECEIVER_FATAL | OAuth quota exhausted - flipped to api_key, marking session dead for restart")
+                self.running = False
+                try:
+                    self._message_queue.put_nowait(QueueItem(None, "__SHUTDOWN__"))
+                except Exception:
+                    pass
+            elif is_fatal:
                 self._log.error("RECEIVER_FATAL | Buffer overflow - marking session dead")
                 self.running = False
                 # Wake _run_loop immediately instead of waiting for 30s timeout
@@ -671,14 +769,19 @@ class SDKSession:
         # silently stop responding when turns ran out mid-task.
         turn_limit = None
 
+        resolved_model, betas = _resolve_model_and_betas(self.model)
+        fallback_model_id, _ = _resolve_model_and_betas("sonnet")
+
         opts = ClaudeAgentOptions(
             cli_path=Path.home() / ".local" / "bin" / "claude",  # Use system CLI (not bundled) for OAuth compat
             cwd=self.cwd,
             allowed_tools=tools,
             permission_mode=perm_mode,
             setting_sources=["project"],  # Load CLAUDE.md + skills from cwd
-            model=self.model,
-            fallback_model=None if self.model == "sonnet" else "sonnet",  # Only triggers on 529; skip if already on sonnet
+            model=resolved_model,
+            fallback_model=None if resolved_model == fallback_model_id else fallback_model_id,  # Only triggers on 529
+            betas=betas,  # type: ignore[arg-type]  # 1M context for opus 4.7 / sonnet 4.x
+            effort=SESSION_EFFORT,
             max_turns=turn_limit,
             max_buffer_size=10 * 1024 * 1024,  # 10MB - prevents crash on large Task outputs
             hooks={
@@ -692,6 +795,16 @@ class SDKSession:
             }
         )
 
+        if self._sp_override:
+            opts.system_prompt = self._sp_override
+
+        if self._extra_disallowed:
+            existing = list(getattr(opts, "disallowed_tools", []) or [])
+            for t in self._extra_disallowed:
+                if t not in existing:
+                    existing.append(t)
+            opts.disallowed_tools = existing
+
         # Permission callback for tier-based security enforcement.
         # NOTE: family tier is intentionally excluded from SDK-level blocking.
         # Family restrictions are enforced via system prompt only (family-rules.md),
@@ -699,7 +812,7 @@ class SDKSession:
         # Do NOT add SDK-level can_use_tool blocks for family — admin explicitly
         # rejected this ("revert", "do not do sdk level blocks"). Only favorites
         # use hard SDK-level blocks here.
-        if self.tier == "favorite":
+        if self.tier == "favorite" or self._bash_deny_regex:
             opts.can_use_tool = self._permission_check
 
         # Session resume: use --resume <session_id> to continue a previous session.
@@ -723,6 +836,17 @@ class SDKSession:
         survives compaction.
         """
         self._log.info(f"PERM_CHECK | tool={tool_name} tier={self.tier}")
+
+        if self._bash_deny_regex and tool_name == "Bash":
+            cmd = tool_input.get("command", "") or ""
+            for pat in self._bash_deny_regex:
+                if pat.search(cmd):
+                    produce_session_event(self._producer, self.chat_id, "permission.denied", {
+                        "tool_name": tool_name, "tier": self.tier,
+                        "reason": f"Bash command blocked by deny regex: {pat.pattern}",
+                        "contact_name": self.contact_name,
+                    }, source="sdk")
+                    return PermissionResultDeny(message=f"Bash command blocked by deny regex: {pat.pattern}")
 
         if self.tier == "favorite":
             # Block file modifications
@@ -958,6 +1082,9 @@ class SDKSession:
             for block in message.content:
                 if isinstance(block, TextBlock):
                     self._log.info(f"OUT | {block.text}")
+
+                    if block.text:
+                        self.last_assistant_text = block.text
 
                     # Detect block limit messages from the API
                     self._detect_block_limit(block.text)

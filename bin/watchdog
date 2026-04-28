@@ -26,6 +26,36 @@ send_sms() {
   ~/.claude/skills/sms-assistant/scripts/send-sms "$ADMIN_PHONE" "$1" 2>/dev/null || true
 }
 
+# SDK auth-mode flip detection (runs every cycle, before daemon-up check).
+# When sdk_session.py exhausts the OAuth quota, it writes state/auth_mode.json
+# with mode=api_key. We diff against the last seen mode and SMS the admin on
+# transitions, oauth → api_key (fallback engaged) or api_key → oauth (cleared).
+AUTH_MODE_JSON="$HOME/dispatch/state/auth_mode.json"
+AUTH_STATE_FILE="/tmp/dispatch-watchdog-auth-mode.txt"
+
+current_auth="oauth"
+auth_since=""
+auth_reason=""
+if [ -f "$AUTH_MODE_JSON" ]; then
+  current_auth=$(python3 -c "import json,sys; print(json.load(open('$AUTH_MODE_JSON')).get('mode','oauth'))" 2>/dev/null || echo "oauth")
+  auth_since=$(python3 -c "import json,sys; print(json.load(open('$AUTH_MODE_JSON')).get('since','')[:19])" 2>/dev/null || echo "")
+  auth_reason=$(python3 -c "import json,sys; print(json.load(open('$AUTH_MODE_JSON')).get('reason',''))" 2>/dev/null || echo "")
+fi
+
+last_seen_auth="oauth"
+[ -f "$AUTH_STATE_FILE" ] && last_seen_auth=$(cat "$AUTH_STATE_FILE")
+
+if [ "$current_auth" != "$last_seen_auth" ]; then
+  echo "$current_auth" > "$AUTH_STATE_FILE"
+  if [ "$current_auth" = "api_key" ]; then
+    log "SDK auth flipped: oauth → api_key (since=$auth_since, reason=$auth_reason)"
+    send_sms "[WATCHDOG] SDK auth flipped OAuth → API key (quota fallback). Reason: ${auth_reason:-?}. Since: ${auth_since:-?}. After OAuth resets, run: claude-assistant auth reset && claude-assistant restart"
+  elif [ "$current_auth" = "oauth" ]; then
+    log "SDK auth flipped: api_key → oauth (cleared)"
+    send_sms "[WATCHDOG] SDK auth back on OAuth (Max plan)."
+  fi
+fi
+
 # Check if daemon is running (simple check, no timeout needed)
 if claude-assistant status >/dev/null 2>&1; then
   # Daemon is healthy - reset crash counter if exists

@@ -8,6 +8,7 @@ imported tmux-specific functions directly from cli.py.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import sqlite3
@@ -15,6 +16,42 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
+
+
+def load_dotenv() -> None:
+    """Populate os.environ from ~/dispatch/.env (and any sourced files).
+
+    Format: KEY=VALUE per line (optional 'export ' prefix, surrounding quotes
+    stripped). A line of 'source <path>' recursively pulls in another file in
+    the same format — handy for keeping secrets in a separate (e.g. iCloud-
+    synced) file. Existing env vars win (setdefault), so shell exports still
+    override. Idempotent — safe to call multiple times.
+    """
+    seen: set = set()
+
+    def parse(path: Path) -> None:
+        path = path.expanduser()
+        if not path.exists() or path in seen:
+            return
+        seen.add(path)
+        for raw in path.read_text().splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("source "):
+                parse(Path(line[len("source "):].strip()))
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].lstrip()
+            key, sep, val = line.partition("=")
+            if not sep:
+                continue
+            val = val.strip()
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+                val = val[1:-1]
+            os.environ.setdefault(key.strip(), val)
+
+    parse(Path(__file__).resolve().parent.parent / ".env")
 
 # Paths
 HOME = Path.home()
@@ -34,6 +71,10 @@ BUN = HOME / ".bun/bin/bun"
 # Master session config
 MASTER_SESSION = "master"
 MASTER_TRANSCRIPT_DIR = TRANSCRIPTS_DIR / "master"
+
+# Reasoning effort for user-facing SDK sessions ("low" | "medium" | "high" | "max").
+# Health-check probes (haiku) intentionally don't use this.
+SESSION_EFFORT = "high"
 
 # Signal config
 SIGNAL_CLI = "/opt/homebrew/bin/signal-cli"

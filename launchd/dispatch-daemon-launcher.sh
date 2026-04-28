@@ -19,4 +19,11 @@ mkdir -p "$DISPATCH_DIR/state" "$DISPATCH_DIR/logs"
 echo "$$" > "$PID_FILE"
 
 cd "$DISPATCH_DIR"
+
+# Force SDK sessions to authenticate via Claude Code OAuth (Max plan quota)
+# instead of API credits. _load_dotenv() in manager.py uses setdefault(), so
+# pre-existing env vars win — explicitly unset here so a stray export from
+# launchctl/shell rc/etc. can't leak in.
+unset ANTHROPIC_API_KEY
+
 exec "$DISPATCH_DIR/.venv/bin/python" -m assistant.manager

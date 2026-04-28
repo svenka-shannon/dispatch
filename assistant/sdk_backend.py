@@ -1426,6 +1426,10 @@ Gemini analyzed the attached image:
         requested_by: str,
         timeout_minutes: int = 30,
         notify: bool = True,
+        *,
+        system_prompt_override: str | None = None,
+        disallowed_tools: tuple[str, ...] = (),
+        bash_deny_regex: tuple[str, ...] = (),
     ) -> SDKSession:
         """Create an ephemeral SDK session for a one-off task.
 
@@ -1440,6 +1444,13 @@ Gemini analyzed the attached image:
             requested_by: chat_id of requester (for result routing)
             timeout_minutes: Auto-kill after this many minutes
             notify: Whether to text requester on start/finish
+            system_prompt_override: If set, overrides the SDK system prompt and
+                skips the inline first-message task_prompt inject (the SDK
+                delivers system_prompt directly).
+            disallowed_tools: Extra tool names to append to the SDK's
+                disallowed_tools list (harness-level enforcement).
+            bash_deny_regex: Regex patterns; any Bash command matching any of
+                them is denied via can_use_tool (survives compaction).
 
         Returns:
             The created SDKSession
@@ -1472,6 +1483,9 @@ Gemini analyzed the attached image:
                 cwd=str(ephemeral_dir),
                 session_type="ephemeral",
                 producer=self._producer,
+                system_prompt_override=system_prompt_override,
+                extra_disallowed_tools=disallowed_tools,
+                bash_deny_regex=bash_deny_regex,
             )
             await session.start()
             self.sessions[session_key] = session
@@ -1488,8 +1502,11 @@ Gemini analyzed the attached image:
                 "requested_by": requested_by,
             }, source="task-runner")
 
-        # Inject task instructions outside lock
-        task_prompt = f"""EPHEMERAL TASK SESSION — {title}
+        # Inject task instructions outside lock.
+        # When system_prompt_override is set, the SDK delivers the system prompt
+        # directly — seeding via inject would double-send the framing.
+        if system_prompt_override is None:
+            task_prompt = f"""EPHEMERAL TASK SESSION — {title}
 
 You are an autonomous agent executing a specific task. When done, state your
 results clearly. You have access to all skills and tools.
@@ -1502,7 +1519,9 @@ Requested by: {requested_by}
 --- END INSTRUCTIONS ---
 
 Execute the task now. Be thorough but efficient."""
-        await session.inject(task_prompt)
+            await session.inject(task_prompt)
+        else:
+            await session.inject(instructions)
         return session
 
     async def kill_ephemeral_session(self, task_id: str) -> bool:

@@ -33,40 +33,10 @@ from enum import Enum
 from typing import Optional, Dict, Any, List
 
 
-def _load_dotenv() -> None:
-    """Populate os.environ from ~/dispatch/.env before any module reads it.
-
-    Format: KEY=VALUE per line (optional 'export ' prefix, surrounding quotes
-    stripped). A line of 'source <path>' recursively pulls in another file in
-    the same format — handy for keeping secrets in a separate (e.g. iCloud-
-    synced) file. Existing env vars win, so shell exports still override.
-    """
-    seen: set = set()
-
-    def parse(path: Path) -> None:
-        path = path.expanduser()
-        if not path.exists() or path in seen:
-            return
-        seen.add(path)
-        for raw in path.read_text().splitlines():
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.startswith("source "):
-                parse(Path(line[len("source "):].strip()))
-                continue
-            if line.startswith("export "):
-                line = line[len("export "):].lstrip()
-            key, sep, val = line.partition("=")
-            if not sep:
-                continue
-            val = val.strip()
-            if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
-                val = val[1:-1]
-            os.environ.setdefault(key.strip(), val)
-
-    parse(Path(__file__).resolve().parent.parent / ".env")
-
+# Load ~/dispatch/.env (which sources ~/.secrets.env) before any module
+# reads os.environ. Implementation lives in common.py so the CLI can also
+# call it without pulling in the daemon's heavy imports.
+from assistant.common import load_dotenv as _load_dotenv
 
 _load_dotenv()
 
@@ -1629,8 +1599,81 @@ class IPCServer:
             if hasattr(self, 'restart_api_callback') and self.restart_api_callback:
                 return self.restart_api_callback()
             return {"ok": False, "error": "restart_api not available"}
+        elif cmd == "investigation_dispatch":
+            return await self._cmd_dispatch_investigation(request)
+        elif cmd == "investigation_status":
+            return await self._cmd_investigation_status(request)
+        elif cmd == "investigation_list":
+            return await self._cmd_investigation_list(request)
+        elif cmd == "investigation_cancel":
+            return await self._cmd_investigation_cancel(request)
         else:
             return {"ok": False, "error": f"Unknown command: {cmd}"}
+
+    async def _cmd_dispatch_investigation(self, req: dict) -> dict:
+        from_session = req.get("from_session")
+        prompt = req.get("prompt", "")
+        allow_mutations = bool(req.get("allow_mutations", False))
+        timeout_minutes = int(req.get("timeout_minutes", 15))
+        if not from_session:
+            return {"ok": False, "error": "from_session required"}
+        if not prompt:
+            return {"ok": False, "error": "prompt required"}
+
+        if from_session not in self.backend.sessions:
+            return {"ok": False,
+                    "error": f"Originating session not found: {from_session}"}
+
+        from assistant import investigations
+        producer = getattr(self.backend, "_producer", None)
+        try:
+            task_id = investigations.dispatch(
+                producer, prompt, from_session,
+                allow_mutations=allow_mutations,
+                timeout_minutes=timeout_minutes,
+            )
+        except investigations.RecursiveDispatchError as e:
+            return {"ok": False, "error": str(e), "code": "recursive"}
+        except investigations.RateLimitExceeded as e:
+            return {"ok": False, "error": str(e), "code": "rate_limited"}
+        except investigations.InvestigationError as e:
+            return {"ok": False, "error": str(e), "code": "invalid"}
+        return {"ok": True, "task_id": task_id,
+                "message": f"Investigation dispatched: {task_id}"}
+
+    async def _cmd_investigation_status(self, req: dict) -> dict:
+        from assistant import investigations
+        task_id = req.get("task_id")
+        if not task_id:
+            return {"ok": False, "error": "task_id required"}
+        entry = investigations.get_status(task_id)
+        if entry is None:
+            return {"ok": False, "error": f"Investigation not found: {task_id}"}
+        return {"ok": True, "investigation": entry}
+
+    async def _cmd_investigation_list(self, req: dict) -> dict:
+        from assistant import investigations
+        from_session = req.get("from_session")
+        entries = investigations.list_inflight(from_session=from_session)
+        return {"ok": True, "investigations": entries}
+
+    async def _cmd_investigation_cancel(self, req: dict) -> dict:
+        from assistant import investigations
+        task_id = req.get("task_id")
+        if not task_id:
+            return {"ok": False, "error": "task_id required"}
+        ok = investigations.cancel(task_id)
+        if not ok:
+            return {"ok": False, "error": "Investigation not cancellable "
+                                          "(missing or already terminal)"}
+        session_key = f"ephemeral-{task_id}"
+        if session_key in self.backend.sessions:
+            try:
+                await self.backend.kill_ephemeral_session(task_id)
+            except Exception as e:
+                return {"ok": True,
+                        "message": f"Marked cancelled but kill failed: {e}"}
+        return {"ok": True, "message": f"Cancelled {task_id}"}
 
     async def _cmd_inject(self, req: dict) -> dict:
         chat_id = req.get("chat_id")
@@ -3213,6 +3256,31 @@ class Manager:
             log.error(f"task.requested {task_id} missing instructions, skipping")
             return
 
+        is_investigation = bool(payload.get("investigation"))
+        if is_investigation:
+            looks_ephemeral = (
+                requested_by.startswith("ephemeral-")
+                or requested_by in self._ephemeral_tasks
+                or f"ephemeral-{requested_by}" in self.sessions.sessions
+            )
+            if looks_ephemeral:
+                log.warning(
+                    f"investigation.rejected_recursive | task_id={task_id} | "
+                    f"requested_by={requested_by} (ephemeral session may not "
+                    f"dispatch investigations)"
+                )
+                produce_event(self._producer, "system",
+                    "investigation.rejected_recursive", {
+                        "task_id": task_id,
+                        "requested_by": requested_by,
+                        "reason": "requested_by is ephemeral",
+                    }, key=requested_by, source="task-runner")
+                produce_event(self._producer, "tasks", "task.failed",
+                    task_failed_payload(task_id, title, requested_by,
+                        "Recursive investigation dispatch rejected"),
+                    key=requested_by, source="task-runner")
+                return
+
         # Global kill switch — check tasks_enabled in config.local.yaml.
         # Hot-reloaded on every task so changes take effect without a restart.
         from . import config as _cfg
@@ -3278,6 +3346,23 @@ class Manager:
             return
 
         # Agent tasks: create ephemeral Claude session
+        ephemeral_kwargs: dict[str, Any] = {}
+        if is_investigation:
+            from assistant.investigations import (
+                INVESTIGATOR_SYSTEM_PROMPT,
+                bash_deny_patterns,
+                mark_status,
+            )
+            allow_mutations = bool(payload.get("allow_mutations", False))
+            ephemeral_kwargs["system_prompt_override"] = (
+                INVESTIGATOR_SYSTEM_PROMPT + "\n\n" + instructions
+            )
+            ephemeral_kwargs["disallowed_tools"] = (
+                () if allow_mutations else ("Edit", "Write", "NotebookEdit")
+            )
+            ephemeral_kwargs["bash_deny_regex"] = bash_deny_patterns(allow_mutations)
+            mark_status(task_id, "running")
+
         try:
             session = await self.sessions.create_ephemeral_session(
                 task_id=task_id,
@@ -3286,12 +3371,31 @@ class Manager:
                 requested_by=requested_by,
                 timeout_minutes=timeout_minutes,
                 notify=notify,
+                **ephemeral_kwargs,
             )
         except Exception as e:
             log.error(f"Failed to create ephemeral session for task {task_id}: {e}")
             produce_event(self._producer, "tasks", "task.failed",
                 task_failed_payload(task_id, title, requested_by, str(e)),
                 key=requested_by, source="task-runner")
+            if is_investigation:
+                from assistant.investigations import (
+                    format_result_for_injection, parse_result_block, mark_status,
+                )
+                notify_session = payload.get("notify_session") or requested_by
+                target = self.sessions.sessions.get(notify_session)
+                if target and target.is_alive():
+                    parsed = parse_result_block("")
+                    parsed["raw"] = f"Investigator failed to start: {e}"
+                    wrapped = format_result_for_injection(task_id, "failed", parsed)
+                    try:
+                        await target.inject(wrapped)
+                    except Exception as inj_e:
+                        log.warning(
+                            f"investigation: failed to inject failure to "
+                            f"{notify_session}: {inj_e}"
+                        )
+                mark_status(task_id, "failed", error=str(e))
             return
 
         # Track for timeout supervision
@@ -3302,6 +3406,8 @@ class Manager:
             "requested_by": requested_by,
             "title": title,
             "notify": notify,
+            "investigation": is_investigation,
+            "notify_session": payload.get("notify_session") if is_investigation else None,
         }
 
         # Produce task.started event
@@ -3535,6 +3641,10 @@ class Manager:
                                 info["requested_by"], elapsed),
                             key=info["requested_by"], source="task-runner")
 
+                        await self._handle_investigation_completed(
+                            task_id, info, session, "completed"
+                        )
+
                         # Clean up — record completion time to prevent restart loops
                         self._completed_task_times[task_id] = time.time()
                         await self.sessions.kill_ephemeral_session(task_id)
@@ -3572,6 +3682,10 @@ class Manager:
                                     info["requested_by"], elapsed),
                                 key=info["requested_by"], source="task-runner")
 
+                            await self._handle_investigation_completed(
+                                task_id, info, session, "completed"
+                            )
+
                             self._completed_task_times[task_id] = time.time()
                             await self.sessions.kill_ephemeral_session(task_id)
                             self._ephemeral_tasks.pop(task_id, None)
@@ -3596,6 +3710,10 @@ class Manager:
                                 info["requested_by"], info["timeout_minutes"]),
                             key=info["requested_by"], source="task-runner")
 
+                        await self._handle_investigation_completed(
+                            task_id, info, session, "timeout"
+                        )
+
                         # Kill session and clean up
                         self._completed_task_times[task_id] = time.time()
                         await self.sessions.kill_ephemeral_session(task_id)
@@ -3619,6 +3737,66 @@ class Manager:
                 await asyncio.sleep(5)
 
         log.info("Task supervisor stopped")
+
+    async def _handle_investigation_completed(
+        self, task_id: str, info: dict, session: Any, status: str,
+    ) -> None:
+        """Deliver an investigation result to the originating session.
+
+        Pulls last_assistant_text from the ephemeral session, parses the
+        === INVESTIGATION RESULT === block, and injects the wrapped result
+        into notify_session. Must run BEFORE kill_ephemeral_session because
+        the ephemeral cwd (and the SDKSession in-memory state) is destroyed
+        on kill.
+        """
+        if not info.get("investigation"):
+            return
+
+        notify_session = info.get("notify_session")
+        if not notify_session:
+            return
+
+        from assistant.investigations import (
+            parse_result_block, format_result_for_injection, mark_status,
+        )
+
+        text = ""
+        if session is not None:
+            text = getattr(session, "last_assistant_text", "") or ""
+
+        if not text and status == "timeout":
+            text = "Investigation timed out before completing."
+
+        parsed = parse_result_block(text)
+        wrapped = format_result_for_injection(task_id, status, parsed)
+
+        target = self.sessions.sessions.get(notify_session)
+        if not target or not target.is_alive():
+            log.warning(
+                f"investigation: notify_session {notify_session} is dead, "
+                f"dropping result for task_id={task_id}"
+            )
+            mark_status(task_id, status,
+                        delivered=False, parse_status=parsed["parse_status"])
+            return
+
+        try:
+            await target.inject(wrapped)
+            log.info(
+                f"investigation.delivered | task_id={task_id} | "
+                f"status={status} | parse_status={parsed['parse_status']} | "
+                f"notify_session={notify_session}"
+            )
+            mark_status(task_id, status,
+                        delivered=True, parse_status=parsed["parse_status"])
+        except Exception as e:
+            log.warning(
+                f"investigation: failed to inject result for task_id={task_id} "
+                f"into {notify_session}: {e}"
+            )
+            mark_status(task_id, status,
+                        delivered=False, parse_status=parsed["parse_status"],
+                        delivery_error=str(e))
 
     async def _notify_task_event(self, chat_id: str, message: str):
         """Send a task notification to the requester's session.
@@ -5645,6 +5823,14 @@ def main():
     # Ensure directories exist
     (ASSISTANT_DIR / "state").mkdir(parents=True, exist_ok=True)
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Honor a previously-persisted auth mode flip (state/auth_mode.json).
+    # If the last run ended in api_key mode (OAuth quota fallback), promote
+    # ANTHROPIC_API_KEY_FALLBACK into ANTHROPIC_API_KEY before spawning any
+    # SDK subprocesses so they inherit the right credentials.
+    from assistant import auth_mode
+    active_mode = auth_mode.apply_at_startup()
+    print(f"[startup] SDK auth mode: {active_mode}")
 
     manager = Manager()
     asyncio.run(manager.run())

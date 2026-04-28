@@ -242,6 +242,16 @@ def cmd_status(args):
         uptime = result.stdout.strip()
         print(f"Daemon running (PID {pid}, uptime {uptime})")
 
+        # Show SDK auth mode (oauth vs api_key)
+        from assistant import auth_mode
+        am = auth_mode.current_mode()
+        if am.get("mode") == "api_key":
+            since = am.get("since", "?")[:19].replace("T", " ")
+            reason = am.get("reason", "?")
+            print(f"Auth: api_key (quota fallback since {since}, reason: {reason}). Run `claude-assistant auth reset` to flip back.")
+        else:
+            print("Auth: oauth (Max plan)")
+
         # Get sessions via IPC
         resp = _ipc_command({"cmd": "status"})
         if resp.get("ok") and resp.get("sessions"):
@@ -887,6 +897,43 @@ def cmd_watchdog_status(args):
   return 0
 
 
+def cmd_auth(args):
+    """Manage SDK auth mode (oauth vs api_key fallback)."""
+    from assistant import auth_mode
+
+    sub = getattr(args, "auth_command", None)
+    if sub == "status" or sub is None:
+        info = auth_mode.current_mode()
+        mode = info.get("mode", "oauth")
+        if mode == "api_key":
+            since = info.get("since", "?")[:19].replace("T", " ")
+            print(f"mode: api_key")
+            print(f"since: {since}")
+            print(f"reason: {info.get('reason', '?')}")
+            if info.get("triggered_by_session"):
+                print(f"triggered_by_session: {info['triggered_by_session']}")
+            if info.get("error_text"):
+                print(f"error_text: {info['error_text']}")
+            print("\nTo flip back to OAuth: claude-assistant auth reset && claude-assistant restart")
+        else:
+            print("mode: oauth (Max plan quota)")
+            fb = "set" if os.environ.get("ANTHROPIC_API_KEY_FALLBACK") else "NOT SET"
+            print(f"ANTHROPIC_API_KEY_FALLBACK: {fb}")
+        return 0
+
+    if sub == "reset":
+        removed = auth_mode.clear()
+        if removed:
+            print("auth_mode.json cleared. Next daemon restart will use OAuth.")
+            print("Run: claude-assistant restart")
+        else:
+            print("auth_mode.json was not present — already on OAuth.")
+        return 0
+
+    print(f"Unknown auth subcommand: {sub}")
+    return 1
+
+
 def cmd_remind(args):
     """Manage native reminders."""
     from assistant.reminders import (
@@ -1062,7 +1109,128 @@ def cmd_menubar_uninstall(args):
     return 0
 
 
+def _detect_session_from_cwd() -> str | None:
+    """Resolve the session_name (or chat_id) of the current transcript dir.
+
+    Mirrors the heuristic used by ~/.claude/skills/sms-assistant/scripts/reply:
+    walks the registry for an entry whose transcript_dir matches cwd, returns
+    the chat_id (which is what the daemon uses as the session key).
+    """
+    transcripts_dir = Path.home() / "transcripts"
+    cwd = Path.cwd()
+    try:
+        parts = cwd.relative_to(transcripts_dir).parts
+    except ValueError:
+        return None
+    if len(parts) < 2:
+        return None
+
+    expected = str(transcripts_dir / parts[0] / parts[1])
+    registry_path = Path.home() / "dispatch/state/sessions.json"
+    try:
+        registry = json.loads(registry_path.read_text())
+    except Exception:
+        return None
+    for entry in registry.values():
+        if entry.get("transcript_dir") == expected:
+            return entry.get("chat_id")
+    return None
+
+
+def cmd_dispatch_investigation(args):
+    """Dispatch a background investigation from the current session."""
+    from_session = args.from_session or _detect_session_from_cwd()
+    if not from_session:
+        print("Error: Could not detect originating session from cwd. "
+              "Pass --from-session.", file=sys.stderr)
+        return 1
+
+    prompt = args.prompt
+    if args.file:
+        try:
+            prompt = Path(args.file).read_text()
+        except Exception as e:
+            print(f"Error reading file: {e}", file=sys.stderr)
+            return 1
+    if not prompt:
+        print("Error: prompt required (positional arg or --file)", file=sys.stderr)
+        return 1
+
+    resp = _ipc_command({
+        "cmd": "investigation_dispatch",
+        "from_session": from_session,
+        "prompt": prompt,
+        "allow_mutations": args.allow_mutations,
+        "timeout_minutes": args.timeout_minutes,
+    })
+    if resp.get("ok"):
+        print(resp.get("message", f"Dispatched: {resp.get('task_id')}"))
+        return 0
+    print(f"Error: {resp.get('error', 'unknown')}", file=sys.stderr)
+    return 1
+
+
+def cmd_investigation_status(args):
+    """Show status of a single investigation."""
+    resp = _ipc_command({
+        "cmd": "investigation_status",
+        "task_id": args.task_id,
+    })
+    if not resp.get("ok"):
+        print(f"Error: {resp.get('error', 'unknown')}", file=sys.stderr)
+        return 1
+    print(json.dumps(resp.get("investigation"), indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_investigation_list(args):
+    """List in-flight (and recent) investigations."""
+    payload: dict = {"cmd": "investigation_list"}
+    if args.from_session:
+        payload["from_session"] = args.from_session
+    elif args.mine:
+        detected = _detect_session_from_cwd()
+        if detected:
+            payload["from_session"] = detected
+
+    resp = _ipc_command(payload)
+    if not resp.get("ok"):
+        print(f"Error: {resp.get('error', 'unknown')}", file=sys.stderr)
+        return 1
+    investigations = resp.get("investigations", [])
+    if not investigations:
+        print("No investigations.")
+        return 0
+    for entry in investigations:
+        print(f"{entry.get('task_id')}  {entry.get('status'):<10}  "
+              f"from={entry.get('from_session')}  "
+              f"created={entry.get('created_at')}")
+        prompt = entry.get("prompt", "")
+        if prompt:
+            first = prompt.strip().splitlines()[0][:100]
+            print(f"  {first}")
+    return 0
+
+
+def cmd_investigation_cancel(args):
+    """Cancel a running investigation."""
+    resp = _ipc_command({
+        "cmd": "investigation_cancel",
+        "task_id": args.task_id,
+    })
+    if not resp.get("ok"):
+        print(f"Error: {resp.get('error', 'unknown')}", file=sys.stderr)
+        return 1
+    print(resp.get("message", "Cancelled"))
+    return 0
+
+
 def main():
+    # Load ~/.secrets.env (via ~/dispatch/.env) so commands like `auth status`
+    # can see ANTHROPIC_API_KEY_FALLBACK without the daemon being involved.
+    from assistant.common import load_dotenv
+    load_dotenv()
+
     parser = argparse.ArgumentParser(
         prog="claude-assistant",
         description="Manage the Claude Assistant daemon"
@@ -1167,6 +1335,52 @@ def main():
     inject_parser.add_argument("--reply-to", help="GUID of message being replied to (for reply chain context)")
     inject_parser.add_argument("--attachment", help="Path to image attachment for Gemini vision analysis")
 
+    # dispatch-investigation
+    di_parser = subparsers.add_parser(
+        "dispatch-investigation",
+        help="Spawn a background investigation agent from the current session",
+    )
+    di_parser.add_argument("prompt", nargs="?", default="",
+                           help="What you want investigated")
+    di_parser.add_argument("--file", "-f", help="Read prompt from file")
+    di_parser.add_argument("--from-session", dest="from_session",
+                           help="Override originator session (default: detect from cwd)")
+    di_parser.add_argument("--allow-mutations", action="store_true",
+                           help="Allow Edit/Write tools (default: read-only)")
+    di_parser.add_argument("--timeout-minutes", dest="timeout_minutes",
+                           type=int, default=15,
+                           help="Investigator timeout (default: 15min)")
+
+    # investigation-status
+    is_parser = subparsers.add_parser(
+        "investigation-status",
+        help="Show status of a single investigation",
+    )
+    is_parser.add_argument("task_id", help="Investigation task_id")
+
+    # investigation-list
+    il_parser = subparsers.add_parser(
+        "investigation-list",
+        help="List in-flight investigations",
+    )
+    il_parser.add_argument("--from-session", dest="from_session",
+                           help="Filter by originating session")
+    il_parser.add_argument("--mine", action="store_true",
+                           help="Filter to investigations from the current cwd's session")
+
+    # investigation-cancel
+    ic_parser = subparsers.add_parser(
+        "investigation-cancel",
+        help="Cancel a running investigation",
+    )
+    ic_parser.add_argument("task_id", help="Investigation task_id")
+
+    # auth - SDK auth mode (oauth vs api_key fallback)
+    auth_parser = subparsers.add_parser("auth", help="Show or reset SDK auth mode (oauth/api_key)")
+    auth_subparsers = auth_parser.add_subparsers(dest="auth_command", help="Auth subcommands")
+    auth_subparsers.add_parser("status", help="Show current auth mode (default)")
+    auth_subparsers.add_parser("reset", help="Clear state/auth_mode.json — flips back to OAuth on next daemon restart")
+
     # remind - native reminder system
     remind_parser = subparsers.add_parser("remind", help="Manage native reminders")
     remind_subparsers = remind_parser.add_subparsers(dest="remind_command", help="Reminder commands")
@@ -1237,6 +1451,11 @@ def main():
         "watchdog-status": cmd_watchdog_status,
         "inject-prompt": cmd_inject_prompt,
         "remind": cmd_remind,
+        "auth": cmd_auth,
+        "dispatch-investigation": cmd_dispatch_investigation,
+        "investigation-status": cmd_investigation_status,
+        "investigation-list": cmd_investigation_list,
+        "investigation-cancel": cmd_investigation_cancel,
     }
 
     return commands[args.command](args)

@@ -1,6 +1,11 @@
 {
   "permissions": {
-    "defaultMode": "auto"
+    "defaultMode": "auto",
+    "allow": [
+      "Bash(git push origin main)",
+      "Bash(git push origin HEAD)",
+      "Bash(git push origin HEAD:main)"
+    ]
   },
   "hooks": {
     "PreToolUse": [

@@ -3440,6 +3440,33 @@ class Manager:
             # consumer re-reads the same task.requested event (sev0 fix).
             self._completed_task_times[task_id] = time.time()
 
+    async def _imessage_tickle(self):
+        """Wake Messages.app/IMDPersistenceAgent so pending iMessages flush to chat.db.
+
+        macOS aggressively throttles backgrounded apps (App Nap + IMDPersistenceAgent's
+        own scheduling), which can defer chat.db writes for minutes. The push arrives,
+        but the disk row is delayed until something pokes the app. A cheap Apple Event
+        is enough — we don't care about the result, only the side effect of forcing
+        Messages.app to do a unit of work, which lets the agent flush its queue.
+        """
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "osascript", "-e", 'tell application "Messages" to count of chats',
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            log.warning("IMESSAGE_TICKLE | osascript timed out after 5s")
+            if proc is not None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+        except Exception as e:
+            log.warning(f"IMESSAGE_TICKLE | failed: {e}")
+
     async def _periodic_wal_checkpoint(self):
         """Run WAL checkpoint on a separate timer, outside the poll cycle.
 
@@ -5365,6 +5392,12 @@ You have 15 minutes. Work efficiently.
         last_reminder_check = time.time()
         REMINDER_CHECK_INTERVAL = 5  # Check reminders every 5 seconds
 
+        # Track last iMessage tickle — works around App Nap / IMDPersistenceAgent
+        # delaying chat.db writes when Messages.app has been backgrounded.
+        # First tickle fires ~5s after start so any backlog flushes early.
+        last_imessage_tickle = time.time() - 25
+        IMESSAGE_TICKLE_INTERVAL = 30
+
         # Nightly consolidation is now handled by cron reminders firing
         # task.requested events. See scripts/setup-nightly-tasks.py.
         # Verify nightly task reminders exist at startup
@@ -5517,6 +5550,12 @@ You have 15 minutes. Work efficiently.
                 if time.time() - last_reminder_check > REMINDER_CHECK_INTERVAL:
                     await self.reminders.process_due_reminders()
                     last_reminder_check = time.time()
+
+                # Periodic Messages.app tickle (fire-and-forget) — keeps
+                # IMDPersistenceAgent flushing chat.db despite App Nap.
+                if time.time() - last_imessage_tickle > IMESSAGE_TICKLE_INTERVAL:
+                    asyncio.create_task(self._imessage_tickle(), name="imessage-tickle")
+                    last_imessage_tickle = time.time()
 
                 # Fast health check (Tier 1: regex-based fatal error detection)
                 if time.time() - last_fast_health > FAST_HEALTH_INTERVAL:

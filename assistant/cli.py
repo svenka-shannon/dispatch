@@ -1126,6 +1126,72 @@ def cmd_commitment(args):
         return 1
 
 
+def cmd_health_history(args):
+    """Show the resilience / health-history report (self-healing-resilience §4.4).
+
+    Queries state/bus.db for health.dependency (and session.stuck_nudge,
+    health.haiku_verdict/circuit_breaker/quota_alert) over a window and prints
+    per-dependency current state, recovery counts, MTTR P50/P95, last escalation,
+    the recovery-frequency alarm status, a transition tail, and a one-line SLO check.
+    """
+    from assistant import health_report
+
+    db_path = getattr(args, "db", None) or (STATE_DIR / "bus.db")
+    try:
+        conn = health_report.open_bus_db(db_path)
+    except FileNotFoundError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    try:
+        report = health_report.build_report(
+            conn,
+            hours=args.hours,
+            dep=args.dep,
+            transition_limit=args.limit,
+        )
+    finally:
+        conn.close()
+
+    if getattr(args, "json", False):
+        # Emit a JSON view (no truncation).
+        def _dep_json(s):
+            return {
+                "name": s.name,
+                "current_state": s.current_state,
+                "last_event": health_report._fmt_ts(s.last_event_ms),
+                "recoveries_1h": s.recoveries_1h,
+                "recoveries_24h": s.recoveries_24h,
+                "recovery_attempts": s.recovery_attempts,
+                "mttr_p50_s": s.mttr_p50_s,
+                "mttr_p95_s": s.mttr_p95_s,
+                "incident_count": s.incident_count,
+                "ongoing_incident": (
+                    {"start": health_report._fmt_ts(s.ongoing_incident.start_ms),
+                     "escalated": s.ongoing_incident.escalated}
+                    if s.ongoing_incident else None
+                ),
+                "last_escalation": health_report._fmt_ts(s.last_escalation_ms),
+                "last_escalation_detail": s.last_escalation_detail,
+                "recovery_alarm_fired": s.recovery_alarm_fired,
+                "slo_misses": s.slo_misses,
+            }
+        out = {
+            "window_hours": report.window_hours,
+            "window_start": health_report._fmt_ts(report.window_start_ms),
+            "now": health_report._fmt_ts(report.now_ms),
+            "slo_ok": report.slo_ok,
+            "slo_misses": report.all_slo_misses,
+            "dependencies": {n: _dep_json(s) for n, s in report.dependencies.items()},
+            "stuck_nudge_count": len(report.stuck_nudges),
+            "transition_count": len(report.transitions),
+        }
+        print(json.dumps(out, indent=2, sort_keys=True))
+    else:
+        print(health_report.render_report(report, dep_filter=args.dep))
+    # Exit 2 if any SLO miss (so it can gate scripts/CI), 0 otherwise.
+    return 0 if report.slo_ok else 2
+
+
 def cmd_menubar(args):
     """Start the menu bar app (foreground)."""
     menubar_script = ASSISTANT_DIR / "bin" / "claude-menubar"
@@ -1441,6 +1507,17 @@ def main():
     auth_subparsers.add_parser("status", help="Show current auth mode (default)")
     auth_subparsers.add_parser("reset", help="Clear state/auth_mode.json — flips back to OAuth on next daemon restart")
 
+    # health-history - resilience / health-history report (self-healing-resilience §4.4)
+    hh_parser = subparsers.add_parser(
+        "health-history",
+        help="Resilience report: per-dependency state, recovery counts, MTTR, escalations, SLO check",
+    )
+    hh_parser.add_argument("--hours", type=float, default=24.0, help="Window size in hours (default: 24)")
+    hh_parser.add_argument("--dep", help="Filter to a single dependency name (chrome_control, signal_cli, ...)")
+    hh_parser.add_argument("--limit", type=int, default=50, help="Max transitions in the tail (default: 50)")
+    hh_parser.add_argument("--json", action="store_true", help="Emit JSON instead of a text table")
+    hh_parser.add_argument("--db", help="Path to bus.db (default: state/bus.db)")
+
     # commitment - per-session outstanding-commitment marker (read by the
     # blocked-session watchdog so a stuck task never just idles)
     commitment_parser = subparsers.add_parser(
@@ -1524,6 +1601,7 @@ def main():
         "watchdog-status": cmd_watchdog_status,
         "inject-prompt": cmd_inject_prompt,
         "commitment": cmd_commitment,
+        "health-history": cmd_health_history,
         "remind": cmd_remind,
         "auth": cmd_auth,
         "dispatch-investigation": cmd_dispatch_investigation,

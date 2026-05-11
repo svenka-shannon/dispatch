@@ -310,6 +310,144 @@ WHERE timestamp > (strftime('%s','now','-24 hours') * 1000)
 GROUP BY hour, source ORDER BY hour, cnt DESC;
 ```
 
+## Resilience & self-healing queries
+
+The self-healing framework (`plans/self-healing-resilience.md`) leaves a structured trail:
+`health.dependency` (topic `system`) — per-dependency state machine
+`HEALTHY→DEGRADED→DOWN→RECOVERING→(HEALTHY|ESCALATED)`; fields include `name`,
+`state`, `prev_state`, `action_taken` (`probe|recover|escalate|none`), `detail`,
+`attempt`/`max_attempts` (during RECOVERING), `recovered`/`recovered_after_escalation`,
+`recoveries_in_window`/`recovery_alarm_k` (recovery-frequency alarm), plus flattened
+diagnostics (`probe_rc`, `probe_output`, `recover_rc`, `disable_reason`, `dead_members`,
+`used_pct`, `free_gb`, `fd_actual`, `fd_delta`, ...). And `session.stuck_nudge`
+(topic `sessions`) — the blocked-session watchdog: `session_name`, `chat_id`,
+`idle_minutes`, `detection` (`marker|heuristic`), `contact_name?`, `committed_text?`.
+
+> **Most of these are one CLI away:** `claude-assistant health-history [--hours N] [--dep <name>] [--limit N] [--json]`
+> renders the per-dependency table (current state, recoveries 1h/24h, MTTR P50/P95,
+> last escalation, recovery-frequency alarm), a transition tail, and a one-line SLO
+> check. Use the raw SQL below for ad-hoc slicing the CLI doesn't cover.
+
+```bash
+# Quick look — all health.dependency events in the last 24h
+uv run python -m bus.cli replay system --limit 200 \
+  | grep health.dependency
+# Or full-text search across the trail
+uv run python -m bus.cli search "health.dependency" --topic system --limit 100
+```
+
+### R1. Recovery events in the last 24h (what self-healed, and how)
+```sql
+SELECT datetime(timestamp/1000,'unixepoch','localtime') AS ts,
+  key AS dep,
+  json_extract(payload,'$.action_taken') AS action,
+  json_extract(payload,'$.detail') AS detail
+FROM records
+WHERE type = 'health.dependency'
+  AND timestamp > (strftime('%s','now','-24 hours') * 1000)
+  AND (json_extract(payload,'$.action_taken') = 'recover'
+       AND (json_extract(payload,'$.recovered') = 1
+            OR json_extract(payload,'$.recovered_after_escalation') = 1))
+ORDER BY ts;
+```
+
+### R2. MTTR per dependency (pair DOWN/DEGRADED → next HEALTHY by name)
+```sql
+-- For each impaired-start event, find the next HEALTHY for the same dep and
+-- diff the timestamps. (Roughly what `claude-assistant health-history` does;
+-- the CLI also de-dups overlapping incidents and computes P50/P95.)
+WITH ev AS (
+  SELECT key AS dep, timestamp AS ts,
+         json_extract(payload,'$.state') AS state
+  FROM records
+  WHERE type = 'health.dependency'
+    AND timestamp > (strftime('%s','now','-7 days') * 1000)
+),
+starts AS (
+  SELECT dep, ts FROM ev WHERE state IN ('DOWN','DEGRADED')
+),
+recovered AS (
+  SELECT s.dep, s.ts AS down_ts,
+         (SELECT MIN(h.ts) FROM ev h
+          WHERE h.dep = s.dep AND h.state = 'HEALTHY' AND h.ts > s.ts) AS up_ts
+  FROM starts s
+)
+SELECT dep,
+  COUNT(*) AS incidents,
+  ROUND(AVG((up_ts - down_ts)/1000.0),1) AS mean_recovery_s,
+  MIN((up_ts - down_ts)/1000) AS fastest_s,
+  MAX((up_ts - down_ts)/1000) AS slowest_s
+FROM recovered WHERE up_ts IS NOT NULL
+GROUP BY dep ORDER BY slowest_s DESC;
+```
+
+### R3. Recovery-attempt rate / which deps are flapping
+```sql
+-- A spike here = an underlying problem getting masked by auto-recovery.
+SELECT key AS dep,
+  datetime((timestamp/3600000)*3600,'unixepoch','localtime') AS hour,
+  COUNT(*) AS recovery_attempts
+FROM records
+WHERE type = 'health.dependency'
+  AND json_extract(payload,'$.action_taken') = 'recover'
+  AND json_extract(payload,'$.state') = 'RECOVERING'
+  AND json_extract(payload,'$.recovered') IS NULL   -- the per-attempt RECOVERING line
+  AND timestamp > (strftime('%s','now','-24 hours') * 1000)
+GROUP BY dep, hour
+HAVING recovery_attempts > 3
+ORDER BY recovery_attempts DESC;
+```
+
+### R4. All escalations (with the specific ask)
+```sql
+SELECT datetime(timestamp/1000,'unixepoch','localtime') AS ts,
+  key AS dep,
+  json_extract(payload,'$.state') AS state,
+  json_extract(payload,'$.detail') AS detail,
+  json_extract(payload,'$.recoveries_in_window') AS recoveries_in_window
+FROM records
+WHERE type = 'health.dependency'
+  AND json_extract(payload,'$.action_taken') = 'escalate'
+  AND timestamp > (strftime('%s','now','-7 days') * 1000)
+ORDER BY ts;
+```
+
+### R5. Stuck-session nudges — who, how often, marker vs heuristic
+```sql
+SELECT datetime(timestamp/1000,'unixepoch','localtime') AS ts,
+  key AS chat_id,
+  json_extract(payload,'$.contact_name') AS contact,
+  json_extract(payload,'$.detection') AS detection,
+  json_extract(payload,'$.idle_minutes') AS idle_min,
+  json_extract(payload,'$.committed_text') AS committed
+FROM records
+WHERE type = 'session.stuck_nudge'
+  AND timestamp > (strftime('%s','now','-7 days') * 1000)
+ORDER BY ts;
+
+-- Frequency by contact / detection mode:
+SELECT json_extract(payload,'$.contact_name') AS contact,
+  json_extract(payload,'$.detection') AS detection, COUNT(*) AS nudges
+FROM records WHERE type = 'session.stuck_nudge'
+  AND timestamp > (strftime('%s','now','-7 days') * 1000)
+GROUP BY contact, detection ORDER BY nudges DESC;
+```
+
+### R6. Is anything DOWN / ESCALATED right now? (latest state per dep)
+```sql
+WITH latest AS (
+  SELECT key AS dep, MAX(timestamp) AS ts
+  FROM records WHERE type = 'health.dependency' GROUP BY key
+)
+SELECT l.dep,
+  datetime(l.ts/1000,'unixepoch','localtime') AS as_of,
+  json_extract(r.payload,'$.state') AS state,
+  json_extract(r.payload,'$.detail') AS detail
+FROM latest l
+JOIN records r ON r.type = 'health.dependency' AND r.key = l.dep AND r.timestamp = l.ts
+ORDER BY (state IN ('DOWN','ESCALATED','DEGRADED')) DESC, l.dep;
+```
+
 ## Anomaly Pattern Reference
 
 | Pattern | Likely Bug |

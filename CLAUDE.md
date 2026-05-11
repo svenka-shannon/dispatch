@@ -428,6 +428,18 @@ recovery/escalation routing through the framework is deferred).
 The blocked-session watchdog (`_run_stuck_session_check`, Phase 1) is a separate
 concern — not a "dependency" — and stays as its own periodic check.
 
+**Observability (Phase 4):** `claude-assistant health-history [--hours N] [--dep <name>] [--limit N] [--json]`
+(thin wrapper over `assistant/health_report.py`) reads `state/bus.db` for
+`health.dependency` / `session.stuck_nudge` / `health.haiku_verdict` /
+`health.circuit_breaker` / `health.quota_alert` over a window and prints a
+per-dependency table — current state, recoveries 1h/24h, **MTTR P50/P95** (paired
+DOWN/DEGRADED→HEALTHY incident durations, nearest-rank percentiles), last
+escalation, recovery-frequency-alarm status — plus a recent-transition tail and a
+one-line **SLO check** against the plan §3 budgets (P50 < 2 min, P95 < 6 min,
+escalate within ≤5 min; exits 2 on a miss). Copy-pasteable `bus query` recipes for
+recovery events / MTTR / flapping deps / escalations / stuck nudges / "anything
+DOWN right now" live in `skills/bus/SKILL.md` → "Resilience & self-healing queries".
+
 ## Scheduling Tasks
 
 **CRITICAL: NEVER create new LaunchAgents or launchd plists for scheduled tasks.** The ONLY LaunchAgents allowed are:
@@ -640,6 +652,8 @@ extra-paths = [
 | `session.stuck_nudge` (topic: `sessions`) | session_name, chat_id, idle_minutes, detection (marker/heuristic), contact_name?, committed_text? — blocked-session watchdog nudged an idle session that still has an outstanding commitment (a `claude-assistant commitment set` marker, or a last message matching a small commitment-phrase list); the nudge tells the session to re-check the blocker / escalate with a specific ask. Idle threshold N is `watchdog.stuck_session_idle_minutes` in config (default 5); ~75s cadence; per-session 2×N back-off so it nudges once, then the session escalates. | `bus replay sessions --type session.stuck_nudge --limit 50` |
 
 **Cross-event correlation:** `bus search "<check_run_id_uuid>" --topic system` — shows all events from the same health check cycle.
+
+**Resilience postmortem shortcut:** `claude-assistant health-history` aggregates `health.dependency` + `session.stuck_nudge` (+ the three above) into a per-dependency state / recovery-count / MTTR / escalation / SLO view. Raw `bus query` recipes (recovery events, MTTR, flapping deps, escalations, stuck nudges, "anything DOWN right now") are in `skills/bus/SKILL.md` → "Resilience & self-healing queries".
 
 **Schema rules:**
 - Producer: add new optional fields freely, no version bump. Breaking changes → bump `schema_v`.

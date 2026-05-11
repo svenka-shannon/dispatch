@@ -382,6 +382,52 @@ rm -f /tmp/dispatch-watchdog-crashes.txt
 ~/dispatch/bin/watchdog
 ```
 
+## Dependency Health Framework
+
+External dependencies the daemon relies on (chrome-control's MV3 service worker,
+signal-cli, bus consumers, disk, FD usage) are all monitored by a single
+`DependencyHealthRunner` (`assistant/dependency_health.py`), with the concrete
+checks defined in `assistant/dependency_checks.py`. Each dependency is a
+`DependencyCheck` (dataclass): a `probe` (→ `OK`/`DEGRADED`/`DOWN`/`SKIP`), an
+optional `recover`, a poll `interval_s`, a bounded retry schedule
+(`max_attempts`, `backoff_s`), an `escalate` callback (default: SMS the admin —
+`Manager._send_sms` → `send-sms` CLI, NOT via a chat session), and an
+`enabled_when` gate (e.g. `chrome_control` only when Chrome.app is running).
+
+Per-dependency state machine: `HEALTHY → DEGRADED → DOWN → RECOVERING →
+(HEALTHY | ESCALATED)`. On `DOWN`: attempt `recover()` up to `max_attempts` with
+`backoff_s` between attempts; success → `HEALTHY` (+ recovery event); exhausted
+→ `ESCALATED` + escalate. From `ESCALATED` it keeps probing; a later good probe
+→ `HEALTHY` ("recovered after escalation"). Escalations are rate-limited per
+dependency (one SMS per incident, re-SMS at most every few hours while still
+down). A **recovery-frequency alarm** escalates if a dependency self-recovers
+>5×/hour ("auto-recovery must never silently mask a worsening problem").
+
+Probes/recoveries run **off the main loop** (`asyncio.to_thread`) with per-check
+timeouts and overlap guards — they never block message routing. The runner is
+ticked from the poll loop every ~15s (`Manager._run_with_registry` builds it via
+`build_default_registry(self)`; the poll loop calls `self._dep_health_runner.tick()`).
+Every transition + recovery attempt + escalation emits a `health.dependency` bus
+event (`system` topic) and an authoritative manager-log line; healthy
+steady-state is DEBUG-only.
+
+Migrated checks: `chrome_control` (90s; probe `chrome ping`, recover `chrome
+reset`, escalate on the errored-extension state — `chrome reset`/`wake` exits
+non-zero — with the exact "reload at chrome://extensions/ → Developer mode →
+reload ⟳" fix; replaces the old standalone `_run_chrome_control_check`),
+`signal_cli` (300s; probe the JSON-RPC socket, recover = restart the signal-cli
+daemon with `--receive-mode on-connection`; replaces the old 5-min ad-hoc
+check), `bus_consumers` (300s; probe ConsumerRunner thread + DEAD registry
+members, recover = rebuild + restart the consumer thread), `disk` (300s; probe
+APFS-aware usage, recover = clean known temp dirs, else escalate), `fd_leak`
+(300s; probe untracked FD growth via ResourceRegistry, no auto-recovery →
+escalate). **Not migrated:** `sdk_sessions` — `health.py`'s fast-regex + deep-Haiku
+verdict logic is load-bearing and stays as the daemon's own periodic check (its
+recovery/escalation routing through the framework is deferred).
+
+The blocked-session watchdog (`_run_stuck_session_check`, Phase 1) is a separate
+concern — not a "dependency" — and stays as its own periodic check.
+
 ## Scheduling Tasks
 
 **CRITICAL: NEVER create new LaunchAgents or launchd plists for scheduled tasks.** The ONLY LaunchAgents allowed are:
@@ -589,7 +635,7 @@ extra-paths = [
 | `health.haiku_verdict` | check_run_id, check_type (deep/stuck), session_name, chat_id, verdict (FATAL/HEALTHY/STUCK/WORKING), action_taken (restart/none) | `bus replay system --type health.haiku_verdict --limit 50` |
 | `health.circuit_breaker` | check_run_id? (see below), session_name, chat_id, transition (opened/closed), restart_count | `bus replay system --type health.circuit_breaker --limit 50` |
 | `health.quota_alert` | quota_type (5-hour/7-day all/7-day sonnet/7-day opus/extra usage), utilization, threshold, resets_at | `bus replay system --type health.quota_alert --limit 50` |
-| `health.chrome_check` | status (ok/wedged/chrome_not_running/cli_missing), action_taken (reset/none), detail, ping_rc?/ping_output?/ping_timed_out?, reset_rc?/reset_output?/reset_timed_out? — emitted on recovery attempt or ok↔wedged transition (daemon checks chrome-control every ~90s, auto-runs `chrome reset` if wedged) | `bus replay system --type health.chrome_check --limit 50` |
+| `health.dependency` (source=`dependency_health`, key=`<name>`) | name (chrome_control/signal_cli/bus_consumers/disk/fd_leak), state (HEALTHY/DEGRADED/DOWN/RECOVERING/ESCALATED), prev_state, action_taken (probe/recover/escalate/none), attempt?/max_attempts? (when RECOVERING), recovered?/recovered_after_escalation? flags, detail, plus check-specific diagnostics (probe_rc, probe_output, probe_timed_out, recover_rc, recover_output, recover_timed_out, disable_reason, dead_members, used_pct, free_gb, fd_actual, ...). Emitted on every state transition + every recovery attempt + every escalation (incl. the recovery-frequency alarm — >5 self-recoveries/hr); healthy steady-state is log-DEBUG only. Replaces the old `health.chrome_check` event. | `bus replay system --type health.dependency --limit 50` · per-dep: `bus search chrome_control --topic system` · recoveries in 24h: filter `action_taken=recover` |
 | `health.bus_check` | status:"ok" — startup canary only | N/A |
 | `session.stuck_nudge` (topic: `sessions`) | session_name, chat_id, idle_minutes, detection (marker/heuristic), contact_name?, committed_text? — blocked-session watchdog nudged an idle session that still has an outstanding commitment (a `claude-assistant commitment set` marker, or a last message matching a small commitment-phrase list); the nudge tells the session to re-check the blocker / escalate with a specific ask. Idle threshold N is `watchdog.stuck_session_idle_minutes` in config (default 5); ~75s cadence; per-session 2×N back-off so it nudges once, then the session escalates. | `bus replay sessions --type session.stuck_nudge --limit 50` |
 

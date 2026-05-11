@@ -80,7 +80,7 @@ from assistant.bus_helpers import (
     health_check_payload, service_restarted_payload, service_spawned_payload,
     reminder_payload, healme_payload,
     compaction_triggered_payload, message_sent_payload, session_injected_payload,
-    quota_alert_payload, chrome_check_payload,
+    quota_alert_payload,
     produce_read_receipt,
 )
 
@@ -2128,9 +2128,12 @@ class Manager:
         # Health check background task flag (prevents overlapping runs)
         self._health_check_running = False
 
-        # chrome-control health check guard + last-known status (for transition logging)
-        self._chrome_check_running = False
-        self._chrome_last_status: str | None = None
+        # Unified dependency health & recovery framework (self-healing-resilience
+        # plan §4.1). Holds the registry of external-dependency checks
+        # (chrome_control, signal_cli, bus_consumers, disk, fd_leak) — each with
+        # probe/recover/backoff/escalate. Built in run() once the manager is wired
+        # up; ticked from the poll loop. Replaces the ad-hoc chrome-control check.
+        self._dep_health_runner = None  # set in _run_with_registry()
 
         # Blocked-session watchdog: prevents a session from idling forever with an
         # outstanding commitment ("I'll do X" / "waiting on you"). See
@@ -4081,54 +4084,12 @@ class Manager:
                 service_restarted_payload("discord_listener", "died"), source="health")
             self._start_discord_listener()
 
-    async def _run_chrome_control_check(self):
-        """Probe chrome-control and recover it if the MV3 service worker is wedged.
-
-        Runs ~every 90s from the main loop (fire-and-forget task), so a wedged
-        chrome-control is caught within ~1-2 min without waiting for a chat
-        session to notice. The blocking `chrome ping` / `chrome reset`
-        subprocesses run via asyncio.to_thread so the daemon loop never blocks.
-
-        Skips entirely if the Google Chrome app isn't running (user closed it
-        deliberately) — `chrome reset`/`wake` would relaunch it.
-
-        Emits a `health.chrome_check` bus event whenever a recovery is attempted
-        or the ok↔wedged state transitions; otherwise just DEBUG-logs.
-        """
-        from assistant.health import check_chrome_control
-        try:
-            check = await asyncio.to_thread(check_chrome_control)
-        except Exception as e:
-            log.error(f"CHROME_CHECK | failed: {e}")
-            return
-
-        status = check.get("status", "unknown")
-        prev = self._chrome_last_status
-        self._chrome_last_status = status
-
-        action = check.get("action_taken", "none")
-        recovery_attempted = action != "none"
-        transitioned = prev is not None and prev != status
-        # Treat first observation that isn't plainly "ok" as worth surfacing too.
-        notable = recovery_attempted or transitioned or (prev is None and status != "ok")
-
-        if status == "wedged":
-            log.warning(
-                f"CHROME_CHECK | wedged — {check.get('detail', '')} | "
-                f"ping={check.get('ping_output', '')!r} | "
-                f"reset_rc={check.get('reset_rc')} reset_out={check.get('reset_output', '')!r}"
-            )
-        elif status in ("chrome_not_running", "cli_missing"):
-            log.debug(f"CHROME_CHECK | {status} — {check.get('detail', '')}")
-        else:  # ok
-            if notable:
-                log.info(f"CHROME_CHECK | recovered/ok — {check.get('detail', '')}")
-            else:
-                log.debug(f"CHROME_CHECK | ok — {check.get('detail', '')}")
-
-        if notable:
-            produce_event(self._producer, "system", "health.chrome_check",
-                          chrome_check_payload(check), source="health")
+    # chrome-control health is now a framework-registered dependency
+    # ("chrome_control" in assistant/dependency_checks.py). The old standalone
+    # _run_chrome_control_check() / _chrome_check_running / _chrome_last_status
+    # were removed in the Phase 2 unification — recovery used to run twice.
+    # The DependencyHealthRunner now emits `health.dependency` events instead of
+    # `health.chrome_check` (see CLAUDE.md "Diagnostic Events" table).
 
     # ── Blocked-session watchdog ────────────────────────────────────────
     #
@@ -4617,8 +4578,13 @@ class Manager:
         the main message processing loop. Includes:
         - Session health_check_all (liveness)
         - Tier 2 deep Haiku analysis
-        - Signal daemon health
-        - Dispatch API health
+        - Discord listener / Dispatch API / Metro health
+        - Quota fetch + cache write
+        - perf gauges for FDs / disk
+
+        NOTE: signal-cli, disk recovery/escalation, and FD-leak escalation are
+        owned by the DependencyHealthRunner (assistant/dependency_checks.py) —
+        this method only emits the perf gauges for FDs/disk, not the alarms.
         """
         try:
             log.info("Running session health check (background)...")
@@ -4634,12 +4600,11 @@ class Manager:
                 log.error(f"Deep health check failed: {e}")
 
             # --- Service health checks (each isolated so one failure can't block others) ---
-
-            if SIGNAL_ENABLED:
-                try:
-                    self._check_signal_health()
-                except Exception as e:
-                    log.error(f"Signal health check failed: {e}")
+            #
+            # NOTE: signal-cli health + restart is now owned by the
+            # DependencyHealthRunner's "signal_cli" check (probe socket → restart
+            # with --receive-mode on-connection → escalate after 3). We no longer
+            # call _check_signal_health() here — that would recover twice.
 
             try:
                 self._check_discord_health()
@@ -4666,16 +4631,14 @@ class Manager:
                                status['fd_actual'] - status['fd_baseline'] - status['fd_tracked'],
                                component="daemon")
 
-                    # Check for untracked FD leaks
-                    warnings = self._resource_registry.check_fd_leaks(threshold=40)
-                    for w in warnings:
+                    # Untracked-FD leak detection + escalation is now owned by the
+                    # DependencyHealthRunner's "fd_leak" check (no auto-recovery —
+                    # a real FD leak needs a code fix → escalate). We still record
+                    # the calibrated leak warnings to the log here for the
+                    # authoritative trail / grep, but the alarm path lives in the
+                    # framework.
+                    for w in self._resource_registry.check_fd_leaks(threshold=40):
                         log.warning(f"FD_LEAK | {w}")
-
-                    # Also warn on absolute count
-                    if status['fd_actual'] > 200:
-                        log.warning(f"FD_WARNING | open_fds={status['fd_actual']} | "
-                                    f"tracked={status['total']} | "
-                                    f"baseline={status['fd_baseline']}")
                 else:
                     # Fallback if registry not yet initialized
                     fd_count = len(os.listdir('/dev/fd'))
@@ -4685,20 +4648,17 @@ class Manager:
             except Exception:
                 pass
 
-            # Disk space monitoring — alert admin if disk is filling up
+            # Disk space — perf gauges only. Detection / recovery (clean temp
+            # dirs) / escalation is owned by the DependencyHealthRunner's "disk"
+            # check (it both warns and, if critical, attempts a cleanup before
+            # escalating). We keep emitting the gauges here for the perf trail.
             try:
-                from assistant.health import check_disk_space, should_send_disk_alert
-                from assistant import config
+                from assistant.health import check_disk_space
                 disk = check_disk_space()
                 perf.gauge("disk_used_pct", disk["used_pct"], component="daemon")
                 perf.gauge("disk_free_gb", disk["free_gb"], component="daemon")
-
                 if disk["message"]:
                     log.warning(f"DISK | {disk['message']}")
-                    if should_send_disk_alert():
-                        admin_phone = config.get("owner.phone")
-                        if admin_phone:
-                            self._send_sms(admin_phone, f"[SVEN] ⚠️ {disk['message']}")
             except Exception as e:
                 log.error(f"Disk space check failed: {e}")
 
@@ -5607,6 +5567,18 @@ You have 15 minutes. Work efficiently.
         # Start audit consumers (background thread)
         self._consumer_thread = self._start_consumer_thread()
 
+        # Build the unified dependency-health runner (chrome_control, signal_cli,
+        # bus_consumers, disk, fd_leak). Probes/recoveries run off the main loop;
+        # the runner is ticked from the poll loop below. No resources to release —
+        # it captures the manager and shells out per-cycle — so no registry entry.
+        try:
+            from assistant.dependency_checks import build_default_registry
+            self._dep_health_runner = build_default_registry(self)
+            log.info(f"DEP_HEALTH | registered checks: {', '.join(self._dep_health_runner.names())}")
+        except Exception as e:
+            log.error(f"DEP_HEALTH | failed to build registry: {e}")
+            self._dep_health_runner = None
+
         # Start message-router consumer (async task — processes messages from bus)
         self._consumer_task = asyncio.create_task(
             self._run_message_consumer(), name="message-consumer"
@@ -5784,11 +5756,13 @@ You have 15 minutes. Work efficiently.
         last_fast_health = time.time()
         FAST_HEALTH_INTERVAL = 60  # 1 minute
 
-        # Track chrome-control health check — tight interval so a wedged MV3
-        # service worker is caught + auto-recovered within ~1-2 min, not 5+.
-        # First check ~15s after start.
-        last_chrome_check = time.time() - (90 - 15)
-        CHROME_CHECK_INTERVAL = 90  # 1.5 minutes
+        # Dependency-health runner tick — the runner internally rate-limits each
+        # check to its own interval_s (chrome_control 90s, signal_cli/bus/disk/fd
+        # 300s) and runs probes/recoveries off the main loop. We just poke it
+        # every ~15s so a due check fires within ~15s of its interval elapsing.
+        # First tick ~10s after start.
+        last_dep_health_tick = time.time() - (15 - 10)
+        DEP_HEALTH_TICK_INTERVAL = 15
 
         # Track blocked-session watchdog — nudges a session that's gone idle
         # with an outstanding commitment. ~75s cadence so a stuck session is
@@ -5979,26 +5953,16 @@ You have 15 minutes. Work efficiently.
                         log.error(f"Fast health check failed: {e}")
                     last_fast_health = time.time()
 
-                # chrome-control health check (background, non-blocking, ~90s)
-                if time.time() - last_chrome_check > CHROME_CHECK_INTERVAL:
-                    if not self._chrome_check_running:
-                        self._chrome_check_running = True
-                        async def _chrome_check_guarded():
-                            try:
-                                await asyncio.wait_for(
-                                    self._run_chrome_control_check(),
-                                    timeout=60,  # ping(12s) + reset(30s) + slack
-                                )
-                            except asyncio.TimeoutError:
-                                log.error("CHROME_CHECK | timed out after 60s — clearing guard")
-                            except Exception as e:
-                                log.error(f"CHROME_CHECK | error: {e}")
-                            finally:
-                                self._chrome_check_running = False
-                        asyncio.create_task(
-                            _chrome_check_guarded(), name="chrome-control-check"
-                        )
-                    last_chrome_check = time.time()
+                # Dependency-health runner tick (non-blocking — fires due checks
+                # as fire-and-forget tasks; each check runs its probe/recover off
+                # the main loop with a per-check timeout + overlap guard).
+                if time.time() - last_dep_health_tick > DEP_HEALTH_TICK_INTERVAL:
+                    if self._dep_health_runner is not None:
+                        try:
+                            self._dep_health_runner.tick()
+                        except Exception as e:
+                            log.error(f"DEP_HEALTH | tick failed: {e}")
+                    last_dep_health_tick = time.time()
 
                 # blocked-session watchdog (background, non-blocking, ~75s)
                 if time.time() - last_stuck_check > STUCK_CHECK_INTERVAL:

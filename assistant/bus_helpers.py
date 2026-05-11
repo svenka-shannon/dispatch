@@ -37,6 +37,7 @@ Topic/type taxonomy (v6):
                 quota.fetched, quota.fetch_failed (source=daemon),
                 health.haiku_verdict, health.circuit_breaker,
                 health.quota_alert, health.bus_check (source=health),
+                health.dependency (source=dependency_health, key=<dep name>),
                 auth_dialog.event (source=auth-dialog-monitor),
                 auth_dialog.approved, auth_dialog.denied,
                 auth_dialog.always_approved (source=auth-dialog-approve)
@@ -51,7 +52,8 @@ Source column semantics per topic:
     messages:   transport layer — "imessage", "signal", "test"
     sessions:   origin context — "daemon", "health", "ipc", "inject", "sdk"
     system:     component name — "daemon", "watchdog", "health", "consolidation",
-                "consumer", "reminder", "healme", "vision", "compaction", "sdk", "signal"
+                "consumer", "reminder", "healme", "vision", "compaction", "sdk", "signal",
+                "dependency_health"
     reminders:  "reminder-poller"
     tasks:      "task-runner", "reminder-scheduler"
     facts:      "fact-cli", "consolidation"
@@ -351,10 +353,23 @@ def service_spawned_payload(service: str, pid: int, **extra) -> dict:
 #   schema_v:1, quota_type(5-hour|7-day all|7-day sonnet|7-day opus|extra usage),
 #   utilization, threshold, resets_at, timestamp
 #
-# health.chrome_check:
+# health.chrome_check:  [LEGACY — superseded by health.dependency, kept for back-compat]
 #   schema_v:1, status(ok|wedged|chrome_not_running|cli_missing),
 #   action_taken(reset|none), detail, timestamp,
 #   ping_rc?/ping_output?/ping_timed_out?, reset_rc?/reset_output?/reset_timed_out?
+#
+# health.dependency:  (source="dependency_health", key=<dep name>)
+#   schema_v:1, name(chrome_control|signal_cli|bus_consumers|disk|fd_leak),
+#   state(HEALTHY|DEGRADED|DOWN|RECOVERING|ESCALATED), prev_state,
+#   action_taken(probe|recover|escalate|none), detail, timestamp,
+#   attempt?/max_attempts?(when RECOVERING),
+#   recovered?/recovered_after_escalation? flags,
+#   plus flat check-specific diagnostics (probe_rc, probe_output, probe_timed_out,
+#   recover_rc, recover_output, recover_timed_out, disable_reason, dead_members,
+#   used_pct, free_gb, fd_actual, fd_delta, recoveries_in_window, ...).
+#   Built inline by assistant/dependency_health.DependencyHealthRunner._emit().
+#   Emitted on every state transition + every recovery attempt + every escalation
+#   (incl. the recovery-frequency alarm); healthy steady-state is DEBUG-log only.
 #
 # health.bus_check:
 #   status:"ok" — startup canary only

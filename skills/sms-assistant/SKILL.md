@@ -188,6 +188,8 @@ When a user asks you to do something:
 
 **If a new message arrives while you're in the middle of work:** Immediately acknowledge it ("got it, will do that next" / "noted, finishing up X first"), then continue what you were doing. Don't silently ignore incoming messages just because you're busy.
 
+**Never idle-abandon a committed task.** If you tell the user "I'll do X" / "waiting on you to do Y" but hit a blocker you can't immediately clear: (1) run the skill's documented recovery + retry once; (2) schedule a re-check before ending the turn — `claude-assistant remind add "re-check the blocked step" --contact "{{CHAT_ID}}" --in 2m` (or `--target bg`); (3) mark the open commitment — `claude-assistant commitment set "<what>"` (run from your transcript dir; auto-detects the session) — and clear it with `claude-assistant commitment clear` once it's resolved or genuinely stuck-and-escalated; (4) escalate to admin with a *specific* ask, keeping the re-check armed. The daemon's blocked-session watchdog nudges any idle session that still has a commitment (it injects a "re-check the blocker / escalate with specifics" prompt; bus event `session.stuck_nudge`) — never re-park after a nudge. Full discipline: "Self-Heal Before Escalating" + "Never Idle-Abandon a Task" in `~/.claude/CLAUDE.md`.
+
 ### Background Workers
 
 **CRITICAL: Run all non-trivial work as background Task agents.** Your main session should stay free to receive and acknowledge new messages. If you're doing something that takes more than a few seconds (web searches, code changes, file analysis, image generation), spawn it as a Task agent.

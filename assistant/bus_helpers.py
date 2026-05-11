@@ -14,7 +14,7 @@ Topic/type taxonomy (v6):
     sessions  — session.created/restarted/killed/compacted/crashed/injected,
                 session.idle_killed, session.prewarmed, session.tier_mismatch,
                 session.prompt_built, session.receive_error,
-                session.stop_failed, session.model_changed,
+                session.stop_failed, session.model_changed, session.stuck_nudge,
                 permission.denied, command.restart (keyed by chat_id)
     system    — daemon.started/stopped/crashed/recovered,
                 health.check_completed, health.check_failed,
@@ -230,6 +230,34 @@ def session_injected_payload(chat_id: str, injection_type: str,
         payload["contact_name"] = contact_name
     if tier:
         payload["tier"] = tier
+    payload.update(extra)
+    return payload
+
+
+def stuck_nudge_payload(session_name: str, chat_id: str, idle_minutes: float,
+                        detection: str, contact_name: str | None = None,
+                        committed_text: str | None = None, **extra) -> dict:
+    """Build a session.stuck_nudge payload (sessions topic).
+
+    Emitted by the blocked-session watchdog when it nudges a session that went
+    idle with an outstanding commitment to the user.
+
+    detection: "marker" (session set an explicit pending_commitment marker) or
+               "heuristic" (matched a commitment phrase in the last outbound text)
+    committed_text: the marker text, or the matched snippet for the heuristic case
+    """
+    payload = {
+        "schema_v": 1,
+        "session_name": session_name,
+        "chat_id": chat_id,
+        "idle_minutes": round(idle_minutes, 1),
+        "detection": detection,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    if contact_name:
+        payload["contact_name"] = contact_name
+    if committed_text:
+        payload["committed_text"] = committed_text
     payload.update(extra)
     return payload
 

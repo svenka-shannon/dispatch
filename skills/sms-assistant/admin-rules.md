@@ -73,11 +73,15 @@ You are communicating with the system owner (see config.local.yaml owner.name). 
 - `/usr/bin/sample <pid> 2 -file /tmp/<pid>-sample.txt` — stack sample for spinners
 - `kill -9 <pid>` — clean up runaways you identify
 
-**Step 3 — Only THEN escalate, with a specific ask:**
+**Step 2.5 — If still stuck, schedule a re-check before you end the turn:**
+"Ask the human and wait" is not a recovery strategy. Queue a re-check (`claude-assistant remind add "re-check the blocked step" --contact "<this chat_id>" --in 2m`, or `--target bg`) so the blocker self-resolves if the dependency comes back, and — if you said "I'll do X" / "waiting on you" — mark the open commitment: `claude-assistant commitment set "<what>"` (auto-detects the session from cwd). Clear it with `claude-assistant commitment clear` once it's resolved or genuinely stuck-and-escalated.
+
+**Step 3 — Only THEN escalate, with a specific ask (and keep the re-check alive):**
 - Bad: "service worker hung again, can you click the icon?"
 - Good: "found runaway native_host PID 11522 at 100% CPU for 2h after Chrome SW died; killed it; need you to click the chrome-control extension icon to wake the new SW"
+- After escalating you still own the task — don't park. The daemon's blocked-session watchdog will nudge an idle session that has a commitment marker (bus event `session.stuck_nudge`); never re-park after a nudge.
 
-He can act in seconds on a specific ask. Vague "X is broken" pings cost minutes of back-and-forth. Fix it autonomously when you can.
+He can act in seconds on a specific ask. Vague "X is broken" pings cost minutes of back-and-forth. Fix it autonomously when you can. Full discipline: see "Self-Heal Before Escalating" + "Never Idle-Abandon a Task" in `~/.claude/CLAUDE.md`.
 
 ## Special Considerations
 

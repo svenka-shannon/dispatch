@@ -51,6 +51,13 @@ podcast:
 hooks:
   compact_notify: true  # Send SMS for both pre-compact ("Compacting…") and post-compact ("Done compacting ✓")
 
+watchdog:
+  # Blocked-session watchdog: a session that's gone idle this many minutes with
+  # an outstanding commitment (a `commitment set` marker, or a last message that
+  # reads like an "I'll …/waiting on you" promise) gets a "re-check the blocker /
+  # escalate with specifics" nudge. Default 5.
+  stuck_session_idle_minutes: 5
+
 chrome:
   profiles:
     0:

@@ -1066,6 +1066,66 @@ def cmd_remind(args):
         return 1
 
 
+def _session_name_from_cwd() -> Optional[str]:
+    """Derive the session name ({backend}/{folder}) from the caller's working dir.
+
+    Sessions run with cwd = ~/transcripts/{backend}/{sanitized_chat_id}/, which
+    is exactly the session name. The `claude-assistant` wrapper exports
+    DISPATCH_CALLER_CWD before it `cd`s into the repo, so prefer that; fall back
+    to the process cwd. Returns None if not inside a transcript dir.
+    """
+    transcripts_dir = (Path.home() / "transcripts").resolve()
+    candidate = os.environ.get("DISPATCH_CALLER_CWD") or os.getcwd()
+    try:
+        rel = Path(candidate).resolve().relative_to(transcripts_dir)
+    except (ValueError, OSError):
+        return None
+    parts = rel.parts
+    if len(parts) < 2:
+        return None
+    return f"{parts[0]}/{parts[1]}"
+
+
+def cmd_commitment(args):
+    """Set/clear/show a session's outstanding-commitment marker.
+
+    A session should `commitment set "<what>"` whenever it tells the user
+    "I'll do X" / "waiting on you to do Y", and `commitment clear` once that's
+    resolved (or escalated). The daemon's blocked-session watchdog nudges any
+    idle session that still has a marker — so a stuck task never just stalls.
+    """
+    from assistant.commitments import set_commitment, clear_commitment, get_commitment
+
+    session_name = getattr(args, "session", None) or _session_name_from_cwd()
+    if not session_name:
+        print("Error: could not determine session — run from a transcript dir or pass --session <backend>/<id>", file=sys.stderr)
+        return 1
+
+    sub = getattr(args, "commitment_command", None)
+    if sub == "set":
+        text = (args.text or "").strip()
+        if not text:
+            print("Error: commitment text is required", file=sys.stderr)
+            return 1
+        path = set_commitment(session_name, text)
+        print(f"Commitment set for {session_name}: {text}\n  ({path})")
+        return 0
+    elif sub == "clear":
+        existed = clear_commitment(session_name)
+        print(f"Commitment cleared for {session_name}" if existed else f"No commitment was set for {session_name}")
+        return 0
+    elif sub == "show" or sub is None:
+        c = get_commitment(session_name)
+        if c:
+            print(f"{session_name}: {c.get('text')}  (set at {c.get('set_at')})")
+        else:
+            print(f"{session_name}: no outstanding commitment")
+        return 0
+    else:
+        print(f"Unknown commitment command: {sub}", file=sys.stderr)
+        return 1
+
+
 def cmd_menubar(args):
     """Start the menu bar app (foreground)."""
     menubar_script = ASSISTANT_DIR / "bin" / "claude-menubar"
@@ -1381,6 +1441,19 @@ def main():
     auth_subparsers.add_parser("status", help="Show current auth mode (default)")
     auth_subparsers.add_parser("reset", help="Clear state/auth_mode.json — flips back to OAuth on next daemon restart")
 
+    # commitment - per-session outstanding-commitment marker (read by the
+    # blocked-session watchdog so a stuck task never just idles)
+    commitment_parser = subparsers.add_parser(
+        "commitment",
+        help="Set/clear/show this session's outstanding-commitment marker",
+    )
+    commitment_parser.add_argument("--session", help="Session name (default: derived from cwd)")
+    commitment_subparsers = commitment_parser.add_subparsers(dest="commitment_command", help="Commitment subcommands")
+    c_set = commitment_subparsers.add_parser("set", help="Record an outstanding commitment")
+    c_set.add_argument("text", help="What you committed to (e.g. 'waiting on the user to reload the extension')")
+    commitment_subparsers.add_parser("clear", help="Clear the outstanding commitment (task done / escalated)")
+    commitment_subparsers.add_parser("show", help="Show the current commitment (default)")
+
     # remind - native reminder system
     remind_parser = subparsers.add_parser("remind", help="Manage native reminders")
     remind_subparsers = remind_parser.add_subparsers(dest="remind_command", help="Reminder commands")
@@ -1450,6 +1523,7 @@ def main():
         "watchdog-uninstall": cmd_watchdog_uninstall,
         "watchdog-status": cmd_watchdog_status,
         "inject-prompt": cmd_inject_prompt,
+        "commitment": cmd_commitment,
         "remind": cmd_remind,
         "auth": cmd_auth,
         "dispatch-investigation": cmd_dispatch_investigation,

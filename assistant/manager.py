@@ -2132,6 +2132,13 @@ class Manager:
         self._chrome_check_running = False
         self._chrome_last_status: str | None = None
 
+        # Blocked-session watchdog: prevents a session from idling forever with an
+        # outstanding commitment ("I'll do X" / "waiting on you"). See
+        # _run_stuck_session_check(). Guard against overlapping runs + per-session
+        # backoff so we nudge once, then escalate-via-the-session — never spam.
+        self._stuck_check_running = False
+        self._last_stuck_nudge_at: Dict[str, float] = {}  # session_name -> monotonic-ish time.time()
+
         # Message consumer: asyncio.Event for near-zero-latency notification
         self._consumer_notify = asyncio.Event()
         self._consumer_executor = ThreadPoolExecutor(1, thread_name_prefix="bus-consumer")
@@ -4123,6 +4130,169 @@ class Manager:
             produce_event(self._producer, "system", "health.chrome_check",
                           chrome_check_payload(check), source="health")
 
+    # ── Blocked-session watchdog ────────────────────────────────────────
+    #
+    # Default idle threshold (minutes) before a session that went quiet with an
+    # outstanding commitment gets nudged. Overridable via
+    # config.local.yaml: `watchdog.stuck_session_idle_minutes`.
+    STUCK_SESSION_IDLE_MINUTES_DEFAULT = 5.0
+
+    def _stuck_session_idle_minutes(self) -> float:
+        """Idle threshold N (minutes), from config (default 5)."""
+        from assistant import config
+        try:
+            val = config.get("watchdog.stuck_session_idle_minutes",
+                              self.STUCK_SESSION_IDLE_MINUTES_DEFAULT)
+            return float(val)
+        except (TypeError, ValueError):
+            return self.STUCK_SESSION_IDLE_MINUTES_DEFAULT
+
+    async def _run_stuck_session_check(self):
+        """Nudge any session that's gone idle with an outstanding commitment.
+
+        The 2026-05-11 outage: a session hit a wedged tool, tried the documented
+        recovery once, asked the human to do something, then parked idle for ~1h.
+        "Ask the human and wait" is not a recovery strategy. This backstop catches
+        a quiet-but-committed session within ~N min and injects a system nudge
+        telling it to re-check the blocker / escalate with a specific ask.
+
+        Detection (two ways, marker preferred):
+          - marker: the session set a `pending_commitment` via
+            `claude-assistant commitment set ...` (a small file under
+            state/commitments/). Authoritative; the session is *expected* to set
+            this when it tells the user "I'll do X".
+          - heuristic: no marker → scan the session's last outbound text for a
+            small, conservative set of commitment phrases ("I'll …", "working on
+            it", "waiting on you …", "once you …", "let me know … and I'll …").
+
+        Idle = not currently in a turn (`not is_busy`), empty message queue, and
+        `last_activity` older than N min (config: watchdog.stuck_session_idle_minutes,
+        default 5). Don't-spam: per-session backoff of 2×N — one nudge, then the
+        session itself escalates (it has send-sms + the "Self-Heal Before
+        Escalating" rule); we re-arm only after the session does another turn.
+
+        Emits a `session.stuck_nudge` bus event (sessions topic) + a manager-log
+        line on each nudge. Non-blocking: all reads are in-process / cheap; the
+        commitment-marker GC touches a few tiny files off the hot path.
+        """
+        from datetime import datetime as _dt, timezone as _tz
+        from assistant.commitments import (
+            get_commitment, clear_commitment, commitment_age_seconds,
+            looks_like_commitment, COMMITMENT_MAX_AGE_SECONDS,
+        )
+        from assistant.bus_helpers import stuck_nudge_payload
+
+        n_minutes = self._stuck_session_idle_minutes()
+        idle_threshold_s = n_minutes * 60.0
+        backoff_s = max(idle_threshold_s * 2.0, 120.0)  # 2×N, floor 2 min
+        now_wall = time.time()
+
+        # Snapshot the live sessions (dict can mutate concurrently).
+        try:
+            sessions_snapshot = list(self.sessions.sessions.items())
+        except Exception as e:
+            log.debug(f"STUCK_CHECK | could not snapshot sessions: {e}")
+            return
+
+        for chat_id, session in sessions_snapshot:
+            if chat_id == MASTER_SESSION:
+                continue
+            try:
+                session_name = getattr(session, "_session_name", None) or get_session_name(
+                    getattr(session, "chat_id", chat_id), getattr(session, "source", "imessage"))
+
+                # ── Idle gate ──
+                if getattr(session, "is_busy", False):
+                    continue
+                try:
+                    if session._message_queue.qsize() > 0:
+                        continue
+                except Exception:
+                    continue
+                last_activity = getattr(session, "last_activity", None)
+                if not isinstance(last_activity, _dt):
+                    continue
+                idle_s = (_dt.now() - last_activity).total_seconds()
+                if idle_s < idle_threshold_s:
+                    # Active recently — clear any stale nudge cooldown so the next
+                    # quiet-with-commitment period gets a fresh nudge.
+                    self._last_stuck_nudge_at.pop(session_name, None)
+                    continue
+
+                # ── Outstanding-commitment gate ──
+                detection: str | None = None
+                committed_text: str | None = None
+
+                commitment = get_commitment(session_name)
+                if commitment is not None:
+                    age = commitment_age_seconds(commitment)
+                    if age is not None and age > COMMITMENT_MAX_AGE_SECONDS:
+                        # Stale marker — GC it, don't nudge on it.
+                        clear_commitment(session_name)
+                        commitment = None
+                    else:
+                        detection = "marker"
+                        committed_text = str(commitment.get("text", ""))[:280]
+
+                if detection is None:
+                    snippet = looks_like_commitment(getattr(session, "last_assistant_text", None))
+                    if snippet:
+                        detection = "heuristic"
+                        committed_text = snippet[:280]
+
+                if detection is None:
+                    continue  # Normally-idle session with no commitment — leave it.
+
+                # ── Don't-spam gate ──
+                last_nudge = self._last_stuck_nudge_at.get(session_name)
+                if last_nudge is not None and (now_wall - last_nudge) < backoff_s:
+                    continue
+
+                idle_minutes = idle_s / 60.0
+                contact_name = getattr(session, "contact_name", "the user") or "the user"
+
+                # Build the nudge message injected into the session's queue.
+                ts_display = _dt.now().strftime("%Y-%m-%d %I:%M %p")
+                what = f' (you said: "{committed_text}")' if committed_text else ""
+                nudge = (
+                    f"---SYSTEM NUDGE [{ts_display}]---\n"
+                    f"You've been idle for ~{idle_minutes:.0f} min with an open commitment to "
+                    f"{contact_name}{what}.\n\n"
+                    "Do NOT just wait. Right now:\n"
+                    "1. Re-check whether the blocker has cleared (re-run the documented recovery / retry the blocked step once).\n"
+                    "2. If it cleared, continue the task and update the user.\n"
+                    "3. If it's still blocked, escalate to the admin with a SPECIFIC ask (per the 'Self-Heal Before Escalating' rule in CLAUDE.md) AND schedule a re-check (e.g. `claude-assistant remind add \"re-check the blocked step\" --contact \"<this chat_id>\" --in 2m`) so the blocker self-resolves if the dependency comes back.\n"
+                    "4. When done (or genuinely stuck and escalated), clear the marker: `claude-assistant commitment clear`.\n"
+                    "---END SYSTEM NUDGE---"
+                )
+
+                try:
+                    if session.is_alive():
+                        await session.inject(nudge)
+                    else:
+                        log.warning(f"STUCK_CHECK | {session_name} idle+committed but not alive — skipping nudge")
+                        continue
+                except Exception as e:
+                    log.error(f"STUCK_CHECK | failed to inject nudge into {session_name}: {e}")
+                    continue
+
+                self._last_stuck_nudge_at[session_name] = now_wall
+                log.warning(
+                    f"STUCK_CHECK | nudged {session_name} | idle={idle_minutes:.1f}min | "
+                    f"detection={detection} | committed={committed_text!r}"
+                )
+                produce_session_event(
+                    self._producer, getattr(session, "chat_id", chat_id), "session.stuck_nudge",
+                    stuck_nudge_payload(session_name, getattr(session, "chat_id", chat_id),
+                                        idle_minutes, detection,
+                                        contact_name=contact_name, committed_text=committed_text),
+                    source="watchdog",
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.error(f"STUCK_CHECK | error checking {chat_id}: {e}")
+
     def _check_dispatch_api(self):
         """Deep health check for Dispatch API — diagnostic only, no restarts.
 
@@ -5620,6 +5790,13 @@ You have 15 minutes. Work efficiently.
         last_chrome_check = time.time() - (90 - 15)
         CHROME_CHECK_INTERVAL = 90  # 1.5 minutes
 
+        # Track blocked-session watchdog — nudges a session that's gone idle
+        # with an outstanding commitment. ~75s cadence so a stuck session is
+        # caught + nudged (→ escalation) well within the 5-min SLO. First check
+        # ~20s after start.
+        last_stuck_check = time.time() - (75 - 20)
+        STUCK_CHECK_INTERVAL = 75  # 1.25 minutes
+
         # Track last idle check time
         last_idle_check = time.time()
         IDLE_CHECK_INTERVAL = 300  # Check for idle sessions every 5 minutes
@@ -5822,6 +5999,36 @@ You have 15 minutes. Work efficiently.
                             _chrome_check_guarded(), name="chrome-control-check"
                         )
                     last_chrome_check = time.time()
+
+                # blocked-session watchdog (background, non-blocking, ~75s)
+                if time.time() - last_stuck_check > STUCK_CHECK_INTERVAL:
+                    if not self._stuck_check_running:
+                        self._stuck_check_running = True
+                        async def _stuck_check_guarded():
+                            try:
+                                await asyncio.wait_for(
+                                    self._run_stuck_session_check(),
+                                    timeout=30,
+                                )
+                            except asyncio.TimeoutError:
+                                log.error("STUCK_CHECK | timed out after 30s — clearing guard")
+                            except asyncio.CancelledError:
+                                # SDK anyio cancel-scope leak — recover unless shutting down.
+                                task = asyncio.current_task()
+                                if task is not None:
+                                    while task.cancelling() > 0:
+                                        task.uncancel()
+                                if self._shutdown_flag:
+                                    raise
+                                log.warning("STUCK_CHECK | CancelledError (SDK cancel scope leak), recovered")
+                            except Exception as e:
+                                log.error(f"STUCK_CHECK | error: {e}")
+                            finally:
+                                self._stuck_check_running = False
+                        asyncio.create_task(
+                            _stuck_check_guarded(), name="stuck-session-check"
+                        )
+                    last_stuck_check = time.time()
 
                 # Periodic health check (runs in background, non-blocking)
                 if time.time() - last_health_check > HEALTH_CHECK_INTERVAL:

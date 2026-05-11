@@ -5,4 +5,9 @@
 ASSISTANT_DIR="$HOME/dispatch"
 UV="$(command -v uv || echo "$HOME/.local/bin/uv")"
 
+# Preserve the caller's working directory — some subcommands (e.g. `commitment`)
+# auto-detect the session from the transcript dir they were invoked in, and the
+# `cd` below would otherwise hide it.
+export DISPATCH_CALLER_CWD="$PWD"
+
 cd "$ASSISTANT_DIR" && exec "$UV" run python -m assistant.cli "$@"

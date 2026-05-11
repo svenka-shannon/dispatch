@@ -591,6 +591,7 @@ extra-paths = [
 | `health.quota_alert` | quota_type (5-hour/7-day all/7-day sonnet/7-day opus/extra usage), utilization, threshold, resets_at | `bus replay system --type health.quota_alert --limit 50` |
 | `health.chrome_check` | status (ok/wedged/chrome_not_running/cli_missing), action_taken (reset/none), detail, ping_rc?/ping_output?/ping_timed_out?, reset_rc?/reset_output?/reset_timed_out? — emitted on recovery attempt or ok↔wedged transition (daemon checks chrome-control every ~90s, auto-runs `chrome reset` if wedged) | `bus replay system --type health.chrome_check --limit 50` |
 | `health.bus_check` | status:"ok" — startup canary only | N/A |
+| `session.stuck_nudge` (topic: `sessions`) | session_name, chat_id, idle_minutes, detection (marker/heuristic), contact_name?, committed_text? — blocked-session watchdog nudged an idle session that still has an outstanding commitment (a `claude-assistant commitment set` marker, or a last message matching a small commitment-phrase list); the nudge tells the session to re-check the blocker / escalate with a specific ask. Idle threshold N is `watchdog.stuck_session_idle_minutes` in config (default 5); ~75s cadence; per-session 2×N back-off so it nudges once, then the session escalates. | `bus replay sessions --type session.stuck_nudge --limit 50` |
 
 **Cross-event correlation:** `bus search "<check_run_id_uuid>" --topic system` — shows all events from the same health check cycle.
 

@@ -83,15 +83,25 @@ If `chrome ping` or any other command **times out** — even though `/tmp/chrome
 - `/tmp/chrome_control.log` keeps showing heartbeats, no errors — log alone won't reveal it
 - Multiple `/tmp/chrome_control_*.sock` files exist
 
-**Recovery (do this BEFORE asking the user):**
+**Recovery — fully automatic, NEVER ask the user to click anything:**
 
 ```bash
-chrome reset
+chrome reset      # kill stuck host(s), then auto-wake the service worker
+chrome ping       # confirm — should print "Connected to Chrome Control extension"
 ```
 
-That subcommand kills any native_host.py processes, clears orphaned sockets, and wipes the registry. Then ask the user to **click the chrome-control extension's toolbar icon** (or the refresh button on its tile in `chrome://extensions/`). That gesture re-runs `connectNative()`, which spawns a fresh host and re-registers the profile.
+`chrome reset` now does the whole recovery itself:
+1. Wipes the registry, SIGKILLs all `native_host.py` processes, waits briefly.
+2. Re-checks for any host the SW's `onDisconnect` already respawned — if one came back, it preserves that host's socket (via `lsof`) and you're done ("fresh native_host(s) already spawned by SW").
+3. If no host came back, the SW itself is evicted — so `chrome reset` runs `chrome wake`, which opens a throwaway tab on the extension's own popup page (`chrome-extension://<id>/popup.html`). **Loading any extension page forces Chrome to start the service worker** — this is the programmatic equivalent of clicking the toolbar icon. It then waits for the host to re-register and closes the tab.
 
-`chrome reset` is safe to run anytime — Chrome will respawn a host the next time the extension calls `connectNative()`. There is no way to wake a dead MV3 service worker from outside Chrome without a user gesture (or a navigation/alarm/etc.), so the click is unavoidable. Just don't make the user troubleshoot the wedge first.
+So a wedged Chrome is self-healing now. The **only** time you should mention the toolbar icon to the user is if `chrome wake` prints *"Service worker did not come back within 15s"* — that means the extension is disabled or in an errored state, and a one-time manual reload at `chrome://extensions/` (Developer mode → reload ⟳) is genuinely required. After that one reload, everything is automatic again.
+
+Related commands:
+- `chrome wake` — revive an evicted SW without touching the host (use directly when the registry is empty / `chrome profiles` shows nothing).
+- `chrome reload-extension` — tell Chrome to reload the unpacked extension so it picks up `background.js` / `manifest.json` changes; the worker restarts, the host respawns, and it reconnects on its own (with a `chrome wake` fallback). Use after editing the extension instead of asking the user to hit reload in `chrome://extensions/`.
+
+**Why this works / why it used to need a click:** an MV3 service worker can't be woken "from outside" by an arbitrary process — but it *is* started whenever one of the extension's own pages loads, and Chrome happily opens `chrome-extension://` URLs from `open(1)`. Combined with the race-safe reset (which no longer kills a freshly-respawned host) and the `connectNativeHost()` singleton guard in `background.js` (which stops the alarm-vs-onDisconnect double-spawn that used to leak zombie hosts and burn the SW's crash budget), the wedge-loop that made the click necessary is gone.
 
 ## Multi-Profile Support
 

@@ -4,6 +4,7 @@
 
 const NATIVE_HOST_NAME = 'com.dispatch.chrome_control';
 let port = null;
+let connecting = false;
 let reconnectTimeout = null;
 
 // Track managed tabs and console/network data
@@ -103,12 +104,18 @@ chrome.debugger.onDetach.addListener((source) => {
 
 // Connect to native messaging host
 function connectNativeHost() {
-  if (port) return;
+  // Singleton guard: avoid duplicate spawns when both port.onDisconnect and
+  // the keepalive alarm race to reconnect after the native host dies.
+  if (port || connecting) return;
+  connecting = true;
 
   console.log('[ChromeControl] Connecting to native host:', NATIVE_HOST_NAME);
 
   try {
     port = chrome.runtime.connectNative(NATIVE_HOST_NAME);
+    // Clear the in-flight flag shortly after; if the port is still alive
+    // by then the connection succeeded, otherwise onDisconnect will reset it.
+    setTimeout(() => { if (port) connecting = false; }, 250);
 
     port.onMessage.addListener(async (message) => {
       console.log('[ChromeControl] Received:', message);
@@ -180,11 +187,14 @@ function connectNativeHost() {
     port.onDisconnect.addListener(() => {
       console.log('[ChromeControl] Disconnected:', chrome.runtime.lastError?.message);
       port = null;
+      connecting = false;
       scheduleReconnect();
     });
 
   } catch (error) {
     console.error('[ChromeControl] Connection failed:', error);
+    port = null;
+    connecting = false;
     scheduleReconnect();
   }
 }
@@ -1532,9 +1542,14 @@ async function clickByAccessibleName(tabId, name, role = null, index = 0) {
 // Initialize
 connectNativeHost();
 
-// Set up keepalive alarm to prevent service worker suspension
+// Set up keepalive alarm to prevent service worker suspension.
+// 0.5 min (30s) is Chrome's minimum periodic-alarm interval — anything smaller
+// is silently clamped to 30s and spams a console warning on every worker load.
+// This alarm is also our recovery backstop: if the worker is ever evicted, the
+// alarm fires, the worker wakes, runs the heartbeat handler below, and
+// reconnects the native host without any manual intervention.
 function setupKeepaliveAlarm() {
-  chrome.alarms.create('keepalive', { periodInMinutes: 0.4 }); // ~24 seconds
+  chrome.alarms.create('keepalive', { periodInMinutes: 0.5 }); // 30s — Chrome's minimum
 }
 
 // Set up hourly alarm for stale tab cleanup
@@ -1602,6 +1617,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
       } catch (e) {
         console.log('[ChromeControl] Heartbeat failed, reconnecting');
         port = null;
+        connecting = false;
         connectNativeHost();
       }
     } else {

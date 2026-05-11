@@ -31,6 +31,7 @@ addopts = "-m 'not live_api and not integration'"
 markers = [
     "live_api: tests that call real Claude API (run with -m live_api)",
     "integration: tests that require a running server (run with -m integration)",
+    "chaos: destructive resilience smoke tests (run via scripts/chaos-test.sh; gated on CLAUDE_LIVE_TESTS=1)",
 ]
 # tests/live/ has its own conftest that removes the SDK mock and imports the
 # real claude_agent_sdk.  Recursing into it during normal collection breaks

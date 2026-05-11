@@ -143,8 +143,8 @@ No new LaunchAgents (per `~/dispatch/CLAUDE.md` — only `com.dispatch.daemon` a
 **Phase 4 — observability:**
 - `bus query` recovery/MTTR recipes (document in the relevant SKILL/CLAUDE files); dependency-health dashboard panel.
 
-**Phase 5 — chaos testing:**
-- Live smoke tests gated on `CLAUDE_LIVE_TESTS=1` (existing pattern): kill the SW, kill `native_host`, kill Chrome, disable the extension, kill signal-cli, kill a bus consumer, exhaust FDs — assert recovery within the SLO and that escalation fires when it can't.
+**Phase 5 — chaos testing — done (suite shipped; awaiting a babysat live run):**
+- `tests/chaos/test_chaos_resilience.py` + `tests/chaos/conftest.py` — live smoke tests gated on `CLAUDE_LIVE_TESTS=1` (the most disruptive ones additionally on `CLAUDE_CHAOS_DESTRUCTIVE=1`): kill `native_host` (SW eviction wedge), kill Chrome.app (assert SKIP, no relaunch), errored-extension (mocked → escalates not loops), kill signal-cli (assert restart with `--receive-mode on-connection`), bus consumer crash (mocked recover + live no-DEAD-members invariant), FD leak (mocked → escalates, no auto-recovery), stuck-session nudge (mocked + structural live). Mocked/structural variants run in the normal `pytest` collection (`-m chaos`); the live set runs via `scripts/chaos-test.sh` (loud warning, interactive confirm, `--yes-i-mean-it` for destructive) and **should only be run after `claude-assistant restart` + `chrome reload-extension` with no chat session mid-task**. Docs in `CLAUDE.md` ("Chaos / resilience testing").
 
 ---
 

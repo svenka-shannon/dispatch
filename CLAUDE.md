@@ -583,6 +583,21 @@ tests/
 
 Tests use a `FakeClaudeSDKClient` (in `conftest.py`) that replaces the real Agent SDK. This lets us test the full session lifecycle — creation, injection, queue processing, health checks, error handling — without hitting the Claude API. The mock supports configurable delays and errors for performance/reliability testing.
 
+### Chaos / resilience testing
+
+`tests/chaos/` holds the Phase-5 chaos suite from `plans/self-healing-resilience.md` — it deliberately *breaks* live components (kills Chrome's `native_host.py`, quits Chrome.app, kills signal-cli, pokes the bus consumer, simulates an FD leak / errored extension) and asserts the self-healing loops recover within the §3 SLOs (detection ≤ ~2 min, recovery attempted ≤ ~30 s after, escalation ≤ ~5 min if it genuinely can't recover; chrome's daemon check is ~90 s so end-to-end ~2–3 min).
+
+**Every destructive test is gated.** `@requires_live` → needs `CLAUDE_LIVE_TESTS=1`; the most disruptive ones (quit Chrome.app, kill signal-cli, bus consumer) ALSO need `CLAUDE_CHAOS_DESTRUCTIVE=1` (`@requires_destructive`). With no env vars set, only the mocked/structural variants run (they're part of the normal `pytest` collection — `-m chaos` selects/excludes the suite). The mocked variants drive the *real* `DependencyHealthRunner` / `dependency_checks` probes & recoveries with fakes — no real kills.
+
+**Run it via the wrapper, not pytest directly:**
+```bash
+scripts/chaos-test.sh                  # mocked/structural only (safe)
+scripts/chaos-test.sh --live           # + moderately-disruptive live tests (native_host kill, etc.)
+scripts/chaos-test.sh --yes-i-mean-it  # + DESTRUCTIVE tests (quit Chrome, kill signal-cli, bus consumer)
+scripts/chaos-test.sh --live -k native_host   # pass a pytest -k filter through
+```
+The script prints a loud warning and requires an interactive `chaos` confirmation (and `--yes-i-mean-it` for the destructive set). **Only run the live/destructive set after `claude-assistant restart` + `chrome reload-extension`, when no chat session is mid-task, and with someone watching it** — otherwise the new Phase-1/2 loops aren't live in the running daemon and the live tests will (correctly) time out, and a destructive run can leave the extension needing a manual reload at `chrome://extensions/`.
+
 ### Linting Hook
 
 A PostToolUse hook automatically runs `ruff` and `ty` on Python files after edits.

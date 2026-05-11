@@ -434,6 +434,133 @@ def _find_transcript(session_cwd: str, session_id: Optional[str]) -> Optional[Pa
 
 
 # ──────────────────────────────────────────────────────────────
+# chrome-control health monitoring
+# ──────────────────────────────────────────────────────────────
+#
+# The chrome-control extension's MV3 service worker gets evicted/wedged
+# periodically. When that happens `chrome ping` hangs (it has a 30s internal
+# socket timeout) or exits non-zero. Recovery: `chrome reset` (SIGKILLs stuck
+# native_host.py procs and, if the SW is gone, runs `chrome wake` to revive it).
+#
+# We do NOT auto-launch Chrome: if the user closed Chrome they did it
+# deliberately. So we gate the whole check on Chrome already running.
+
+# Path to the chrome CLI. Resolve via ~/.claude (the canonical symlink target
+# in CLAUDE.md). No pre-existing constant for this in assistant/ — checked.
+CHROME_CLI = Path.home() / ".claude" / "skills" / "chrome-control" / "scripts" / "chrome"
+
+# Timeouts (seconds): ping gets a short one (its internal 30s is too slow for
+# our ~1-2 min detection target); reset gets a generous one (it sleeps + waits
+# for the SW to come back).
+CHROME_PING_TIMEOUT = 12
+CHROME_RESET_TIMEOUT = 30
+
+
+def _chrome_app_running() -> bool:
+    """True if the Google Chrome application is running. We never auto-launch it."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-x", "Google Chrome"],
+            capture_output=True, timeout=5,
+        )
+        return result.returncode == 0
+    except Exception as e:
+        log.debug(f"CHROME_CHECK | pgrep failed: {e}")
+        # If we can't tell, be conservative and skip — don't risk relaunching Chrome.
+        return False
+
+
+def check_chrome_control(
+    runner: Any = subprocess.run,
+    app_running_fn: Any = None,
+) -> dict[str, Any]:
+    """Probe chrome-control health and recover it if wedged.
+
+    Steps:
+      1. If the Google Chrome app isn't running → skip (status=chrome_not_running).
+      2. `chrome ping` with a short timeout. Exit 0 + "Connected ..." → healthy.
+      3. Otherwise (timeout / non-zero) → `chrome reset` (which self-heals:
+         kills stuck native_host, runs `chrome wake` if the SW is gone).
+
+    `runner` / `app_running_fn` are injectable for testing — production callers
+    should not pass them.
+
+    Returns a dict:
+        status: "ok" | "wedged" | "chrome_not_running" | "cli_missing"
+        action_taken: "reset" | "none"
+        detail: human-readable summary
+        ping_rc / ping_output / ping_timed_out  (when a ping was attempted)
+        reset_rc / reset_output / reset_timed_out  (when a reset was attempted)
+    """
+    if app_running_fn is None:
+        app_running_fn = _chrome_app_running
+
+    result: dict[str, Any] = {
+        "status": "ok",
+        "action_taken": "none",
+        "detail": "",
+    }
+
+    if not app_running_fn():
+        result["status"] = "chrome_not_running"
+        result["detail"] = "Google Chrome app not running — skipping chrome-control check"
+        return result
+
+    if not CHROME_CLI.exists():
+        result["status"] = "cli_missing"
+        result["detail"] = f"chrome CLI not found at {CHROME_CLI}"
+        return result
+
+    # ── Step 2: ping ──────────────────────────────────────────
+    ping_ok = False
+    try:
+        ping = runner(
+            [str(CHROME_CLI), "ping"],
+            capture_output=True, text=True, timeout=CHROME_PING_TIMEOUT,
+        )
+        result["ping_rc"] = ping.returncode
+        out = ((ping.stdout or "") + (ping.stderr or "")).strip()
+        result["ping_output"] = out
+        result["ping_timed_out"] = False
+        ping_ok = ping.returncode == 0 and "Connected to Chrome Control extension" in out
+    except subprocess.TimeoutExpired:
+        result["ping_timed_out"] = True
+        result["ping_output"] = f"timed out after {CHROME_PING_TIMEOUT}s"
+    except Exception as e:
+        result["ping_timed_out"] = False
+        result["ping_output"] = f"ping errored: {e}"
+
+    if ping_ok:
+        result["detail"] = "chrome ping ok"
+        return result
+
+    # ── Step 3: wedged → reset ────────────────────────────────
+    result["status"] = "wedged"
+    result["action_taken"] = "reset"
+    try:
+        reset = runner(
+            [str(CHROME_CLI), "reset"],
+            capture_output=True, text=True, timeout=CHROME_RESET_TIMEOUT,
+        )
+        result["reset_rc"] = reset.returncode
+        result["reset_output"] = ((reset.stdout or "") + (reset.stderr or "")).strip()
+        result["reset_timed_out"] = False
+        result["detail"] = (
+            f"chrome ping unhealthy; ran `chrome reset` (rc={reset.returncode})"
+        )
+    except subprocess.TimeoutExpired:
+        result["reset_timed_out"] = True
+        result["reset_output"] = f"timed out after {CHROME_RESET_TIMEOUT}s"
+        result["detail"] = "chrome ping unhealthy; `chrome reset` timed out"
+    except Exception as e:
+        result["reset_timed_out"] = False
+        result["reset_output"] = f"reset errored: {e}"
+        result["detail"] = f"chrome ping unhealthy; `chrome reset` errored: {e}"
+
+    return result
+
+
+# ──────────────────────────────────────────────────────────────
 # Disk space monitoring
 # ──────────────────────────────────────────────────────────────
 

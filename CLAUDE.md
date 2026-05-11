@@ -589,6 +589,7 @@ extra-paths = [
 | `health.haiku_verdict` | check_run_id, check_type (deep/stuck), session_name, chat_id, verdict (FATAL/HEALTHY/STUCK/WORKING), action_taken (restart/none) | `bus replay system --type health.haiku_verdict --limit 50` |
 | `health.circuit_breaker` | check_run_id? (see below), session_name, chat_id, transition (opened/closed), restart_count | `bus replay system --type health.circuit_breaker --limit 50` |
 | `health.quota_alert` | quota_type (5-hour/7-day all/7-day sonnet/7-day opus/extra usage), utilization, threshold, resets_at | `bus replay system --type health.quota_alert --limit 50` |
+| `health.chrome_check` | status (ok/wedged/chrome_not_running/cli_missing), action_taken (reset/none), detail, ping_rc?/ping_output?/ping_timed_out?, reset_rc?/reset_output?/reset_timed_out? — emitted on recovery attempt or ok↔wedged transition (daemon checks chrome-control every ~90s, auto-runs `chrome reset` if wedged) | `bus replay system --type health.chrome_check --limit 50` |
 | `health.bus_check` | status:"ok" — startup canary only | N/A |
 
 **Cross-event correlation:** `bus search "<check_run_id_uuid>" --topic system` — shows all events from the same health check cycle.

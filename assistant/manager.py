@@ -80,7 +80,7 @@ from assistant.bus_helpers import (
     health_check_payload, service_restarted_payload, service_spawned_payload,
     reminder_payload, healme_payload,
     compaction_triggered_payload, message_sent_payload, session_injected_payload,
-    quota_alert_payload,
+    quota_alert_payload, chrome_check_payload,
     produce_read_receipt,
 )
 
@@ -2128,6 +2128,10 @@ class Manager:
         # Health check background task flag (prevents overlapping runs)
         self._health_check_running = False
 
+        # chrome-control health check guard + last-known status (for transition logging)
+        self._chrome_check_running = False
+        self._chrome_last_status: str | None = None
+
         # Message consumer: asyncio.Event for near-zero-latency notification
         self._consumer_notify = asyncio.Event()
         self._consumer_executor = ThreadPoolExecutor(1, thread_name_prefix="bus-consumer")
@@ -4070,6 +4074,55 @@ class Manager:
                 service_restarted_payload("discord_listener", "died"), source="health")
             self._start_discord_listener()
 
+    async def _run_chrome_control_check(self):
+        """Probe chrome-control and recover it if the MV3 service worker is wedged.
+
+        Runs ~every 90s from the main loop (fire-and-forget task), so a wedged
+        chrome-control is caught within ~1-2 min without waiting for a chat
+        session to notice. The blocking `chrome ping` / `chrome reset`
+        subprocesses run via asyncio.to_thread so the daemon loop never blocks.
+
+        Skips entirely if the Google Chrome app isn't running (user closed it
+        deliberately) — `chrome reset`/`wake` would relaunch it.
+
+        Emits a `health.chrome_check` bus event whenever a recovery is attempted
+        or the ok↔wedged state transitions; otherwise just DEBUG-logs.
+        """
+        from assistant.health import check_chrome_control
+        try:
+            check = await asyncio.to_thread(check_chrome_control)
+        except Exception as e:
+            log.error(f"CHROME_CHECK | failed: {e}")
+            return
+
+        status = check.get("status", "unknown")
+        prev = self._chrome_last_status
+        self._chrome_last_status = status
+
+        action = check.get("action_taken", "none")
+        recovery_attempted = action != "none"
+        transitioned = prev is not None and prev != status
+        # Treat first observation that isn't plainly "ok" as worth surfacing too.
+        notable = recovery_attempted or transitioned or (prev is None and status != "ok")
+
+        if status == "wedged":
+            log.warning(
+                f"CHROME_CHECK | wedged — {check.get('detail', '')} | "
+                f"ping={check.get('ping_output', '')!r} | "
+                f"reset_rc={check.get('reset_rc')} reset_out={check.get('reset_output', '')!r}"
+            )
+        elif status in ("chrome_not_running", "cli_missing"):
+            log.debug(f"CHROME_CHECK | {status} — {check.get('detail', '')}")
+        else:  # ok
+            if notable:
+                log.info(f"CHROME_CHECK | recovered/ok — {check.get('detail', '')}")
+            else:
+                log.debug(f"CHROME_CHECK | ok — {check.get('detail', '')}")
+
+        if notable:
+            produce_event(self._producer, "system", "health.chrome_check",
+                          chrome_check_payload(check), source="health")
+
     def _check_dispatch_api(self):
         """Deep health check for Dispatch API — diagnostic only, no restarts.
 
@@ -5561,6 +5614,12 @@ You have 15 minutes. Work efficiently.
         last_fast_health = time.time()
         FAST_HEALTH_INTERVAL = 60  # 1 minute
 
+        # Track chrome-control health check — tight interval so a wedged MV3
+        # service worker is caught + auto-recovered within ~1-2 min, not 5+.
+        # First check ~15s after start.
+        last_chrome_check = time.time() - (90 - 15)
+        CHROME_CHECK_INTERVAL = 90  # 1.5 minutes
+
         # Track last idle check time
         last_idle_check = time.time()
         IDLE_CHECK_INTERVAL = 300  # Check for idle sessions every 5 minutes
@@ -5742,6 +5801,27 @@ You have 15 minutes. Work efficiently.
                     except Exception as e:
                         log.error(f"Fast health check failed: {e}")
                     last_fast_health = time.time()
+
+                # chrome-control health check (background, non-blocking, ~90s)
+                if time.time() - last_chrome_check > CHROME_CHECK_INTERVAL:
+                    if not self._chrome_check_running:
+                        self._chrome_check_running = True
+                        async def _chrome_check_guarded():
+                            try:
+                                await asyncio.wait_for(
+                                    self._run_chrome_control_check(),
+                                    timeout=60,  # ping(12s) + reset(30s) + slack
+                                )
+                            except asyncio.TimeoutError:
+                                log.error("CHROME_CHECK | timed out after 60s — clearing guard")
+                            except Exception as e:
+                                log.error(f"CHROME_CHECK | error: {e}")
+                            finally:
+                                self._chrome_check_running = False
+                        asyncio.create_task(
+                            _chrome_check_guarded(), name="chrome-control-check"
+                        )
+                    last_chrome_check = time.time()
 
                 # Periodic health check (runs in background, non-blocking)
                 if time.time() - last_health_check > HEALTH_CHECK_INTERVAL:

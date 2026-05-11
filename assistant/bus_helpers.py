@@ -323,6 +323,11 @@ def service_spawned_payload(service: str, pid: int, **extra) -> dict:
 #   schema_v:1, quota_type(5-hour|7-day all|7-day sonnet|7-day opus|extra usage),
 #   utilization, threshold, resets_at, timestamp
 #
+# health.chrome_check:
+#   schema_v:1, status(ok|wedged|chrome_not_running|cli_missing),
+#   action_taken(reset|none), detail, timestamp,
+#   ping_rc?/ping_output?/ping_timed_out?, reset_rc?/reset_output?/reset_timed_out?
+#
 # health.bus_check:
 #   status:"ok" — startup canary only
 
@@ -405,6 +410,29 @@ def quota_alert_payload(alert_dict: dict) -> dict:
         "resets_at": alert_dict["resets_at"],
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+
+
+def chrome_check_payload(check: dict) -> dict:
+    """Build a health.chrome_check payload from check_chrome_control()'s result.
+
+    check fields: status (ok|wedged|chrome_not_running|cli_missing),
+    action_taken (reset|none), detail, plus optional ping_*/reset_* diagnostics.
+    No check_run_id: chrome-control polling runs on its own tight timer.
+    No chat_id: global resource, not per-session.
+    """
+    payload: dict = {
+        "schema_v": 1,
+        "status": check.get("status", "unknown"),
+        "action_taken": check.get("action_taken", "none"),
+        "detail": check.get("detail", ""),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    # Carry diagnostics through when present (esp. on failure / recovery).
+    for k in ("ping_rc", "ping_output", "ping_timed_out",
+              "reset_rc", "reset_output", "reset_timed_out"):
+        if k in check:
+            payload[k] = check[k]
+    return payload
 
 
 def sanitize_reaction_for_bus(reaction: dict) -> dict:

@@ -984,3 +984,147 @@ class TestHealthCheckTimeout:
 
         await health_with_timeout()
         assert m._health_check_running is False
+
+
+class TestCheckChromeControl:
+    """Test chrome-control health check + auto-recovery (assistant.health.check_chrome_control)."""
+
+    @staticmethod
+    def _proc(returncode=0, stdout="", stderr=""):
+        p = MagicMock()
+        p.returncode = returncode
+        p.stdout = stdout
+        p.stderr = stderr
+        return p
+
+    def test_chrome_not_running_skips(self):
+        from assistant.health import check_chrome_control
+
+        def runner(*a, **k):  # should never be called
+            raise AssertionError("runner called even though Chrome is not running")
+
+        result = check_chrome_control(runner=runner, app_running_fn=lambda: False)
+        assert result["status"] == "chrome_not_running"
+        assert result["action_taken"] == "none"
+        assert "ping_rc" not in result and "reset_rc" not in result
+
+    def test_healthy_no_action(self):
+        from assistant.health import check_chrome_control
+
+        calls = []
+
+        def runner(cmd, **k):
+            calls.append(cmd)
+            assert cmd[-1] == "ping"
+            return self._proc(0, "Connected to Chrome Control extension\n")
+
+        result = check_chrome_control(runner=runner, app_running_fn=lambda: True)
+        assert result["status"] == "ok"
+        assert result["action_taken"] == "none"
+        assert result["ping_rc"] == 0
+        # ping only — no reset on a healthy worker
+        assert all(c[-1] != "reset" for c in calls)
+
+    def test_wedged_ping_timeout_triggers_reset(self):
+        import subprocess
+        from assistant.health import check_chrome_control
+
+        calls = []
+
+        def runner(cmd, **k):
+            calls.append(cmd[-1])
+            if cmd[-1] == "ping":
+                raise subprocess.TimeoutExpired(cmd, k.get("timeout", 12))
+            if cmd[-1] == "reset":
+                return self._proc(0, "Killed 1 native_host process(es)...\nwaking the service worker...")
+            raise AssertionError(f"unexpected command {cmd}")
+
+        result = check_chrome_control(runner=runner, app_running_fn=lambda: True)
+        assert result["status"] == "wedged"
+        assert result["action_taken"] == "reset"
+        assert result["ping_timed_out"] is True
+        assert result["reset_rc"] == 0
+        assert calls == ["ping", "reset"]
+
+    def test_wedged_ping_nonzero_triggers_reset(self):
+        from assistant.health import check_chrome_control
+
+        calls = []
+
+        def runner(cmd, **k):
+            calls.append(cmd[-1])
+            if cmd[-1] == "ping":
+                return self._proc(1, "", "no extension registered")
+            if cmd[-1] == "reset":
+                return self._proc(0, "ok")
+            raise AssertionError(f"unexpected command {cmd}")
+
+        result = check_chrome_control(runner=runner, app_running_fn=lambda: True)
+        assert result["status"] == "wedged"
+        assert result["action_taken"] == "reset"
+        assert result["ping_rc"] == 1
+        assert calls == ["ping", "reset"]
+
+    def test_reset_timeout_captured(self):
+        import subprocess
+        from assistant.health import check_chrome_control
+
+        def runner(cmd, **k):
+            if cmd[-1] == "ping":
+                raise subprocess.TimeoutExpired(cmd, 12)
+            if cmd[-1] == "reset":
+                raise subprocess.TimeoutExpired(cmd, 30)
+            raise AssertionError(f"unexpected command {cmd}")
+
+        result = check_chrome_control(runner=runner, app_running_fn=lambda: True)
+        assert result["status"] == "wedged"
+        assert result["action_taken"] == "reset"
+        assert result["reset_timed_out"] is True
+
+    def test_cli_missing(self, monkeypatch):
+        from assistant import health
+        from pathlib import Path
+
+        # Point CHROME_CLI at a path that doesn't exist
+        monkeypatch.setattr(health, "CHROME_CLI", Path("/nonexistent/chrome-cli-xyz"))
+
+        def runner(*a, **k):
+            raise AssertionError("runner should not be called when CLI is missing")
+
+        result = health.check_chrome_control(runner=runner, app_running_fn=lambda: True)
+        assert result["status"] == "cli_missing"
+        assert result["action_taken"] == "none"
+
+
+class TestChromeCheckPayload:
+    """Test the health.chrome_check bus payload builder."""
+
+    def test_payload_carries_diagnostics(self):
+        from assistant.bus_helpers import chrome_check_payload
+
+        check = {
+            "status": "wedged",
+            "action_taken": "reset",
+            "detail": "chrome ping unhealthy; ran `chrome reset` (rc=0)",
+            "ping_timed_out": True,
+            "ping_output": "timed out after 12s",
+            "reset_rc": 0,
+            "reset_output": "Killed 1 native_host process(es)...",
+            "reset_timed_out": False,
+        }
+        p = chrome_check_payload(check)
+        assert p["schema_v"] == 1
+        assert p["status"] == "wedged"
+        assert p["action_taken"] == "reset"
+        assert p["ping_timed_out"] is True
+        assert p["reset_rc"] == 0
+        assert "timestamp" in p
+
+    def test_payload_minimal_ok(self):
+        from assistant.bus_helpers import chrome_check_payload
+
+        p = chrome_check_payload({"status": "ok", "action_taken": "none", "detail": "chrome ping ok"})
+        assert p["status"] == "ok"
+        assert p["action_taken"] == "none"
+        # No ping/reset diagnostics present when not in source dict
+        assert "ping_rc" not in p and "reset_rc" not in p

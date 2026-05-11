@@ -95,7 +95,16 @@ chrome ping       # confirm — should print "Connected to Chrome Control extens
 2. Re-checks for any host the SW's `onDisconnect` already respawned — if one came back, it preserves that host's socket (via `lsof`) and you're done ("fresh native_host(s) already spawned by SW").
 3. If no host came back, the SW itself is evicted — so `chrome reset` runs `chrome wake`, which opens a throwaway tab on the extension's own popup page (`chrome-extension://<id>/popup.html`). **Loading any extension page forces Chrome to start the service worker** — this is the programmatic equivalent of clicking the toolbar icon. It then waits for the host to re-register and closes the tab.
 
-So a wedged Chrome is self-healing now. The **only** time you should mention the toolbar icon to the user is if `chrome wake` prints *"Service worker did not come back within 15s"* — that means the extension is disabled or in an errored state, and a one-time manual reload at `chrome://extensions/` (Developer mode → reload ⟳) is genuinely required. After that one reload, everything is automatic again.
+So a wedged Chrome is self-healing now. The **only** time you should escalate to the user is if `chrome wake` prints *"Service worker did not come back within 15s"* — and even then it tells you exactly which case you're in:
+- *"Confirmed: Chrome has the chrome-control extension DISABLED/errored (…)"* — this is **the one genuinely human-required state** (Chrome stops auto-restarting an extension after ~5 service-worker crashes). Ask the admin to reload it **once** at `chrome://extensions/` → Developer mode → reload ⟳ (or toggle it off/on). After that one reload, everything is automatic again. Pass along the reason in the parens if there is one.
+- *"Chrome's Preferences say the extension is still ENABLED"* — a **different** failure: Chrome's service-worker subsystem is wedged, not the extension. Ask the admin to fully quit and reopen Google Chrome first; only if that doesn't fix it, fall back to the `chrome://extensions/` reload.
+- *"Could not confirm the extension's state…"* — couldn't read the Default profile's Preferences (the extension may be loaded in a different Chrome profile). Best ask: reload it once at `chrome://extensions/`, and restart Chrome if that doesn't help.
+
+`chrome wake` exits 0 only when it actually reconnected, non-zero otherwise — so `chrome reset`, the daemon's chrome-control check, and chat sessions can all branch on it.
+
+### Why the worker rarely evicts anymore
+
+`native_host.py` now sends an **unsolicited keepalive ping to the extension every ~20s** (`PING_INTERVAL_S`), independent of the extension's own `chrome.alarms` heartbeat. Every inbound port message resets the MV3 service worker's idle timer, so as long as the host is connected the worker stays alive — the alarm is just the backstop that *wakes* an already-evicted worker. If the host's ping write ever fails (Chrome/worker gone), the host exits cleanly so the worker's `onDisconnect` respawns a fresh one. So an eviction now basically only happens if Chrome itself kills the worker faster than 20s (rare) or the extension is disabled/errored (the case above).
 
 Related commands:
 - `chrome wake` — revive an evicted SW without touching the host (use directly when the registry is empty / `chrome profiles` shows nothing).

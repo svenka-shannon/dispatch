@@ -7,6 +7,11 @@ let port = null;
 let connecting = false;
 let reconnectTimeout = null;
 
+// Expected cadence of the native host's unsolicited keepalive ping (seconds).
+// Mirrors PING_INTERVAL_S in scripts/native_host.py — kept here only as
+// documentation of the contract; the worker reacts to whatever it receives.
+const HOST_PING_INTERVAL_S = 20;
+
 // Track managed tabs and console/network data
 const managedTabs = new Map(); // tabId -> { url, status, createdAt }
 const consoleMessages = new Map(); // tabId -> messages[]
@@ -119,6 +124,19 @@ function connectNativeHost() {
 
     port.onMessage.addListener(async (message) => {
       console.log('[ChromeControl] Received:', message);
+
+      // Proactive keepalive from the native host (sent every ~HOST_PING_INTERVAL_S,
+      // see native_host.py PING_INTERVAL_S). Just receiving this message already
+      // reset the MV3 service worker's idle timer — the whole point. Reply with
+      // a pong so the host can also detect a dead/wedged worker (no reply ⇒ gone).
+      if (message.type === 'ping') {
+        try {
+          port.postMessage({ type: 'pong' });
+        } catch (e) {
+          console.log('[ChromeControl] pong failed:', e);
+        }
+        return;
+      }
 
       if (message.type === 'ready') {
         console.log('[ChromeControl] Native host ready');

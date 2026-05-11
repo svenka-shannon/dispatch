@@ -22,6 +22,15 @@ SOCKET_DIR = "/tmp"
 REGISTRY_PATH = "/tmp/chrome_control_registry.json"
 LOG_FILE = "/tmp/chrome_control.log"
 
+# Proactive keepalive: the host pings the extension every PING_INTERVAL_S
+# *without being asked*. Each inbound port message resets the MV3 service
+# worker's idle timer, so a steady host->worker ping keeps the worker alive as
+# long as the host is connected — independent of the extension's own
+# alarm-driven heartbeat (which is now just the backstop that *wakes* an
+# already-evicted worker). Must be comfortably under Chrome's ~30s idle
+# eviction window; 20s leaves margin even if a tick is slightly late.
+PING_INTERVAL_S = 20
+
 _read_buffer = bytearray()
 _expected_length = None
 
@@ -247,6 +256,11 @@ class ChromeControlHost:
             send_message({'type': 'pong'})
             return
 
+        if msg_type == 'pong':
+            # Reply to our proactive ping — receiving it already proved the
+            # worker is alive; nothing more to do. (Don't log every one.)
+            return
+
         if msg_type == 'extension_ready':
             log("Extension ready - clearing stale state")
             self.screenshot_chunks.clear()  # Clear any orphaned chunks from previous session
@@ -369,6 +383,19 @@ class ChromeControlHost:
                 except Exception:
                     pass
 
+    def send_proactive_ping(self) -> bool:
+        """Send an unsolicited ping to keep the MV3 service worker's idle timer
+        from lapsing. Returns False if the write failed (broken pipe — the
+        worker/Chrome is gone), in which case the caller should shut down so the
+        worker's onDisconnect respawns a fresh host.
+        """
+        try:
+            send_message({'type': 'ping'})
+            return True
+        except (BrokenPipeError, OSError) as e:
+            log(f"Proactive ping write failed ({e}) — extension gone, exiting")
+            return False
+
     def run(self):
         log("Native host started")
         self.setup_socket()
@@ -378,13 +405,30 @@ class ChromeControlHost:
         fcntl.fcntl(sys.stdin.buffer.fileno(), fcntl.F_SETFL, fl | os.O_NONBLOCK)
 
         stdin_fd = sys.stdin.buffer.fileno()
+        next_ping = time.monotonic() + PING_INTERVAL_S
+        ping_count = 0
 
         while self.running:
             try:
+                # Proactive keepalive — fire if due (and not waiting on EOF
+                # shutdown). Done before select() so a slow loop iteration
+                # can't push us past Chrome's eviction window.
+                now = time.monotonic()
+                if now >= next_ping:
+                    if not self.send_proactive_ping():
+                        self.running = False
+                        break
+                    ping_count += 1
+                    if ping_count % 30 == 1:  # ~every 10 min at 20s cadence
+                        log(f"Proactive keepalive ping sent (#{ping_count})")
+                    next_ping = now + PING_INTERVAL_S
+
                 read_fds = [stdin_fd, self.socket_server.fileno()]
                 read_fds.extend([c.fileno() for c in self.clients])
 
-                readable, _, _ = select.select(read_fds, [], [], 1.0)
+                # Wake up in time for the next ping (cap at 1s for responsiveness).
+                timeout = max(0.0, min(1.0, next_ping - time.monotonic()))
+                readable, _, _ = select.select(read_fds, [], [], timeout)
 
                 for fd in readable:
                     if fd == stdin_fd:

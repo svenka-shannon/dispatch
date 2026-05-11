@@ -78,6 +78,94 @@ def extension_id():
     return None
 
 
+# Chrome profile dir holding Preferences / Secure Preferences. Default profile
+# is the common case; we don't try every profile (keep it simple, fall back
+# gracefully if the extension isn't there).
+CHROME_DEFAULT_PROFILE_DIR = (
+    Path.home() / "Library/Application Support/Google/Chrome/Default"
+)
+
+# disable_reasons bitmask values from Chromium's extension_disabled_reason.h.
+# Only the ones worth naming to a human are listed.
+_DISABLE_REASON_NAMES = {
+    1: "disabled by user",
+    2: "permissions increase needs re-approval",
+    4: "needs a reload",
+    8: "unsupported requirement",
+    16: "sideload wipeout",
+    32: "unknown from sync",
+    128: "not verified",
+    256: "greylist",
+    512: "corrupted (Chrome's content-verification failed)",
+    1024: "corrupted (Chrome's content-verification failed)",
+    2048: "blocked as malware",
+    8192: "needs reinstall",
+}
+
+
+def _describe_disable_reasons(mask):
+    """Human-readable list of disable reasons from a bitmask int."""
+    if not mask:
+        return []
+    out = []
+    for bit, name in _DISABLE_REASON_NAMES.items():
+        if mask & bit:
+            out.append(name)
+    if not out:
+        out.append(f"reason code {mask}")
+    return out
+
+
+def extension_prefs_state(ext_id):
+    """Inspect the Chrome Default profile's Preferences for this extension.
+
+    Returns one of:
+      {"found": False}                                  — not in Preferences (maybe
+                                                          a non-Default profile, or
+                                                          prefs unreadable)
+      {"found": True, "enabled": True,  "reasons": []}  — Chrome says it's enabled
+      {"found": True, "enabled": False, "reasons": [...]}  — disabled / errored;
+                                                          reasons describes why
+    """
+    for fname in ("Preferences", "Secure Preferences"):
+        path = CHROME_DEFAULT_PROFILE_DIR / fname
+        try:
+            with open(path) as f:
+                prefs = json.load(f)
+        except (OSError, ValueError):
+            continue
+        settings = (
+            prefs.get("extensions", {}).get("settings", {})
+        )
+        entry = settings.get(ext_id)
+        if not isinstance(entry, dict):
+            continue
+        # state: 1 = ENABLED, 0 = DISABLED (other values are rarer states).
+        state = entry.get("state")
+        reasons_mask = entry.get("disable_reasons", 0) or 0
+        # Some Chrome versions store a single int; older ones a list of ints.
+        if isinstance(reasons_mask, list):
+            combined = 0
+            for r in reasons_mask:
+                try:
+                    combined |= int(r)
+                except (TypeError, ValueError):
+                    pass
+            reasons_mask = combined
+        try:
+            reasons_mask = int(reasons_mask)
+        except (TypeError, ValueError):
+            reasons_mask = 0
+        enabled = (state == 1) and reasons_mask == 0
+        return {
+            "found": True,
+            "enabled": enabled,
+            "state": state,
+            "reasons": _describe_disable_reasons(reasons_mask),
+        }
+    return {"found": False}
+
+
 def load_registry() -> dict:
     """Load the profile registry."""
     try:
@@ -754,13 +842,45 @@ def cmd_wake(client, args):
         if get_profiles():
             break
     else:
+        # Worker didn't come back. Confirm the cause precisely so escalation is
+        # specific, not "X is broken".
         print("Service worker did not come back within 15s.", file=sys.stderr)
-        print(
-            "The extension is probably disabled or in an errored state — reload "
-            "it once at chrome://extensions/ (Developer mode → reload ⟳). After "
-            "that one manual reload, `chrome wake` recovers it on its own.",
-            file=sys.stderr,
-        )
+        prefs = extension_prefs_state(ext_id)
+        if prefs.get("found") and not prefs.get("enabled"):
+            reasons = prefs.get("reasons") or []
+            why = f" ({'; '.join(reasons)})" if reasons else ""
+            print(
+                f"Confirmed: Chrome has the chrome-control extension DISABLED/errored{why}.",
+                file=sys.stderr,
+            )
+            print(
+                "This is the one state that genuinely needs a human: open "
+                "chrome://extensions/, turn on Developer mode, find "
+                "\"Chrome Control\", and click the reload ⟳ icon (or toggle it "
+                "off and back on). After that one manual reload, `chrome wake` "
+                "recovers it on its own.",
+                file=sys.stderr,
+            )
+        elif prefs.get("found") and prefs.get("enabled"):
+            print(
+                "Chrome's Preferences say the extension is still ENABLED — so "
+                "this isn't the usual 'errored extension' case. Chrome's "
+                "service-worker subsystem may be wedged. Try fully quitting and "
+                "reopening Google Chrome; if it still won't connect, then reload "
+                "the extension at chrome://extensions/ (Developer mode → reload ⟳).",
+                file=sys.stderr,
+            )
+        else:
+            # Couldn't read Default-profile Preferences, or the extension lives
+            # in a non-Default profile.
+            print(
+                "Could not confirm the extension's state from the Default "
+                "profile's Preferences (it may be loaded in a different Chrome "
+                "profile). Best bet: reload \"Chrome Control\" once at "
+                "chrome://extensions/ (Developer mode → reload ⟳); if that "
+                "doesn't help, fully restart Google Chrome.",
+                file=sys.stderr,
+            )
         sys.exit(1)
 
     # Close the throwaway wake tab(s) so we don't leak them.

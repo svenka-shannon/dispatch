@@ -51,6 +51,7 @@ from Cocoa import NSData
 
 app = typer.Typer(no_args_is_help=True)
 console = Console()
+err_console = Console(stderr=True)
 
 DEFAULT_ATTRIBUTES = ["AXRole", "AXTitle", "AXValue"]
 
@@ -295,7 +296,7 @@ def tree(
     """
     app_element = get_application_by_name(app_name)
     if not app_element:
-        console.print(f"[red]Error: application '{app_name}' not found[/red]", file=sys.stderr)
+        err_console.print(f"[red]Error: application '{app_name}' not found[/red]")
         raise typer.Exit(1)
 
     element = app_element
@@ -305,7 +306,7 @@ def tree(
         # Search for web area
         web_areas = find_by_role(app_element, "AXWebArea")
         if not web_areas:
-            console.print("[red]Error: no web area found[/red]", file=sys.stderr)
+            err_console.print("[red]Error: no web area found[/red]")
             raise typer.Exit(1)
         element = web_areas[0]
 
@@ -313,7 +314,7 @@ def tree(
         # Search for DOM ID
         matches = search_tree(element, lambda e: get_attribute_value(e, "AXDOMIdentifier") == dom_id)
         if not matches:
-            console.print(f"[red]Error: can't find '{dom_id}' DOM identifier in tree[/red]", file=sys.stderr)
+            err_console.print(f"[red]Error: can't find '{dom_id}' DOM identifier in tree[/red]")
             raise typer.Exit(1)
         element = matches[0]
 
@@ -366,7 +367,7 @@ def click(
     """
     app_element = get_application_by_name(app_name)
     if not app_element:
-        console.print(f"[red]Error: application '{app_name}' not found[/red]", file=sys.stderr)
+        err_console.print(f"[red]Error: application '{app_name}' not found[/red]")
         raise typer.Exit(1)
 
     element = None
@@ -377,7 +378,7 @@ def click(
         builder.build_tree(app_element, add_refs=True)
         element = builder.get_element_by_ref(ref)
         if not element:
-            console.print(f"[red]Error: ref '{ref}' not found[/red]", file=sys.stderr)
+            err_console.print(f"[red]Error: ref '{ref}' not found[/red]")
             raise typer.Exit(1)
     else:
         # Search by criteria
@@ -391,15 +392,15 @@ def click(
         elif desc:
             matches = find_by_description(app_element, desc)
         else:
-            console.print("[red]Error: specify --ref, --title, --value, --role, or --desc[/red]", file=sys.stderr)
+            err_console.print("[red]Error: specify --ref, --title, --value, --role, or --desc[/red]")
             raise typer.Exit(1)
 
         if not matches:
-            console.print("[red]Error: no matching elements found[/red]", file=sys.stderr)
+            err_console.print("[red]Error: no matching elements found[/red]")
             raise typer.Exit(1)
 
         if index >= len(matches):
-            console.print(f"[red]Error: index {index} out of range (found {len(matches)} matches)[/red]", file=sys.stderr)
+            err_console.print(f"[red]Error: index {index} out of range (found {len(matches)} matches)[/red]")
             raise typer.Exit(1)
 
         element = matches[index]
@@ -417,7 +418,7 @@ def click(
         result = perform_action(element, actions[0])
         console.print(f"[green]Performed {actions[0]}[/green]")
     else:
-        console.print("[yellow]Warning: no actions available, trying AXPress anyway[/yellow]", file=sys.stderr)
+        err_console.print("[yellow]Warning: no actions available, trying AXPress anyway[/yellow]")
         result = perform_action(element, "AXPress")
 
 
@@ -441,7 +442,7 @@ def action(
     """
     app_element = get_application_by_name(app_name)
     if not app_element:
-        console.print(f"[red]Error: application '{app_name}' not found[/red]", file=sys.stderr)
+        err_console.print(f"[red]Error: application '{app_name}' not found[/red]")
         raise typer.Exit(1)
 
     element = None
@@ -451,7 +452,7 @@ def action(
         builder.build_tree(app_element, add_refs=True)
         element = builder.get_element_by_ref(ref)
         if not element:
-            console.print(f"[red]Error: ref '{ref}' not found[/red]", file=sys.stderr)
+            err_console.print(f"[red]Error: ref '{ref}' not found[/red]")
             raise typer.Exit(1)
     else:
         matches = []
@@ -464,15 +465,15 @@ def action(
         elif desc:
             matches = find_by_description(app_element, desc)
         else:
-            console.print("[red]Error: specify --ref, --title, --value, --role, or --desc[/red]", file=sys.stderr)
+            err_console.print("[red]Error: specify --ref, --title, --value, --role, or --desc[/red]")
             raise typer.Exit(1)
 
         if not matches:
-            console.print("[red]Error: no matching elements found[/red]", file=sys.stderr)
+            err_console.print("[red]Error: no matching elements found[/red]")
             raise typer.Exit(1)
 
         if index >= len(matches):
-            console.print(f"[red]Error: index {index} out of range (found {len(matches)} matches)[/red]", file=sys.stderr)
+            err_console.print(f"[red]Error: index {index} out of range (found {len(matches)} matches)[/red]")
             raise typer.Exit(1)
 
         element = matches[index]
@@ -499,7 +500,7 @@ def type_text(
     """
     app_element = get_application_by_name(app_name)
     if not app_element:
-        console.print(f"[red]Error: application '{app_name}' not found[/red]", file=sys.stderr)
+        err_console.print(f"[red]Error: application '{app_name}' not found[/red]")
         raise typer.Exit(1)
 
     element = None
@@ -509,7 +510,7 @@ def type_text(
         builder.build_tree(app_element, add_refs=True)
         element = builder.get_element_by_ref(ref)
         if not element:
-            console.print(f"[red]Error: ref '{ref}' not found[/red]", file=sys.stderr)
+            err_console.print(f"[red]Error: ref '{ref}' not found[/red]")
             raise typer.Exit(1)
     else:
         matches = []
@@ -520,15 +521,15 @@ def type_text(
         elif desc:
             matches = find_by_description(app_element, desc)
         else:
-            console.print("[red]Error: specify --ref, --title, --role, or --desc[/red]", file=sys.stderr)
+            err_console.print("[red]Error: specify --ref, --title, --role, or --desc[/red]")
             raise typer.Exit(1)
 
         if not matches:
-            console.print("[red]Error: no matching elements found[/red]", file=sys.stderr)
+            err_console.print("[red]Error: no matching elements found[/red]")
             raise typer.Exit(1)
 
         if index >= len(matches):
-            console.print(f"[red]Error: index {index} out of range (found {len(matches)} matches)[/red]", file=sys.stderr)
+            err_console.print(f"[red]Error: index {index} out of range (found {len(matches)} matches)[/red]")
             raise typer.Exit(1)
 
         element = matches[index]
@@ -563,7 +564,7 @@ def search(
     """
     app_element = get_application_by_name(app_name)
     if not app_element:
-        console.print(f"[red]Error: application '{app_name}' not found[/red]", file=sys.stderr)
+        err_console.print(f"[red]Error: application '{app_name}' not found[/red]")
         raise typer.Exit(1)
 
     matches = []
@@ -584,7 +585,7 @@ def search(
             return contains.lower() in str(t).lower() or contains.lower() in str(v).lower() or contains.lower() in str(d).lower()
         matches = search_tree(app_element, contains_match)
     else:
-        console.print("[red]Error: specify --title, --value, --role, --desc, or --contains[/red]", file=sys.stderr)
+        err_console.print("[red]Error: specify --title, --value, --role, --desc, or --contains[/red]")
         raise typer.Exit(1)
 
     if not matches:
@@ -664,7 +665,7 @@ def focus(
     """
     app_element = get_application_by_name(app_name)
     if not app_element:
-        console.print(f"[red]Error: application '{app_name}' not found[/red]", file=sys.stderr)
+        err_console.print(f"[red]Error: application '{app_name}' not found[/red]")
         raise typer.Exit(1)
 
     # Try to raise/activate the app
@@ -697,7 +698,7 @@ def get(
     """
     app_element = get_application_by_name(app_name)
     if not app_element:
-        console.print(f"[red]Error: application '{app_name}' not found[/red]", file=sys.stderr)
+        err_console.print(f"[red]Error: application '{app_name}' not found[/red]")
         raise typer.Exit(1)
 
     element = None
@@ -707,7 +708,7 @@ def get(
         builder.build_tree(app_element, add_refs=True)
         element = builder.get_element_by_ref(ref)
         if not element:
-            console.print(f"[red]Error: ref '{ref}' not found[/red]", file=sys.stderr)
+            err_console.print(f"[red]Error: ref '{ref}' not found[/red]")
             raise typer.Exit(1)
     elif title or value or role or desc:
         matches = []
@@ -721,11 +722,11 @@ def get(
             matches = find_by_description(app_element, desc)
 
         if not matches:
-            console.print("[red]Error: no matching elements found[/red]", file=sys.stderr)
+            err_console.print("[red]Error: no matching elements found[/red]")
             raise typer.Exit(1)
 
         if index >= len(matches):
-            console.print(f"[red]Error: index {index} out of range (found {len(matches)} matches)[/red]", file=sys.stderr)
+            err_console.print(f"[red]Error: index {index} out of range (found {len(matches)} matches)[/red]")
             raise typer.Exit(1)
 
         element = matches[index]
@@ -759,7 +760,7 @@ def set_attr(
     """
     app_element = get_application_by_name(app_name)
     if not app_element:
-        console.print(f"[red]Error: application '{app_name}' not found[/red]", file=sys.stderr)
+        err_console.print(f"[red]Error: application '{app_name}' not found[/red]")
         raise typer.Exit(1)
 
     element = None
@@ -769,7 +770,7 @@ def set_attr(
         builder.build_tree(app_element, add_refs=True)
         element = builder.get_element_by_ref(ref)
         if not element:
-            console.print(f"[red]Error: ref '{ref}' not found[/red]", file=sys.stderr)
+            err_console.print(f"[red]Error: ref '{ref}' not found[/red]")
             raise typer.Exit(1)
     else:
         matches = []
@@ -780,15 +781,15 @@ def set_attr(
         elif desc:
             matches = find_by_description(app_element, desc)
         else:
-            console.print("[red]Error: specify --ref, --title, --role, or --desc[/red]", file=sys.stderr)
+            err_console.print("[red]Error: specify --ref, --title, --role, or --desc[/red]")
             raise typer.Exit(1)
 
         if not matches:
-            console.print("[red]Error: no matching elements found[/red]", file=sys.stderr)
+            err_console.print("[red]Error: no matching elements found[/red]")
             raise typer.Exit(1)
 
         if index >= len(matches):
-            console.print(f"[red]Error: index {index} out of range (found {len(matches)} matches)[/red]", file=sys.stderr)
+            err_console.print(f"[red]Error: index {index} out of range (found {len(matches)} matches)[/red]")
             raise typer.Exit(1)
 
         element = matches[index]
@@ -824,7 +825,7 @@ def wait(
     import time
 
     if not (title or value or role or contains):
-        console.print("[red]Error: specify --title, --value, --role, or --contains[/red]", file=sys.stderr)
+        err_console.print("[red]Error: specify --title, --value, --role, or --contains[/red]")
         raise typer.Exit(1)
 
     start_time = time.time()
@@ -853,7 +854,7 @@ def wait(
 
         time.sleep(interval)
 
-    console.print(f"[red]Timeout after {timeout}s - element not found[/red]", file=sys.stderr)
+    err_console.print(f"[red]Timeout after {timeout}s - element not found[/red]")
     raise typer.Exit(1)
 
 

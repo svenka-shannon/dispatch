@@ -8,7 +8,7 @@ allowed-tools: Bash(~/code/axctl/*), Bash(osascript:*)
 
 A CLI tool for automating macOS native applications via the Accessibility API. Like `pyax` but with interaction capabilities (click, type, actions).
 
-**Location:** `~/code/axctl/axctl`
+**Location:** `~/.claude/skills/axctl/scripts/axctl`
 
 ## When to Use
 
@@ -52,7 +52,7 @@ open -a "Notes"
 ### apps - List Running Applications
 
 ```bash
-~/code/axctl/axctl apps
+~/.claude/skills/axctl/scripts/axctl apps
 ```
 
 Lists all running applications that have windows. Useful to verify app names.
@@ -63,22 +63,22 @@ Lists all running applications that have windows. Useful to verify app names.
 
 ```bash
 # Basic tree (shows AXRole, AXTitle, AXValue)
-~/code/axctl/axctl tree "System Settings"
+~/.claude/skills/axctl/scripts/axctl tree "System Settings"
 
 # With ref IDs for interaction
-~/code/axctl/axctl tree "System Settings" --refs
+~/.claude/skills/axctl/scripts/axctl tree "System Settings" --refs
 
 # Show available actions on each element
-~/code/axctl/axctl tree "System Settings" --list-actions
+~/.claude/skills/axctl/scripts/axctl tree "System Settings" --list-actions
 
 # All attributes
-~/code/axctl/axctl tree "Notes" --all-attributes
+~/.claude/skills/axctl/scripts/axctl tree "Notes" --all-attributes
 
 # JSON output
-~/code/axctl/axctl tree "Finder" --json
+~/.claude/skills/axctl/scripts/axctl tree "Finder" --json
 
 # Web area only (for apps with web views)
-~/code/axctl/axctl tree "Safari" --web
+~/.claude/skills/axctl/scripts/axctl tree "Safari" --web
 ```
 
 **Tip:** Use `--refs` to get ref IDs, then use those refs in click/action/type commands.
@@ -89,22 +89,22 @@ Lists all running applications that have windows. Useful to verify app names.
 
 ```bash
 # Find by exact title
-~/code/axctl/axctl search "System Settings" --title "Notes"
+~/.claude/skills/axctl/scripts/axctl search "System Settings" --title "Notes"
 
 # Find by role
-~/code/axctl/axctl search "System Settings" --role AXButton
+~/.claude/skills/axctl/scripts/axctl search "System Settings" --role AXButton
 
 # Find by value
-~/code/axctl/axctl search "Notes" --value "My note content"
+~/.claude/skills/axctl/scripts/axctl search "Notes" --value "My note content"
 
 # Find containing text (case-insensitive)
-~/code/axctl/axctl search "System Settings" --contains "iCloud"
+~/.claude/skills/axctl/scripts/axctl search "System Settings" --contains "iCloud"
 
 # Show available actions
-~/code/axctl/axctl search "System Settings" --contains "Notes" --list-actions
+~/.claude/skills/axctl/scripts/axctl search "System Settings" --contains "Notes" --list-actions
 
 # JSON output
-~/code/axctl/axctl search "Finder" --role AXRow --json
+~/.claude/skills/axctl/scripts/axctl search "Finder" --role AXRow --json
 ```
 
 The output shows index numbers you can use with `--index` in other commands.
@@ -115,22 +115,22 @@ The output shows index numbers you can use with `--index` in other commands.
 
 ```bash
 # Click by title
-~/code/axctl/axctl click "System Settings" --title "Notes"
+~/.claude/skills/axctl/scripts/axctl click "System Settings" --title "Notes"
 
 # Click by value
-~/code/axctl/axctl click "System Settings" --value "iCloud"
+~/.claude/skills/axctl/scripts/axctl click "System Settings" --value "iCloud"
 
 # Click by role (first match)
-~/code/axctl/axctl click "Finder" --role AXButton
+~/.claude/skills/axctl/scripts/axctl click "Finder" --role AXButton
 
 # Click specific match by index
-~/code/axctl/axctl click "System Settings" --role AXCheckBox --index 2
+~/.claude/skills/axctl/scripts/axctl click "System Settings" --role AXCheckBox --index 2
 
 # Click by description
-~/code/axctl/axctl click "Notes" --desc "New Note"
+~/.claude/skills/axctl/scripts/axctl click "Notes" --desc "New Note"
 
 # Click by ref ID (from tree --refs)
-~/code/axctl/axctl click "System Settings" --ref ref_42
+~/.claude/skills/axctl/scripts/axctl click "System Settings" --ref ref_42
 ```
 
 **How it works:** Tries AXPress first, then AXOpen, then first available action.
@@ -141,16 +141,16 @@ The output shows index numbers you can use with `--index` in other commands.
 
 ```bash
 # Press action (same as click for most elements)
-~/code/axctl/axctl action "System Settings" AXPress --title "Notes"
+~/.claude/skills/axctl/scripts/axctl action "System Settings" AXPress --title "Notes"
 
 # Open action (for rows, files)
-~/code/axctl/axctl action "Finder" AXOpen --role AXRow --index 0
+~/.claude/skills/axctl/scripts/axctl action "Finder" AXOpen --role AXRow --index 0
 
 # Show default action (for buttons)
-~/code/axctl/axctl action "Notes" AXShowDefaultUI --role AXButton --index 0
+~/.claude/skills/axctl/scripts/axctl action "Notes" AXShowDefaultUI --role AXButton --index 0
 
 # Cancel action
-~/code/axctl/axctl action "System Settings" AXCancel --role AXSheet
+~/.claude/skills/axctl/scripts/axctl action "System Settings" AXCancel --role AXSheet
 ```
 
 **Common actions:**
@@ -168,13 +168,13 @@ The output shows index numbers you can use with `--index` in other commands.
 
 ```bash
 # Type into first text field
-~/code/axctl/axctl type "Notes" "Hello world" --role AXTextArea
+~/.claude/skills/axctl/scripts/axctl type "Notes" "Hello world" --role AXTextArea
 
 # Type into specific field by title
-~/code/axctl/axctl type "Safari" "https://example.com" --title "Address and Search"
+~/.claude/skills/axctl/scripts/axctl type "Safari" "https://example.com" --title "Address and Search"
 
 # Type by ref
-~/code/axctl/axctl type "System Settings" "search term" --ref ref_15
+~/.claude/skills/axctl/scripts/axctl type "System Settings" "search term" --ref ref_15
 ```
 
 **Note:** This sets AXValue directly, which works for most text fields. For some apps you may need to use `osascript` keystroke simulation.
@@ -185,16 +185,16 @@ The output shows index numbers you can use with `--index` in other commands.
 
 ```bash
 # Get value of a checkbox
-~/code/axctl/axctl get "System Settings" AXValue --role AXCheckBox --index 0
+~/.claude/skills/axctl/scripts/axctl get "System Settings" AXValue --role AXCheckBox --index 0
 
 # Get title of focused element
-~/code/axctl/axctl get "Finder" AXTitle --role AXTextField
+~/.claude/skills/axctl/scripts/axctl get "Finder" AXTitle --role AXTextField
 
 # Get text content
-~/code/axctl/axctl get "Notes" AXValue --role AXTextArea
+~/.claude/skills/axctl/scripts/axctl get "Notes" AXValue --role AXTextArea
 
 # Get app's frontmost status
-~/code/axctl/axctl get "System Settings" AXFrontmost
+~/.claude/skills/axctl/scripts/axctl get "System Settings" AXFrontmost
 ```
 
 ---
@@ -203,13 +203,13 @@ The output shows index numbers you can use with `--index` in other commands.
 
 ```bash
 # Set text value
-~/code/axctl/axctl set "Notes" AXValue "New content" --role AXTextArea
+~/.claude/skills/axctl/scripts/axctl set "Notes" AXValue "New content" --role AXTextArea
 
 # Set checkbox (boolean)
-~/code/axctl/axctl set "System Settings" AXValue true --role AXCheckBox --bool
+~/.claude/skills/axctl/scripts/axctl set "System Settings" AXValue true --role AXCheckBox --bool
 
 # Set slider (integer)
-~/code/axctl/axctl set "System Settings" AXValue 50 --role AXSlider --int
+~/.claude/skills/axctl/scripts/axctl set "System Settings" AXValue 50 --role AXSlider --int
 ```
 
 ---
@@ -217,8 +217,8 @@ The output shows index numbers you can use with `--index` in other commands.
 ### focus - Focus Application
 
 ```bash
-~/code/axctl/axctl focus "System Settings"
-~/code/axctl/axctl focus "Finder"
+~/.claude/skills/axctl/scripts/axctl focus "System Settings"
+~/.claude/skills/axctl/scripts/axctl focus "Finder"
 ```
 
 Brings the app to the foreground and activates it.
@@ -229,13 +229,13 @@ Brings the app to the foreground and activates it.
 
 ```bash
 # Wait for element with title (default 30s timeout)
-~/code/axctl/axctl wait "System Settings" --title "Notes"
+~/.claude/skills/axctl/scripts/axctl wait "System Settings" --title "Notes"
 
 # Wait with custom timeout
-~/code/axctl/axctl wait "Safari" --contains "Loading" --timeout 60
+~/.claude/skills/axctl/scripts/axctl wait "Safari" --contains "Loading" --timeout 60
 
 # Wait for element to appear after navigation
-~/code/axctl/axctl wait "System Settings" --role AXCheckBox --timeout 10
+~/.claude/skills/axctl/scripts/axctl wait "System Settings" --role AXCheckBox --timeout 10
 ```
 
 Useful for automation scripts where UI takes time to load.
@@ -252,25 +252,25 @@ open -a "System Settings"
 sleep 2
 
 # Focus it
-~/code/axctl/axctl focus "System Settings"
+~/.claude/skills/axctl/scripts/axctl focus "System Settings"
 
 # Navigate to Apple ID
-~/code/axctl/axctl click "System Settings" --title "Apple Account"
+~/.claude/skills/axctl/scripts/axctl click "System Settings" --title "Apple Account"
 sleep 1
 
 # Click iCloud
-~/code/axctl/axctl click "System Settings" --title "iCloud"
+~/.claude/skills/axctl/scripts/axctl click "System Settings" --title "iCloud"
 sleep 1
 
 # Find and click Notes
-~/code/axctl/axctl click "System Settings" --title "Notes"
+~/.claude/skills/axctl/scripts/axctl click "System Settings" --title "Notes"
 ```
 
 ### Read Note Content
 
 ```bash
 # Get the text from Notes app
-~/code/axctl/axctl get "Notes" AXValue --role AXTextArea
+~/.claude/skills/axctl/scripts/axctl get "Notes" AXValue --role AXTextArea
 ```
 
 ### Navigate Finder
@@ -280,14 +280,14 @@ sleep 1
 open ~/Documents
 
 # Click on a file (first row)
-~/code/axctl/axctl click "Finder" --role AXRow --index 0
+~/.claude/skills/axctl/scripts/axctl click "Finder" --role AXRow --index 0
 ```
 
 ### Check Checkbox State
 
 ```bash
 # Get checkbox value (0 or 1)
-~/code/axctl/axctl get "System Settings" AXValue --role AXCheckBox --title "Sync this Mac"
+~/.claude/skills/axctl/scripts/axctl get "System Settings" AXValue --role AXCheckBox --title "Sync this Mac"
 ```
 
 ---
@@ -300,7 +300,7 @@ The app name must match what appears in the menu bar. Check with `axctl apps`.
 ### 2. Use search Before click
 When unsure about element names, search first:
 ```bash
-~/code/axctl/axctl search "System Settings" --contains "iCloud" --list-actions
+~/.claude/skills/axctl/scripts/axctl search "System Settings" --contains "iCloud" --list-actions
 ```
 
 ### 3. Wait for UI to Load
@@ -309,14 +309,14 @@ After opening an app or navigating, add a sleep or use `wait`:
 open -a "System Settings"
 sleep 2
 # or
-~/code/axctl/axctl wait "System Settings" --title "Apple Account"
+~/.claude/skills/axctl/scripts/axctl wait "System Settings" --title "Apple Account"
 ```
 
 ### 4. Index for Multiple Matches
 When there are multiple matches, use `--index`:
 ```bash
 # Click the 3rd checkbox
-~/code/axctl/axctl click "System Settings" --role AXCheckBox --index 2
+~/.claude/skills/axctl/scripts/axctl click "System Settings" --role AXCheckBox --index 2
 ```
 
 ### 5. Some Actions Require Permissions
@@ -329,8 +329,8 @@ To set state: `set ... AXValue 1 --int` or use `click` to toggle
 ### 7. Text Fields May Need Focus First
 If typing doesn't work, try clicking the field first:
 ```bash
-~/code/axctl/axctl click "App" --role AXTextField
-~/code/axctl/axctl type "App" "text" --role AXTextField
+~/.claude/skills/axctl/scripts/axctl click "App" --role AXTextField
+~/.claude/skills/axctl/scripts/axctl type "App" "text" --role AXTextField
 ```
 
 ---
@@ -362,18 +362,18 @@ If typing doesn't work, try clicking the field first:
 
 ### See Full Tree
 ```bash
-~/code/axctl/axctl tree "App Name" --all-attributes --list-actions
+~/.claude/skills/axctl/scripts/axctl tree "App Name" --all-attributes --list-actions
 ```
 
 ### Find Specific Element
 ```bash
 # Search with multiple criteria
-~/code/axctl/axctl search "App" --contains "keyword" --list-actions --json
+~/.claude/skills/axctl/scripts/axctl search "App" --contains "keyword" --list-actions --json
 ```
 
 ### Check if App is Running
 ```bash
-~/code/axctl/axctl apps | grep -i "app name"
+~/.claude/skills/axctl/scripts/axctl apps | grep -i "app name"
 ```
 
 ---
@@ -381,6 +381,6 @@ If typing doesn't work, try clicking the field first:
 ## Version
 
 ```bash
-~/code/axctl/axctl version
+~/.claude/skills/axctl/scripts/axctl version
 # axctl 1.0.0
 ```

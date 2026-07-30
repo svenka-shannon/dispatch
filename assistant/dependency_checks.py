@@ -30,14 +30,13 @@ from __future__ import annotations
 
 import json
 import logging
-import shutil
 import socket
 import subprocess
 import time
 from pathlib import Path
 from typing import Any
 
-from assistant.common import SIGNAL_CLI, SIGNAL_SOCKET
+from assistant.common import SIGNAL_SOCKET
 from assistant.dependency_health import (
     DependencyCheck,
     DependencyHealthRunner,
@@ -110,6 +109,16 @@ _CHROME_HEAL_FIXES = {
 }
 
 
+def _stamp_chrome_version() -> None:
+    """Record that the extension was (re)loaded under the current Chrome."""
+    cur = _chrome_installed_version()
+    if cur:
+        try:
+            CHROME_VERSION_STATE.write_text(cur)
+        except OSError:
+            pass
+
+
 def _run_chrome_heal() -> RecoverResult | None:
     """Rung 2 of chrome_control recovery: chrome-heal's AX reload.
 
@@ -140,6 +149,8 @@ def _run_chrome_heal() -> RecoverResult | None:
         result = {}
     summary = result.get("summary") or (p.stdout or p.stderr or "").strip()
     if p.returncode == 0 and result.get("ok"):
+        # An AX reload re-registers the SW under the current Chrome binary.
+        _stamp_chrome_version()
         return RecoverResult.ok(
             f"chrome-heal AX reload recovered: {summary}",
             recover_method="ax_reload", recover_rc=0, recover_output=summary,
@@ -159,6 +170,43 @@ def _run_chrome_heal() -> RecoverResult | None:
         escalate_now=True, recover_method="ax_reload",
         recover_rc=p.returncode, recover_output=(detail or summary),
     )
+
+
+# The Chrome version the unpacked extension's SW registration was last
+# (re)loaded under. When Chrome auto-updates, the stale registration is what
+# strands the extension on the next cold start (the Jul 2-8 2026 outage) —
+# so on a version change we proactively `chrome reload-extension` while
+# everything is still healthy, then stamp the new version here.
+CHROME_VERSION_STATE = Path.home() / "dispatch/state/chrome-extension-reloaded-under.txt"
+
+
+def _chrome_installed_version() -> str | None:
+    """CFBundleShortVersionString of the installed Chrome.app, or None."""
+    try:
+        import plistlib
+        with open("/Applications/Google Chrome.app/Contents/Info.plist", "rb") as f:
+            return str(plistlib.load(f).get("CFBundleShortVersionString") or "") or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _chrome_version_skew() -> tuple[str, str] | None:
+    """(stored, current) if Chrome's version changed since the last extension
+    reload; None otherwise. First sighting just records the baseline."""
+    cur = _chrome_installed_version()
+    if not cur:
+        return None
+    try:
+        stored = CHROME_VERSION_STATE.read_text().strip()
+    except OSError:
+        stored = ""
+    if not stored:
+        try:
+            CHROME_VERSION_STATE.write_text(cur)
+        except OSError:
+            pass
+        return None
+    return (stored, cur) if stored != cur else None
 
 
 def _chrome_probe() -> ProbeResult:
@@ -186,6 +234,17 @@ def _chrome_probe() -> ProbeResult:
         )
         out = ((p.stdout or "") + (p.stderr or "")).strip()
         if p.returncode == 0 and "Connected to Chrome Control extension" in out:
+            skew = _chrome_version_skew()
+            if skew:
+                # Healthy but running on a stale SW registration from the
+                # pre-update binary — recover_on_degraded triggers a proactive
+                # reload before the next cold start can strand it.
+                return ProbeResult.degraded(
+                    f"chrome ping ok, but Chrome updated {skew[0]} → {skew[1]} — "
+                    "extension needs a proactive reload",
+                    probe_rc=0, version_skew=True,
+                    version_stored=skew[0], version_current=skew[1],
+                )
             return ProbeResult.ok("chrome ping ok", probe_rc=0, probe_output=out)
         return ProbeResult.down(
             f"chrome ping unhealthy (rc={p.returncode})",
@@ -209,6 +268,37 @@ def _chrome_recover() -> RecoverResult:
     """
     if not CHROME_CLI.exists():
         return RecoverResult.fail(f"chrome CLI not found at {CHROME_CLI}")
+    # Version-skew proactive reload: the probe reported DEGRADED (ping is fine
+    # but Chrome updated under us). Reload the extension NOW, while it still
+    # works, so the stale SW registration can't strand it on the next restart.
+    skew = _chrome_version_skew()
+    if skew and _chrome_app_running():
+        ping = subprocess.run(
+            [str(CHROME_CLI), "ping"], capture_output=True, text=True,
+            timeout=CHROME_PING_TIMEOUT,
+        )
+        if ping.returncode == 0:
+            r = subprocess.run(
+                [str(CHROME_CLI), "reload-extension"], capture_output=True,
+                text=True, timeout=CHROME_RESET_TIMEOUT,
+            )
+            rout = ((r.stdout or "") + (r.stderr or "")).strip()
+            if r.returncode == 0:
+                _stamp_chrome_version()
+                return RecoverResult.ok(
+                    f"proactively reloaded extension after Chrome update "
+                    f"{skew[0]} → {skew[1]}",
+                    recover_method="proactive_reload", recover_rc=0,
+                    recover_output=rout,
+                )
+            return RecoverResult.fail(
+                f"proactive `chrome reload-extension` after Chrome update "
+                f"{skew[0]} → {skew[1]} failed (rc={r.returncode}) — if this keeps "
+                "failing the next Chrome restart will likely strand the extension",
+                recover_method="proactive_reload", recover_rc=r.returncode,
+                recover_output=rout,
+            )
+        # ping is down after all — fall through to the normal DOWN chain.
     # Rung 0: Chrome isn't running at all (power-loss reboot, crash, user quit).
     # Launch it in the background and wake the extension. `-g` keeps it out of
     # the foreground so we don't steal focus from an active screen session.
@@ -526,6 +616,9 @@ def build_default_registry(manager: Any) -> DependencyHealthRunner:
         # No enabled_when gate: Chrome-not-running is a DOWN we recover from
         # (relaunch) — required for unattended power-loss reboots. The
         # recovery-frequency alarm catches a human deliberately quitting Chrome.
+        # Healthy-but-Chrome-updated probes come back DEGRADED and trigger the
+        # proactive extension reload (version-skew is what strands the SW).
+        recover_on_degraded=True,
         probe_timeout_s=CHROME_PING_TIMEOUT + 5,
         # reset (~30s) + chrome-heal AX rung (~150s) — the recover chain now
         # includes the automated chrome://extensions reload before escalating.

@@ -1,0 +1,60 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#   "pyobjc-framework-ApplicationServices",
+#   "pyobjc-framework-Cocoa",
+# ]
+# ///
+"""chaos-break-chrome-extension — deliberately disable the Chrome Control
+extension via its chrome://extensions card toggle, to exercise the daemon's
+autonomous detect→heal loop end-to-end.
+
+CHAOS TOOL: only for supervised resilience testing. Must run in an
+Accessibility-trusted context (daemon script task). Reuses chrome-heal's AX
+helpers by exec'ing its source. Verifies the break took effect (`chrome ping`
+fails) before exiting 0.
+"""
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HEAL_SRC = Path.home() / "dispatch/scripts/chrome-heal"
+
+g: dict = {"__name__": "chromeheal"}
+exec(compile(HEAL_SRC.read_text(), str(HEAL_SRC), "exec"), g)
+
+app, err = g["chrome_ax_app"]()
+if app is None:
+    sys.exit(f"no AX app: {err}")
+
+g["open_extensions_page"]()
+time.sleep(g["T_PAGE_LOAD"])
+g["enable_chrome_web_ax"](app)
+time.sleep(g["T_AX_SETTLE"])
+
+web = g["find_extensions_web_area"](app)
+if web is None:
+    sys.exit("no chrome://extensions AXWebArea found")
+
+toggle = g["find_enable_toggle"](web)
+if toggle is None:
+    sys.exit("enable toggle not found")
+state = g["is_on"](toggle)
+print(f"enable toggle current state: {state}")
+if state is False:
+    print("already off — nothing to break")
+    sys.exit(0)
+
+if not (g["ax_press"](toggle) or g["cliclick_center"](toggle)):
+    sys.exit("could not press the enable toggle")
+time.sleep(3)
+
+p = subprocess.run(
+    [str(g["CHROME_CLI"]), "ping"], capture_output=True, text=True, timeout=20
+)
+if p.returncode == 0:
+    sys.exit("BREAK FAILED: chrome ping still healthy after toggling off")
+print("BROKEN as intended: extension toggled off, chrome ping now fails. "
+      "The daemon's chrome_control check should now detect DOWN and heal it.")

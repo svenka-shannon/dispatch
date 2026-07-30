@@ -858,11 +858,13 @@ def cmd_wake(client, args):
                 file=sys.stderr,
             )
             print(
-                "This is the one state that genuinely needs a human: open "
-                "chrome://extensions/, turn on Developer mode, find "
-                "\"Chrome Control\", and click the reload ⟳ icon (or toggle it "
-                "off and back on). After that one manual reload, `chrome wake` "
-                "recovers it on its own.",
+                "Automated fix: run ~/dispatch/scripts/chrome-heal — it presses "
+                "the reload ⟳ on chrome://extensions/ via the Accessibility API "
+                "(must run in an AX-trusted context, e.g. as a daemon script "
+                "task; the daemon's chrome_control check also does this "
+                "automatically). Manual fallback: open chrome://extensions/, "
+                "turn on Developer mode, find \"Chrome Control\", and click the "
+                "reload ⟳ icon (or toggle it off and back on).",
                 file=sys.stderr,
             )
         elif prefs.get("found") and prefs.get("enabled"):

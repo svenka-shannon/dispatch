@@ -475,7 +475,15 @@ def test_bus_consumers_recover_rebuilds_runner() -> None:
     new_runner = MagicMock()
     new_thread = MagicMock()
     manager._init_consumers.return_value = new_runner
-    manager._start_consumer_thread.return_value = new_thread
+
+    # Mirror the real contract: _start_consumer_thread publishes the new thread
+    # as manager._consumer_thread itself (before starting it), so the fencing
+    # supersession check can never race — recover() does not assign it.
+    def _start():
+        manager._consumer_thread = new_thread
+        return new_thread
+
+    manager._start_consumer_thread.side_effect = _start
 
     rec = dc._bus_consumers_recover(manager)
 

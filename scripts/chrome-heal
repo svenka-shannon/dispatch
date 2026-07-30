@@ -612,7 +612,16 @@ def rung_ax_reload(dry_run: bool = False) -> tuple[bool, str]:
     if enable is not None and en_state is False and not dry_run:
         log("Extension toggle is off -> turning it on")
         if ax_press(enable) or cliclick_center(enable):
-            time.sleep(T_AX_SETTLE)
+            time.sleep(T_AFTER_RELOAD)
+            # Enabling alone often fully revives the extension; a disabled
+            # card may not even render a Reload button, so check before
+            # hunting for one and failing spuriously.
+            if wait_for_ping():
+                return True, "re-enabled the extension via its card toggle (no reload needed)"
+            w = chrome_cli("wake", timeout=40)
+            vlog(f"post-enable wake rc={w.returncode}")
+            if wait_for_ping():
+                return True, "re-enabled the extension via its card toggle + chrome wake"
 
     btn, how = find_card_reload_button(web)
     if btn is None:

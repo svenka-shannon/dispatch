@@ -391,8 +391,8 @@ checks defined in `assistant/dependency_checks.py`. Each dependency is a
 `DependencyCheck` (dataclass): a `probe` (→ `OK`/`DEGRADED`/`DOWN`/`SKIP`), an
 optional `recover`, a poll `interval_s`, a bounded retry schedule
 (`max_attempts`, `backoff_s`), an `escalate` callback (default: SMS the admin —
-`Manager._send_sms` → `send-sms` CLI, NOT via a chat session), and an
-`enabled_when` gate (e.g. `chrome_control` only when Chrome.app is running).
+`Manager._send_sms` → `send-sms` CLI, NOT via a chat session), and an optional
+`enabled_when` gate.
 
 Per-dependency state machine: `HEALTHY → DEGRADED → DOWN → RECOVERING →
 (HEALTHY | ESCALATED)`. On `DOWN`: attempt `recover()` up to `max_attempts` with
@@ -411,10 +411,16 @@ Every transition + recovery attempt + escalation emits a `health.dependency` bus
 event (`system` topic) and an authoritative manager-log line; healthy
 steady-state is DEBUG-only.
 
-Migrated checks: `chrome_control` (90s; probe `chrome ping`, recover `chrome
-reset`, escalate on the errored-extension state — `chrome reset`/`wake` exits
-non-zero — with the exact "reload at chrome://extensions/ → Developer mode →
-reload ⟳" fix; replaces the old standalone `_run_chrome_control_check`),
+Migrated checks: `chrome_control` (90s; probe `chrome ping` — Chrome not
+running is DOWN, recovered by relaunching Chrome (`open -ga` + wake) so an
+unattended power-loss reboot self-heals; a healthy ping under a *changed*
+Chrome version is DEGRADED, recovered by a proactive `chrome reload-extension`
+(version-skew cold starts are what strand the MV3 SW registration — Jul 2026
+outage); DOWN recovery chain is `chrome reset` → `scripts/chrome-heal --rung
+ax`, which presses the reload ⟳ on chrome://extensions/ via the Accessibility
+API — the formerly human-required errored-extension state is now automated;
+escalation only fires when all of that fails, with a rung-specific ask;
+replaces the old standalone `_run_chrome_control_check`),
 `signal_cli` (300s; probe the JSON-RPC socket, recover = restart the signal-cli
 daemon with `--receive-mode on-connection`; replaces the old 5-min ad-hoc
 check), `bus_consumers` (300s; probe ConsumerRunner thread + DEAD registry

@@ -638,9 +638,9 @@ GOAL OF THIS CALL: {goal}
 Sound like a person, not a bot:
 - Natural, warm, casual-professional. Use contractions. Brief acknowledgments ("Sure", "Perfect", "Got it") are good.
 - Introduce yourself simply as "{assistant_name}, {owner_name}'s assistant" when a greeting is called for. Do NOT volunteer that you're an AI on routine errands — but if anyone asks whether you're an AI, a robot, or a recording, answer honestly and briefly, then get back to the task. Never deny being an AI.
-- Reply with ONLY the words to speak aloud. 1-2 short conversational sentences. No markdown, no stage directions, no emoji.
-- Open with a short first sentence (a few words), then continue if needed.
-- Numbers/times: speak them naturally ("seven thirty" not "7:30").
+- **BE BRIEF. Usually ONE short sentence; never more than two.** This is a real phone call — long turns get talked over. Ask ONE question at a time; don't recap everything.
+- Reply with ONLY the words to speak aloud — plain text. NEVER use asterisks, bullet points, markdown, emoji, or stage directions. It is read aloud verbatim.
+- Numbers/times: speak them naturally ("seven thirty" not "7:30", "two people" not "2 people").
 
 Mechanics:
 - You receive the other person's words via speech-to-text — it may contain errors; infer intent.
@@ -650,6 +650,16 @@ Mechanics:
 
 
 _SENT_BOUNDARY = None  # compiled lazily in cmd_converse
+
+
+def _clean_for_speech(text: str) -> str:
+    """Strip markdown/formatting the model may slip in — it would be spoken
+    literally ('asterisk asterisk two people'). Keep only speakable text."""
+    import re
+    text = re.sub(r"[*_`#>]+", "", text)          # md emphasis / headers / code
+    text = re.sub(r"^\s*[-•]\s+", "", text, flags=re.M)  # bullet markers
+    text = re.sub(r"\s{2,}", " ", text)
+    return text.strip()
 
 
 def _find_sentence_cut(buf: str, min_len: int = 20) -> int | None:
@@ -725,21 +735,82 @@ def cmd_converse(args) -> None:
                                  channels=1, dtype="float32")
     out_stream.start()
 
+    # Barge-in: when the caller starts talking while we're speaking, stop.
+    # `interrupt` is set by the input monitor; the player checks it between
+    # small blocks and drains the queue so we go quiet fast.
+    interrupt = threading.Event()
+    speaking = threading.Event()  # set while we have audio to play
+
     def _player():
+        BLOCK = KOKORO_RATE // 20  # 50ms blocks — fine-grained stop
         while True:
             arr = playq.get()
             if arr is None:
                 playq.task_done()
                 break
-            out_stream.write(arr.reshape(-1, 1).astype("float32"))
+            buf = arr.reshape(-1, 1).astype("float32")
+            for i in range(0, len(buf), BLOCK):
+                if interrupt.is_set():
+                    break
+                out_stream.write(buf[i:i + BLOCK])
             playq.task_done()
 
     player_thread = threading.Thread(target=_player, daemon=True)
     player_thread.start()
 
+    def _drain_queue() -> None:
+        try:
+            while True:
+                playq.get_nowait()
+                playq.task_done()
+        except queue_mod.Empty:
+            pass
+
+    barge_shutdown = threading.Event()
+
+    def _barge_monitor():
+        """When we start speaking, open the far-end device and watch for the
+        caller talking over us; on sustained speech, set `interrupt` and drop
+        the queue. Opens the stream ONLY while speaking so it never overlaps
+        hear()'s InputStream on the same device."""
+        import sounddevice as _sd
+        blk = int(RECORD_RATE * 0.03)
+        thresh = 10 ** (args.threshold_db / 20)
+        while not barge_shutdown.is_set():
+            if not speaking.wait(timeout=0.1):
+                continue
+            run_len = 0.0
+            try:
+                with _sd.InputStream(device=SPK_DEVICE, channels=1,
+                                     samplerate=RECORD_RATE, blocksize=blk,
+                                     dtype="float32") as st:
+                    # brief settle so we don't catch the tail of our own prior
+                    # audio still draining from the device
+                    time.sleep(0.15)
+                    while speaking.is_set() and not interrupt.is_set() \
+                            and not barge_shutdown.is_set():
+                        block, _ = st.read(blk)
+                        rms = float(np.sqrt(np.mean(block[:, 0] ** 2)))
+                        if rms > thresh:
+                            run_len += 0.03
+                            if run_len >= 0.25:  # ~250ms, ignores blips/echo
+                                interrupt.set()
+                                _drain_queue()
+                                log("barge-in: caller talking over us, stopping")
+                        else:
+                            run_len = 0.0
+            except Exception as e:
+                log(f"barge monitor error: {e}")
+                speaking.wait(timeout=0.5)
+
+    barge_thread = None
+    if args.barge_in:
+        barge_thread = threading.Thread(target=_barge_monitor, daemon=True)
+        barge_thread.start()
+
     def say_now(text: str) -> None:
         """Synchronous speak (greeting / fallback): synth + enqueue + drain."""
-        playq.put(synth(text))
+        playq.put(synth(_clean_for_speech(text)))
         playq.join()
         tlog("ME", text)
 
@@ -811,6 +882,7 @@ def cmd_converse(args) -> None:
                     if len(sent) > 300:
                         sent = sent[:300]
                         hangup = True
+                    sent = _clean_for_speech(sent)
                     if sent:
                         samples = await asyncio.to_thread(synth, sent)
                         playq.put(samples)
@@ -866,6 +938,8 @@ def cmd_converse(args) -> None:
                 silent_rounds = 0
                 tlog("THEM", heard)
                 t0 = time.time()
+                interrupt.clear()
+                speaking.set()  # arm barge-in for this reply's playback
                 # Timeout wraps ONLY brain+synth+enqueue (target ~1-2s, cap
                 # 30s) — never the audio device, so a stalled speaker can't
                 # hang the turn.
@@ -873,10 +947,12 @@ def cmd_converse(args) -> None:
                     text, hangup, wait, first_audio, audio_dur = \
                         await asyncio.wait_for(respond(heard, t0), timeout=30)
                 except asyncio.TimeoutError:
+                    speaking.clear()
                     tlog("SYS", "brain turn timed out (30s) — apologizing, hanging up")
                     say_now("I'm so sorry, I'm having some technical trouble. I'll try again later. Goodbye!")
                     break
                 if wait:
+                    speaking.clear()
                     tlog("SYS", "waiting (hold/menu)")
                     continue
                 if text:
@@ -889,6 +965,9 @@ def cmd_converse(args) -> None:
                                            timeout=audio_dur + 4)
                 except asyncio.TimeoutError:
                     log("playback drain timed out — continuing")
+                speaking.clear()
+                if interrupt.is_set():
+                    tlog("SYS", "was interrupted — listening to the caller now")
                 if hangup:
                     tlog("SYS", "goal met — hanging up")
                     break
@@ -896,6 +975,9 @@ def cmd_converse(args) -> None:
     try:
         asyncio.run(_loop())
     finally:
+        barge_shutdown.set()
+        if barge_thread:
+            barge_thread.join(timeout=2)
         playq.put(None)
         player_thread.join(timeout=5)
         out_stream.stop()
@@ -1054,6 +1136,10 @@ def main() -> None:
                     help="max seconds to wait for them to speak each turn")
     sp.add_argument("--max-minutes", type=float, default=8)
     sp.add_argument("--threshold-db", type=float, default=-55)
+    sp.add_argument("--barge-in", action="store_true", default=True,
+                    help="stop talking when the caller interrupts (default on)")
+    sp.add_argument("--no-barge-in", dest="barge_in", action="store_false",
+                    help="disable barge-in (talk through interruptions)")
     sp.add_argument("--transcript", help="transcript file path")
     sp.set_defaults(func=cmd_converse)
 

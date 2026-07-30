@@ -4,9 +4,11 @@ Concrete `DependencyCheck` descriptors for the daemon's external dependencies.
 `build_default_registry(manager)` returns a `DependencyHealthRunner` with the
 migrated checks registered:
 
-  - chrome_control : `chrome ping` → `chrome reset`; gated on Chrome.app running;
-                     escalate on the errored-extension state (the one true
-                     human-required case) with the exact fix from `chrome wake`.
+  - chrome_control : `chrome ping` → `chrome reset` → `chrome-heal --rung ax`
+                     (AX-driven reload of the errored extension — the state that
+                     previously required a human at chrome://extensions/); gated
+                     on Chrome.app running; escalate only if the automated
+                     reload also fails, with a rung-specific ask.
   - signal_cli     : JSON-RPC socket reachable + daemon process alive →
                      restart the signal-cli daemon with `--receive-mode on-connection`.
   - bus_consumers  : ConsumerRunner thread alive + no DEAD members in the bus
@@ -26,6 +28,7 @@ the module docstring note + the agent report.
 """
 from __future__ import annotations
 
+import json
 import logging
 import shutil
 import socket
@@ -72,12 +75,110 @@ _CHROME_RELOAD_FIX = (
     "After that one manual reload it self-heals again."
 )
 
+# Automated equivalent of the manual reload: drives chrome://extensions/ via the
+# macOS Accessibility API and presses the card's reload button. Runs as rung 2
+# of the recover chain, after `chrome reset` fails with the errored-extension
+# signal. Requires the daemon's python to be Accessibility-trusted (it is —
+# TCC grants by responsible process, and the launchd-spawned daemon binary
+# carries the grant).
+CHROME_HEAL = Path.home() / "dispatch/scripts/chrome-heal"
+CHROME_HEAL_TIMEOUT = 150  # page load + AX tree walk + reload + wake + ping polls
+
+# chrome-heal failure prefixes → what the admin should actually do. Only
+# AX_RELOAD_NO_RECOVERY genuinely needs hands on the machine.
+_CHROME_HEAL_FIXES = {
+    "AX_UNTRUSTED": (
+        "chrome-heal has no Accessibility permission in the daemon's context — grant "
+        "Accessibility to /Users/svenka/dispatch/.venv/bin/python (System Settings → "
+        "Privacy & Security → Accessibility), then `claude-assistant restart`."
+    ),
+    "AX_NO_WEBAREA": (
+        "chrome://extensions/ didn't render in Chrome's AX tree — a modal dialog is "
+        "probably blocking Chrome's window. Check the screen (screen-sharing works) "
+        "or restart Chrome."
+    ),
+    "AX_NO_RELOAD_BUTTON": (
+        "the Chrome Control card has no Reload button — chrome://extensions layout "
+        "may have changed, or the card is collapsed. Falls back to the manual fix: "
+        + _CHROME_RELOAD_FIX
+    ),
+    "AX_RELOAD_NO_RECOVERY": (
+        "the automated reload WAS pressed but the extension never came back — the "
+        "unpacked source tree at ~/dispatch/skills/chrome-control/extension is "
+        "likely broken on disk. This one genuinely needs investigation."
+    ),
+}
+
+
+def _run_chrome_heal() -> RecoverResult | None:
+    """Rung 2 of chrome_control recovery: chrome-heal's AX reload.
+
+    Returns a RecoverResult (ok or fail-with-escalation), or None if the
+    chrome-heal script is missing (fall through to the legacy escalation).
+    """
+    if not CHROME_HEAL.exists():
+        return None
+    try:
+        p = subprocess.run(
+            [str(CHROME_HEAL), "--rung", "ax", "--json"],
+            capture_output=True, text=True, timeout=CHROME_HEAL_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return RecoverResult.fail(
+            f"chrome-heal timed out after {CHROME_HEAL_TIMEOUT}s — falling back to the "
+            "manual fix. " + _CHROME_RELOAD_FIX,
+            escalate_now=True, recover_method="ax_reload", recover_timed_out=True,
+        )
+    except Exception as e:  # noqa: BLE001
+        return RecoverResult.fail(
+            f"chrome-heal errored: {e}. " + _CHROME_RELOAD_FIX,
+            escalate_now=True, recover_method="ax_reload", recover_error=str(e),
+        )
+    try:
+        result = json.loads(p.stdout or "{}")
+    except ValueError:
+        result = {}
+    summary = result.get("summary") or (p.stdout or p.stderr or "").strip()
+    if p.returncode == 0 and result.get("ok"):
+        return RecoverResult.ok(
+            f"chrome-heal AX reload recovered: {summary}",
+            recover_method="ax_reload", recover_rc=0, recover_output=summary,
+        )
+    # Failed — pick the specific admin ask from the diagnostic prefix.
+    detail = ""
+    for a in result.get("attempts", []):
+        if a.get("rung") == "ax":
+            detail = a.get("detail", "")
+    fix = _CHROME_RELOAD_FIX
+    for prefix, ask in _CHROME_HEAL_FIXES.items():
+        if prefix in detail or prefix in summary:
+            fix = ask
+            break
+    return RecoverResult.fail(
+        f"automated AX reload failed — {fix} (chrome-heal: {summary})",
+        escalate_now=True, recover_method="ax_reload",
+        recover_rc=p.returncode, recover_output=(detail or summary),
+    )
+
 
 def _chrome_probe() -> ProbeResult:
-    """`chrome ping` with a short timeout. Healthy iff rc==0 and 'Connected ...'."""
+    """`chrome ping` with a short timeout. Healthy iff rc==0 and 'Connected ...'.
+
+    Chrome.app not running is DOWN, not SKIP: on this machine Chrome is
+    assistant infrastructure, and after a power-loss reboot nothing else
+    launches it (no login items). The old `enabled_when=_chrome_app_running`
+    gate meant the daemon silently never probed a closed Chrome — which is how
+    the Jul 2–8 2026 outage went undetected for days. Recovery relaunches it;
+    the recovery-frequency alarm (>5/hr) still escalates if someone is
+    deliberately quitting Chrome and we keep fighting them.
+    """
     if not CHROME_CLI.exists():
         # Treat a missing CLI as SKIP rather than DOWN — nothing the daemon can do.
         return ProbeResult.skip(f"chrome CLI not found at {CHROME_CLI}")
+    if not _chrome_app_running():
+        return ProbeResult.down(
+            "Google Chrome is not running", chrome_running=False, probe_rc=None,
+        )
     try:
         p = subprocess.run(
             [str(CHROME_CLI), "ping"],
@@ -108,6 +209,35 @@ def _chrome_recover() -> RecoverResult:
     """
     if not CHROME_CLI.exists():
         return RecoverResult.fail(f"chrome CLI not found at {CHROME_CLI}")
+    # Rung 0: Chrome isn't running at all (power-loss reboot, crash, user quit).
+    # Launch it in the background and wake the extension. `-g` keeps it out of
+    # the foreground so we don't steal focus from an active screen session.
+    if not _chrome_app_running():
+        subprocess.run(
+            ["open", "-ga", "Google Chrome"], capture_output=True, timeout=15,
+        )
+        deadline = time.time() + 20
+        while time.time() < deadline and not _chrome_app_running():
+            time.sleep(1)
+        if not _chrome_app_running():
+            return RecoverResult.fail(
+                "`open -ga 'Google Chrome'` did not start Chrome within 20s",
+                recover_method="launch_chrome",
+            )
+        time.sleep(5)  # let the profile + extensions finish loading
+        w = subprocess.run(
+            [str(CHROME_CLI), "wake"], capture_output=True, text=True,
+            timeout=CHROME_RESET_TIMEOUT,
+        )
+        wout = ((w.stdout or "") + (w.stderr or "")).strip()
+        if w.returncode == 0:
+            return RecoverResult.ok(
+                "launched Google Chrome and woke the extension",
+                recover_method="launch_chrome", recover_rc=0, recover_output=wout,
+            )
+        # Chrome is up but the extension didn't wake — fall through to the
+        # reset → chrome-heal chain below, which handles the errored state
+        # (the version-skew cold start lands exactly here).
     try:
         p = subprocess.run(
             [str(CHROME_CLI), "reset"],
@@ -116,10 +246,17 @@ def _chrome_recover() -> RecoverResult:
         out = ((p.stdout or "") + (p.stderr or "")).strip()
         if p.returncode == 0:
             return RecoverResult.ok("chrome reset reconnected", recover_rc=0, recover_output=out)
-        # Non-zero → look for the errored-extension signal; if present, the only
-        # fix is a manual reload — escalate immediately with the precise ask.
+        # Non-zero → likely the errored-extension state. Before paging a human,
+        # try the automated equivalent of the manual reload (chrome-heal's AX
+        # rung presses the reload ⟳ button on chrome://extensions/ itself).
         disable_reason = _extract_disable_reason(out)
         errored = any(sig in out for sig in _ERRORED_EXTENSION_SIGNALS) or "errored" in out.lower()
+        healed = _run_chrome_heal()
+        if healed is not None:
+            if not healed.success and disable_reason:
+                healed.diagnostics["disable_reason"] = disable_reason
+            return healed
+        # chrome-heal missing — legacy behavior: escalate with the manual ask.
         detail = (
             f"`chrome reset` exited {p.returncode} — chrome-control extension appears errored/disabled. "
             + _CHROME_RELOAD_FIX
@@ -242,20 +379,27 @@ def _bus_consumers_probe(manager: Any) -> ProbeResult:
 
 
 def _bus_consumers_recover(manager: Any) -> RecoverResult:
-    """Rebuild the ConsumerRunner and restart its background thread."""
+    """Rebuild the ConsumerRunner and restart its background thread.
+
+    _start_consumer_thread publishes the new thread as manager._consumer_thread
+    before it runs, which supersedes any surviving old thread (it exits at its
+    next loop check instead of competing — two live runner threads fence each
+    other's consumers forever).
+    """
     try:
-        # Stop the current runner (best-effort) so its DB connections are released.
+        # Stop the current runner (best-effort) so its DB connections are
+        # released and the old thread's run_forever() returns cleanly.
         runner = getattr(manager, "_consumer_runner", None)
         if runner is not None:
             try:
                 runner.stop()
             except Exception:
                 pass
-        # Rebuild + restart the thread.
+        # Rebuild + restart the thread (assigns manager._consumer_thread itself).
         if hasattr(manager, "_init_consumers"):
             manager._consumer_runner = manager._init_consumers()
         if hasattr(manager, "_start_consumer_thread"):
-            manager._consumer_thread = manager._start_consumer_thread()
+            manager._start_consumer_thread()
             return RecoverResult.ok("bus ConsumerRunner rebuilt + thread restarted")
         return RecoverResult.fail("manager has no _start_consumer_thread — cannot restart")
     except Exception as e:  # noqa: BLE001
@@ -379,9 +523,13 @@ def build_default_registry(manager: Any) -> DependencyHealthRunner:
         interval_s=90,                       # tight: catch a wedged MV3 SW in ~1-2 min
         max_attempts=3,
         backoff_s=(0, 30, 90),               # `chrome reset` is heavy; modest waits
-        enabled_when=_chrome_app_running,    # never relaunch a Chrome the user closed
+        # No enabled_when gate: Chrome-not-running is a DOWN we recover from
+        # (relaunch) — required for unattended power-loss reboots. The
+        # recovery-frequency alarm catches a human deliberately quitting Chrome.
         probe_timeout_s=CHROME_PING_TIMEOUT + 5,
-        recover_timeout_s=CHROME_RESET_TIMEOUT + 10,
+        # reset (~30s) + chrome-heal AX rung (~150s) — the recover chain now
+        # includes the automated chrome://extensions reload before escalating.
+        recover_timeout_s=CHROME_RESET_TIMEOUT + CHROME_HEAL_TIMEOUT + 15,
         recovery_alarm_k=5,
     ))
 

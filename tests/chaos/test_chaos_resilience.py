@@ -331,8 +331,11 @@ def test_errored_extension_escalates_not_recovers() -> None:
 def test_chrome_recover_classifies_errored_output_as_escalate_now() -> None:
     """MOCKED: the real ``assistant.dependency_checks._chrome_recover`` must, on a
     non-zero ``chrome reset`` whose output contains an errored-extension signal,
-    return ``RecoverResult.fail(escalate_now=True, ...)`` with the manual-reload
-    fix in the detail. Patches ``subprocess.run`` so nothing real is touched.
+    attempt the automated chrome-heal AX reload; when that also fails it must
+    return ``RecoverResult.fail(escalate_now=True, ...)`` with an actionable fix
+    in the detail. Patches ``subprocess.run`` so nothing real is touched, and
+    ``_chrome_app_running`` so the Chrome-relaunch rung 0 doesn't trigger
+    (the global subprocess mock would otherwise fake pgrep as "not running").
     """
     import assistant.dependency_checks as dc
 
@@ -348,15 +351,19 @@ def test_chrome_recover_classifies_errored_output_as_escalate_now() -> None:
     if not dc.CHROME_CLI.exists():
         pytest.skip("chrome CLI not present — _chrome_recover early-returns before subprocess")
     orig_run = dc.subprocess.run
+    orig_running = dc._chrome_app_running
     try:
         dc.subprocess.run = lambda *a, **kw: fake_cp  # type: ignore[assignment]
+        dc._chrome_app_running = lambda: True  # type: ignore[assignment]
         rec = dc._chrome_recover()
     finally:
         dc.subprocess.run = orig_run  # type: ignore[assignment]
+        dc._chrome_app_running = orig_running  # type: ignore[assignment]
 
     assert rec.success is False
-    assert rec.escalate_now is True, "errored-extension output must request immediate escalation"
+    assert rec.escalate_now is True, "errored extension + failed AX heal must escalate immediately"
     assert "chrome://extensions" in rec.detail
+    assert rec.diagnostics.get("recover_method") == "ax_reload", "chrome-heal must have been attempted"
     assert rec.diagnostics.get("recover_rc") == 1
 
 

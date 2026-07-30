@@ -1,0 +1,207 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = []
+# ///
+"""
+chrome-housekeep — periodic Chrome cleanup to prevent runaway resource usage
+from accumulated research tabs.
+
+Background: assistant sessions kick off airbnb / google flights / gmail-search
+tabs that we forget to close. After a day or two Chrome ends up with 15-30
+research tabs eating 400-700% CPU. The chrome extension already auto-cleans
+tabs older than 24h, but that's too long for our usage pattern.
+
+This script runs every 30-60 minutes (via cron / LaunchAgent / schedule skill)
+and closes tabs matching well-known "transient research" URL patterns. It does
+NOT touch tabs the user opened (gmail main view, slack, news, social, etc.).
+
+Also reports CPU & memory state to perf log for trend tracking.
+
+Usage:
+    chrome-housekeep                   # default: close stale research tabs
+    chrome-housekeep --dry-run         # show what would be closed, don't act
+    chrome-housekeep --max-tabs 8      # close oldest research tabs to cap total
+    chrome-housekeep --restart-if-cpu 600  # also restart Chrome if total CPU > N%
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+CHROME_CLI = os.path.expanduser("~/.claude/skills/chrome-control/scripts/chrome")
+PERF_LOG_DIR = Path.home() / "dispatch" / "logs"
+
+# URL patterns considered "transient research" — fine to close after task completes.
+# Tabs matching these get closed by this script. Anything NOT matching is preserved.
+TRANSIENT_PATTERNS = [
+    r"^https?://www\.airbnb\.com/(s/|rooms/)",       # airbnb search & listings
+    r"^https?://www\.google\.com/travel/(flights|search|hotels)",  # google travel/hotels/flights
+    r"^https?://www\.google\.com/maps/search",       # google maps searches
+    r"^https?://www\.google\.com/search",            # google web search results
+    r"^https?://duckduckgo\.com/",                   # ddg searches
+    r"^https?://html\.duckduckgo\.com/",
+    r"^https?://www\.amazon\.com/.*/dp/",            # amazon product pages
+    r"^https?://www\.amazon\.com/gp/",
+    r"^https?://www\.yelp\.com/(search|biz/)",       # yelp searches
+    r"^https?://skiplagged\.com/",                   # skiplagged
+    r"^https?://mail\.google\.com/mail/u/0/#search/",  # gmail search results (NOT main inbox)
+    r"^https?://app\.slack\.com/get-started",        # slack signup
+    r"^https?://slack\.com/get-started",
+    r"^https?://www\.eventbrite\.com/e/",            # eventbrite event pages
+    r"^https?://chrome://newtab",                    # blank new tabs
+    r"^chrome://newtab",
+    r"^about:blank",
+]
+
+PRESERVE_PATTERNS = [
+    r"^https?://mail\.google\.com/mail/u/0/(#inbox|$)",   # gmail main inbox — keep
+    r"^https?://app\.slack\.com/client/",                  # slack workspace — keep
+    r"^https?://voice\.google\.com",                       # google voice — keep (active session)
+]
+
+
+def is_transient(url: str) -> bool:
+    for pat in PRESERVE_PATTERNS:
+        if re.search(pat, url, re.I):
+            return False
+    for pat in TRANSIENT_PATTERNS:
+        if re.search(pat, url, re.I):
+            return True
+    return False
+
+
+def get_tabs() -> list[dict]:
+    """Return [{tab_id, title, url}, ...] from `chrome tabs`."""
+    try:
+        out = subprocess.run(
+            [CHROME_CLI, "tabs"], capture_output=True, text=True, timeout=15
+        )
+    except subprocess.TimeoutExpired:
+        return []
+    if out.returncode != 0:
+        return []
+    tabs = []
+    lines = out.stdout.strip().splitlines()
+    i = 0
+    while i < len(lines):
+        # tab_id<space>title, then next line indented = url
+        m = re.match(r"^(\d+)\s+(.*)$", lines[i])
+        if m and i + 1 < len(lines) and lines[i + 1].startswith(" "):
+            tab_id = m.group(1)
+            title = m.group(2).strip()
+            url = lines[i + 1].strip()
+            tabs.append({"tab_id": tab_id, "title": title, "url": url})
+            i += 2
+        else:
+            i += 1
+    return tabs
+
+
+def chrome_total_cpu_pct() -> float:
+    out = subprocess.run(
+        ["ps", "axo", "%cpu,command"], capture_output=True, text=True
+    )
+    total = 0.0
+    for line in out.stdout.splitlines():
+        if "Google Chrome" in line:
+            try:
+                total += float(line.split()[0])
+            except (ValueError, IndexError):
+                pass
+    return total
+
+
+def restart_chrome():
+    # Graceful quit first: SIGTERM-ing every Chrome helper (`pkill -f`) is an
+    # unclean shutdown that burns the MV3 service-worker crash budget and can
+    # leave the chrome-control extension errored on next launch (July 2026
+    # outage postmortem). AppleScript here is app lifecycle, not page control.
+    subprocess.run(
+        ["osascript", "-e", 'quit app "Google Chrome"'],
+        capture_output=True, timeout=15,
+    )
+    for _ in range(10):
+        if subprocess.run(["pgrep", "-x", "Google Chrome"], capture_output=True).returncode != 0:
+            break
+        time.sleep(1)
+    else:
+        subprocess.run(["pkill", "-f", "Google Chrome"], capture_output=True)
+    time.sleep(3)
+    subprocess.Popen(["open", "-a", "Google Chrome"])
+    time.sleep(5)
+    # Touch a URL to wake the extension service worker
+    subprocess.Popen(["open", "https://www.google.com/"])
+
+
+def log_perf(action: str, count: int, cpu: float, **extra):
+    PERF_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    f = PERF_LOG_DIR / f"perf-{datetime.now():%Y-%m-%d}.jsonl"
+    entry = {
+        "v": 1,
+        "ts": datetime.now().isoformat(),
+        "metric": "chrome_housekeep",
+        "value": count,
+        "component": "chrome-housekeep",
+        "action": action,
+        "chrome_cpu_pct": cpu,
+        **extra,
+    }
+    with open(f, "a") as fh:
+        fh.write(json.dumps(entry) + "\n")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--max-tabs", type=int, default=None,
+                    help="If set, close oldest transient tabs to keep total ≤ N")
+    ap.add_argument("--restart-if-cpu", type=float, default=None,
+                    help="Restart Chrome if total CPU%% exceeds this threshold")
+    args = ap.parse_args()
+
+    cpu = chrome_total_cpu_pct()
+    tabs = get_tabs()
+    transient = [t for t in tabs if is_transient(t["url"])]
+
+    print(f"chrome state: {len(tabs)} tabs, {len(transient)} transient, total CPU {cpu:.0f}%")
+    for t in transient:
+        print(f"  [transient] {t['tab_id']} {t['url'][:80]}")
+
+    closed = 0
+    if not args.dry_run:
+        for t in transient:
+            r = subprocess.run([CHROME_CLI, "close", t["tab_id"]],
+                               capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                closed += 1
+        if args.max_tabs and len(tabs) - closed > args.max_tabs:
+            # Close oldest non-preserved tabs (FIFO by tab_id since they're monotonic)
+            kept = sorted([t for t in tabs if t not in transient],
+                          key=lambda x: int(x["tab_id"]))
+            excess = (len(tabs) - closed) - args.max_tabs
+            for t in kept[:excess]:
+                if not any(re.search(p, t["url"], re.I) for p in PRESERVE_PATTERNS):
+                    r = subprocess.run([CHROME_CLI, "close", t["tab_id"]],
+                                       capture_output=True, text=True, timeout=10)
+                    if r.returncode == 0:
+                        closed += 1
+
+    print(f"closed {closed} tab(s){' [DRY RUN]' if args.dry_run else ''}")
+
+    restarted = False
+    if args.restart_if_cpu is not None and cpu > args.restart_if_cpu and not args.dry_run:
+        print(f"chrome CPU {cpu:.0f}% > threshold {args.restart_if_cpu:.0f}%, restarting...")
+        restart_chrome()
+        restarted = True
+
+    log_perf("housekeep", closed, cpu, restarted=restarted, total_tabs_before=len(tabs))
+
+
+if __name__ == "__main__":
+    main()

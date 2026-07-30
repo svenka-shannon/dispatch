@@ -1,0 +1,807 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#   "pyobjc-framework-ApplicationServices",
+#   "pyobjc-framework-Cocoa",
+# ]
+# ///
+"""chrome-heal — fully-autonomous recovery for the Chrome Control extension.
+
+WHY THIS EXISTS
+---------------
+The chrome-control MV3 extension is loaded *unpacked*. Chrome can put it into
+an errored/disabled state (crashed service worker, "needs a reload",
+manifest reparse failure after a file edit). In that state `chrome ping`,
+`chrome wake` and `chrome reset` all fail, and the documented fix is a HUMAN
+opening chrome://extensions/, enabling Developer mode, and clicking the
+reload (⟳) button on the Chrome Control card. This machine is frequently
+physically inaccessible, so that fix has to be automatable.
+
+chrome-heal climbs an escalating ladder and verifies with `chrome ping`
+(exit 0 == healthy) after every rung. It exits 0 as soon as a rung recovers,
+and non-zero with a specific diagnostic if every rung fails.
+
+THE LADDER
+----------
+  Rung 0  preflight   `chrome ping`. Already healthy -> exit 0 (unless --force).
+  Rung 1  reset       `chrome reset` (kills wedged native_host, auto-wakes the
+                      service worker). Fixes: hung native host, evicted SW.
+  Rung 2  ax-reload   Drive chrome://extensions/ through the macOS
+                      Accessibility API and press the card's reload button --
+                      the programmatic equivalent of the human fix. Fixes: the
+                      errored/disabled unpacked-extension state, which is the
+                      *only* thing that previously needed a human. Also flips
+                      Developer mode on and the per-extension enable toggle on
+                      if either is off. Falls back to cliclick at the AX
+                      element's own screen rect if AXPress is unavailable.
+  Rung 3  restart     Quit Chrome (pkill), relaunch, `chrome wake`. Fixes: a
+                      wedged Chrome service-worker subsystem. Note a restart
+                      does NOT reliably clear a hard "errored" unpacked
+                      extension -- Chrome restores the disabled state from
+                      Preferences -- which is exactly why rung 2 exists and
+                      runs first.
+
+STATES HANDLED
+--------------
+  * native_host wedged / pegged at 100% CPU ................ rung 1
+  * MV3 service worker evicted ............................. rung 1 (or 3)
+  * extension errored / disabled ("needs a reload") ........ rung 2
+  * extension toggled off (AXToggle/AXCheckBox off) ........ rung 2
+  * Developer mode off (hides the reload button) ........... rung 2
+  * Chrome's SW subsystem wedged ........................... rung 3
+  * Chrome not running at all .............................. rung 3 (relaunch)
+
+STATES *NOT* HANDLED (still need a human)
+-----------------------------------------
+  * The unpacked extension directory is missing/corrupt on disk. Chrome will
+    refuse to reload it; the reload button either vanishes or re-errors. The
+    fix is repairing the source tree, not clicking anything.
+  * Chrome shows a modal ("Restore pages?", profile sign-in, an update
+    relaunch prompt) that steals the window. chrome-heal reports it rather
+    than blind-clicking unknown dialogs.
+  * The process running chrome-heal lacks macOS Accessibility permission
+    (AXIsProcessTrusted() == False). Rung 2 is skipped with a specific
+    diagnostic naming the binary that must be granted. TCC attributes the
+    grant to the *responsible* process, so the grant must exist for whatever
+    launches chrome-heal (the launchd-started dispatch daemon), not for an
+    interactive shell that happens to run it.
+
+USAGE
+-----
+    scripts/chrome-heal                 # heal if unhealthy, no-op if healthy
+    scripts/chrome-heal --force         # run the ladder even if ping is OK
+    scripts/chrome-heal --rung ax       # run exactly one rung (reset|ax|restart)
+    scripts/chrome-heal --dry-run       # AX discovery only; presses nothing
+    scripts/chrome-heal --diagnose      # print health + AX + prefs state, exit
+    scripts/chrome-heal --json          # machine-readable result on stdout
+    scripts/chrome-heal --verbose       # per-step timing to stderr
+
+Exit codes: 0 recovered/healthy | 1 all rungs failed | 2 AX unavailable and
+lower rungs failed | 3 Chrome not running and could not be relaunched.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from ApplicationServices import (
+    AXIsProcessTrusted,
+    AXUIElementCopyActionNames,
+    AXUIElementCopyAttributeNames,
+    AXUIElementCopyAttributeValue,
+    AXUIElementCreateApplication,
+    AXUIElementPerformAction,
+    AXUIElementSetAttributeValue,
+    AXValueGetValue,
+    kAXValueCGPointType,
+    kAXValueCGSizeType,
+)
+
+CHROME_CLI = Path.home() / ".claude/skills/chrome-control/scripts/chrome"
+NATIVE_HOST_MANIFEST = (
+    Path.home()
+    / "Library/Application Support/Google/Chrome/NativeMessagingHosts/com.dispatch.chrome_control.json"
+)
+CHROME_DEFAULT_PROFILE_DIR = Path.home() / "Library/Application Support/Google/Chrome/Default"
+CLICLICK = "/opt/homebrew/bin/cliclick"
+
+EXTENSIONS_URL = "chrome://extensions/"
+# The extension's user-visible name as it appears on the chrome://extensions card.
+EXT_NAME = "Chrome Control"
+
+# --- timings (seconds). Tuned on a 2026 Apple-silicon Mac; see the report. ---
+T_PAGE_LOAD = 3.0  # after `open chrome://extensions/` before the AX tree is usable
+T_AX_SETTLE = 0.6  # after any AXPress before re-reading the tree
+T_AFTER_RELOAD = 2.5  # after pressing reload before the SW is expected back
+T_PING_POLL = 0.5  # poll interval while waiting for `chrome ping` to go green
+T_PING_WAIT = 20.0  # total wait for ping after a reload/wake
+T_CHROME_QUIT = 3.0  # after pkill before relaunching
+T_CHROME_BOOT = 6.0  # after `open -a Google Chrome` before talking to it
+
+VERBOSE = False
+
+
+def log(msg: str) -> None:
+    print(f"[chrome-heal] {msg}", file=sys.stderr, flush=True)
+
+
+def vlog(msg: str) -> None:
+    if VERBOSE:
+        log(msg)
+
+
+# --------------------------------------------------------------------------
+# chrome-control CLI helpers
+# --------------------------------------------------------------------------
+
+
+def chrome_cli(*args: str, timeout: int = 45) -> subprocess.CompletedProcess:
+    """Run the chrome-control CLI. Never raises; a timeout becomes rc=124."""
+    try:
+        return subprocess.run(
+            [str(CHROME_CLI), *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as e:
+        return subprocess.CompletedProcess(
+            args=[str(CHROME_CLI), *args],
+            returncode=124,
+            stdout=(e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or ""),
+            stderr="timeout",
+        )
+
+
+def ping_ok(timeout: int = 20) -> bool:
+    r = chrome_cli("ping", timeout=timeout)
+    vlog(f"ping rc={r.returncode} out={r.stdout.strip()!r} err={r.stderr.strip()!r}")
+    return r.returncode == 0
+
+
+def wait_for_ping(total: float = T_PING_WAIT) -> bool:
+    """Poll `chrome ping` until healthy or the budget runs out."""
+    deadline = time.time() + total
+    while time.time() < deadline:
+        if ping_ok(timeout=10):
+            return True
+        time.sleep(T_PING_POLL)
+    return False
+
+
+def chrome_pid() -> int | None:
+    """PID of the main Google Chrome process (not a renderer/helper)."""
+    try:
+        out = subprocess.check_output(["pgrep", "-x", "Google Chrome"], text=True)
+    except subprocess.CalledProcessError:
+        return None
+    pids = [int(p) for p in out.split() if p.strip()]
+    return pids[0] if pids else None
+
+
+def extension_id() -> str | None:
+    try:
+        with open(NATIVE_HOST_MANIFEST) as f:
+            origins = json.load(f).get("allowed_origins", [])
+        for origin in origins:
+            if origin.startswith("chrome-extension://"):
+                return origin.split("//", 1)[1].rstrip("/")
+    except (OSError, ValueError, KeyError):
+        pass
+    return None
+
+
+def extension_prefs_state() -> dict:
+    """Read the Default profile's prefs to see if Chrome thinks the extension
+    is enabled.
+
+    Two gotchas this handles that the chrome-control CLI's own
+    `extension_prefs_state()` does not:
+      * For an unpacked (location 4) extension the entry lives in *Secure
+        Preferences*, not *Preferences* -- so both files must be scanned.
+      * Chrome omits the "state" key entirely while the extension is healthy;
+        it only appears once the extension has been explicitly disabled.
+        Treating a missing "state" as "not enabled" produces a false
+        "extension is DISABLED/errored" diagnosis on a perfectly healthy
+        extension (verified against this machine's live, working extension).
+        Enabled == state in (None, 1) AND disable_reasons == 0.
+    """
+    ext_id = extension_id()
+    if not ext_id:
+        return {"found": False, "reason": "could not resolve extension id"}
+    for fname in ("Secure Preferences", "Preferences"):
+        try:
+            with open(CHROME_DEFAULT_PROFILE_DIR / fname) as f:
+                prefs = json.load(f)
+        except (OSError, ValueError):
+            continue
+        entry = prefs.get("extensions", {}).get("settings", {}).get(ext_id)
+        if not isinstance(entry, dict):
+            continue
+        state = entry.get("state")
+        mask = entry.get("disable_reasons", 0) or 0
+        if isinstance(mask, list):
+            acc = 0
+            for r in mask:
+                try:
+                    acc |= int(r)
+                except (TypeError, ValueError):
+                    pass
+            mask = acc
+        try:
+            mask = int(mask)
+        except (TypeError, ValueError):
+            mask = 0
+        return {
+            "found": True,
+            "ext_id": ext_id,
+            "source": fname,
+            "enabled": state in (None, 1) and mask == 0,
+            "state": state,
+            "disable_reasons": mask,
+            "unpacked_path": entry.get("path"),
+        }
+    return {"found": False, "ext_id": ext_id, "reason": "not in Default profile prefs"}
+
+
+# --------------------------------------------------------------------------
+# Accessibility helpers
+# --------------------------------------------------------------------------
+
+
+def ax_attr(el, name: str):
+    """Read one AX attribute; None on any error."""
+    try:
+        err, val = AXUIElementCopyAttributeValue(el, name, None)
+    except Exception:
+        return None
+    return val if err == 0 else None
+
+
+def ax_attr_names(el) -> list[str]:
+    try:
+        err, names = AXUIElementCopyAttributeNames(el, None)
+    except Exception:
+        return []
+    return list(names) if err == 0 and names else []
+
+
+def ax_actions(el) -> list[str]:
+    try:
+        err, names = AXUIElementCopyActionNames(el, None)
+    except Exception:
+        return []
+    return list(names) if err == 0 and names else []
+
+
+def ax_press(el) -> bool:
+    """AXPress the element. Returns True if the action reported success."""
+    acts = ax_actions(el)
+    for action in ("AXPress", "AXOpen", "AXConfirm"):
+        if action in acts:
+            try:
+                if AXUIElementPerformAction(el, action) == 0:
+                    return True
+            except Exception:
+                pass
+    return False
+
+
+def ax_rect(el) -> tuple[float, float, float, float] | None:
+    """(x, y, w, h) in *screen points* (top-left origin), or None.
+
+    NOTE Retina: AX geometry is already in points, and cliclick also takes
+    points, so no /2 scaling is needed here. (The scaling caveat in the
+    screen-clicking skill applies to pixel coordinates read off a Retina
+    screenshot -- not to AXPosition.)
+    """
+    pos_v, size_v = ax_attr(el, "AXPosition"), ax_attr(el, "AXSize")
+    if pos_v is None or size_v is None:
+        return None
+    try:
+        ok_p, pt = AXValueGetValue(pos_v, kAXValueCGPointType, None)
+        ok_s, sz = AXValueGetValue(size_v, kAXValueCGSizeType, None)
+    except Exception:
+        return None
+    if not (ok_p and ok_s):
+        return None
+    return (float(pt.x), float(pt.y), float(sz.width), float(sz.height))
+
+
+def cliclick_center(el) -> bool:
+    """Last-resort click: click the centre of the AX element's own rect."""
+    rect = ax_rect(el)
+    if not rect:
+        return False
+    x, y, w, h = rect
+    cx, cy = int(x + w / 2), int(y + h / 2)
+    if w <= 0 or h <= 0:
+        return False
+    vlog(f"cliclick c:{cx},{cy} (from AX rect {rect})")
+    try:
+        r = subprocess.run([CLICLICK, f"c:{cx},{cy}"], capture_output=True, text=True, timeout=15)
+        return r.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def label_of(el) -> str:
+    """Best-effort human label for an element (title / description / value)."""
+    for attr in ("AXTitle", "AXDescription", "AXValue", "AXHelp", "AXLabel"):
+        v = ax_attr(el, attr)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
+def walk(el, depth: int = 0, max_depth: int = 60, budget: list[int] | None = None):
+    """Depth-first walk of the AX tree. Yields (element, role, label, depth).
+
+    chrome://extensions/ is a WebUI page whose cards live behind several
+    layers of shadow DOM; the AX tree flattens those but is still deep
+    (~25-40 levels from the window to a card button), hence max_depth 60.
+    `budget` caps total nodes visited so a pathological tree can't hang us.
+    """
+    if budget is None:
+        budget = [40000]
+    if depth > max_depth or budget[0] <= 0:
+        return
+    budget[0] -= 1
+    role = ax_attr(el, "AXRole") or ""
+    yield el, str(role), label_of(el), depth
+    kids = ax_attr(el, "AXChildren") or []
+    for kid in kids:
+        yield from walk(kid, depth + 1, max_depth, budget)
+
+
+def enable_chrome_web_ax(app) -> str:
+    """Ask Chromium to expose its full web-content accessibility tree.
+
+    Chromium gates the (expensive) web-content tree behind an app-level
+    attribute. Older Chromium honors the Chromium-specific
+    "AXManualAccessibility"; current Chrome (149 returns -25205
+    attributeUnsupported for it from a non-assistive client) responds to
+    "AXEnhancedUserInterface" -- the attribute VoiceOver sets. Try both; a
+    set-failure is NOT fatal, because the only test that matters is whether
+    the AXWebArea subsequently shows up in the tree.
+    """
+    results = []
+    for attr in ("AXManualAccessibility", "AXEnhancedUserInterface"):
+        try:
+            err = AXUIElementSetAttributeValue(app, attr, True)
+        except Exception as e:  # noqa: BLE001
+            err = f"exc:{e}"
+        results.append(f"{attr}={err}")
+    detail = ", ".join(results) + " (0 == success)"
+    vlog(f"web-AX enable: {detail}")
+    return detail
+
+
+def chrome_ax_app():
+    """AXUIElement for Chrome, with the web-content AX tree requested."""
+    pid = chrome_pid()
+    if pid is None:
+        return None, "Google Chrome is not running"
+    app = AXUIElementCreateApplication(pid)
+    # -25211 from a plain read == kAXErrorAPIDisabled (no Accessibility grant).
+    err_probe = None
+    try:
+        err_probe, _ = AXUIElementCopyAttributeValue(app, "AXWindows", None)
+    except Exception:
+        pass
+    if err_probe == -25211:
+        return None, "kAXErrorAPIDisabled reading AXWindows (no Accessibility permission)"
+    enable_chrome_web_ax(app)
+    return app, None
+
+
+# --------------------------------------------------------------------------
+# Rung 2: the AX reload path
+# --------------------------------------------------------------------------
+
+RELOAD_RE = re.compile(r"^\s*reload\s*$", re.I)
+DEVMODE_RE = re.compile(r"developer\s*mode", re.I)
+
+
+def open_extensions_page() -> None:
+    """Open chrome://extensions/ in Chrome without AppleScript.
+
+    `open -a` is a Launch Services call, not browser scripting, and it is how
+    the chrome-control CLI itself opens its wake URL.
+    """
+    subprocess.run(
+        ["open", "-a", "Google Chrome", EXTENSIONS_URL],
+        check=False,
+        capture_output=True,
+    )
+
+
+def find_extensions_web_area(app):
+    """Return the AXWebArea whose page is chrome://extensions/, or None."""
+    for el, role, _label, _d in walk(app, max_depth=25):
+        if role == "AXWebArea":
+            url = ax_attr(el, "AXURL")
+            url_s = str(url) if url is not None else ""
+            title = str(ax_attr(el, "AXTitle") or "")
+            if "chrome://extensions" in url_s or title.strip().lower() == "extensions":
+                return el
+    return None
+
+
+def find_card_reload_button(root):
+    """Locate the reload (⟳) button on the Chrome Control card.
+
+    Strategy, in order of preference:
+      1. A button whose own label mentions both "reload" and the extension
+         name (Chrome labels card controls "Reload Chrome Control" in some
+         builds -- unambiguous when present).
+      2. Positional: find the node carrying the text "Chrome Control", then
+         take the nearest following AXButton labelled exactly "Reload".
+         Cards render in DOM order, so the first "Reload" button *after* the
+         extension's name belongs to that card.
+
+    Returns (button_element, how_found) or (None, reason).
+    """
+    nodes = list(walk(root))
+    vlog(f"AX web-area subtree: {len(nodes)} nodes")
+
+    # 1. explicit combined label
+    for el, role, label, _d in nodes:
+        low = label.lower()
+        if role in ("AXButton", "AXLink") and "reload" in low and EXT_NAME.lower() in low:
+            return el, f"combined-label button {label!r}"
+
+    # 2. positional: name text, then the next bare "Reload" button
+    name_idx = None
+    for i, (_el, _role, label, _d) in enumerate(nodes):
+        if label.strip() == EXT_NAME:
+            name_idx = i
+            break
+    if name_idx is None:
+        for i, (_el, _role, label, _d) in enumerate(nodes):
+            if EXT_NAME.lower() in label.lower():
+                name_idx = i
+                break
+    if name_idx is None:
+        return None, f"no node labelled {EXT_NAME!r} found on the page"
+
+    # Scope the search to the card: cards render in DOM order, so the reload
+    # button belongs to this extension only if it appears shortly after the
+    # name. CARD_SPAN is generous (a card is ~30-60 AX nodes) but finite, so a
+    # neighbouring extension's Reload button can't be mistaken for ours.
+    CARD_SPAN = 200
+    window = nodes[name_idx : name_idx + CARD_SPAN]
+    nearby = [f"{r}[{lb!r}]" for _e, r, lb, _d in window if r in ("AXButton", "AXLink", "AXCheckBox", "AXToggle", "AXSwitch") and lb]
+    for offset, (el, role, label, _d) in enumerate(window):
+        if role in ("AXButton", "AXLink") and RELOAD_RE.match(label):
+            return el, (
+                f"first {label!r} button {offset} nodes after the {EXT_NAME!r} label; "
+                f"card controls seen: {nearby[:12]}"
+            )
+
+    has_errors_btn = any("error" in lb.lower() for _e, _r, lb, _d in window)
+    return None, (
+        f"found the {EXT_NAME!r} card but no 'Reload' button within {CARD_SPAN} nodes of it "
+        f"(Developer mode off, or the card is collapsed). errors-button present: {has_errors_btn}. "
+        f"card controls seen: {nearby[:12]}"
+    )
+
+
+def find_developer_mode_toggle(root):
+    """The page-level 'Developer mode' switch (AXCheckBox/AXToggle/AXSwitch)."""
+    for el, role, label, _d in walk(root):
+        if role in ("AXCheckBox", "AXToggle", "AXSwitch", "AXRadioButton") and DEVMODE_RE.search(label):
+            return el
+    return None
+
+
+def is_on(el) -> bool | None:
+    v = ax_attr(el, "AXValue")
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "on", "yes")
+    return None
+
+
+def find_enable_toggle(root):
+    """The per-extension enable switch on the Chrome Control card."""
+    nodes = list(walk(root))
+    name_idx = None
+    for i, (_el, _role, label, _d) in enumerate(nodes):
+        if EXT_NAME.lower() in label.lower():
+            name_idx = i
+            break
+    if name_idx is None:
+        return None
+    for el, role, label, _d in nodes[name_idx:]:
+        if role in ("AXCheckBox", "AXToggle", "AXSwitch"):
+            if DEVMODE_RE.search(label):
+                continue
+            return el
+    return None
+
+
+def close_extensions_tabs() -> None:
+    """Close chrome://extensions tabs we opened, via the chrome CLI."""
+    r = chrome_cli("tabs", timeout=20)
+    if r.returncode != 0:
+        return
+    # `chrome tabs` prints "<tab_id>  <title>" with the URL indented on the
+    # NEXT line, so the id must come from the line preceding the URL match.
+    lines = r.stdout.splitlines()
+    for i, line in enumerate(lines):
+        if "chrome://extensions" not in line or i == 0:
+            continue
+        m = re.match(r"^(\d+)\s", lines[i - 1])
+        if m:
+            vlog(f"closing extensions tab {m.group(1)}")
+            chrome_cli("close", m.group(1), timeout=20)
+
+
+def rung_ax_reload(dry_run: bool = False) -> tuple[bool, str]:
+    """Press the Chrome Control card's reload button via Accessibility.
+
+    Returns (recovered, detail). `recovered` is False in dry-run even on
+    success -- dry-run only proves discovery works.
+    """
+    if not AXIsProcessTrusted():
+        return False, (
+            "AX_UNTRUSTED: this process is not Accessibility-trusted "
+            "(AXIsProcessTrusted() == False). macOS attributes the TCC grant to the "
+            "*responsible* process, so grant Accessibility to whatever launches "
+            "chrome-heal -- for the daemon that is "
+            "/Users/svenka/dispatch/.venv/bin/python (resolves to the uv-managed "
+            "CPython) -- in System Settings > Privacy & Security > Accessibility."
+        )
+
+    app, err = chrome_ax_app()
+    if app is None:
+        return False, f"AX_NO_APP: {err}"
+
+    open_extensions_page()
+    time.sleep(T_PAGE_LOAD)
+
+    # Re-assert web AX: a freshly-created renderer for the new tab may not
+    # have inherited it.
+    enable_chrome_web_ax(app)
+    time.sleep(T_AX_SETTLE)
+
+    web = None
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        web = find_extensions_web_area(app)
+        if web is not None and (ax_attr(web, "AXChildren") or []):
+            break
+        time.sleep(0.5)
+
+    if web is None:
+        return False, (
+            "AX_NO_WEBAREA: chrome://extensions/ has no AXWebArea in Chrome's AX tree. "
+            "Either the page didn't open (modal dialog in front?) or Chrome's web "
+            "accessibility never turned on despite AXManualAccessibility."
+        )
+
+    # Developer mode must be on or the per-card reload button doesn't render.
+    dev = find_developer_mode_toggle(web)
+    dev_state = is_on(dev) if dev is not None else None
+    vlog(f"developer-mode toggle: {'found' if dev is not None else 'MISSING'} value={dev_state}")
+    if dev is not None and dev_state is False and not dry_run:
+        log("Developer mode is off -> turning it on")
+        if not (ax_press(dev) or cliclick_center(dev)):
+            return False, "AX_DEVMODE_PRESS_FAILED: could not toggle Developer mode"
+        time.sleep(T_AX_SETTLE)
+
+    # A disabled extension's card shows its enable switch off; flip it on
+    # first, otherwise reload alone leaves it disabled.
+    enable = find_enable_toggle(web)
+    en_state = is_on(enable) if enable is not None else None
+    vlog(f"enable toggle: {'found' if enable is not None else 'MISSING'} value={en_state}")
+    if enable is not None and en_state is False and not dry_run:
+        log("Extension toggle is off -> turning it on")
+        if ax_press(enable) or cliclick_center(enable):
+            time.sleep(T_AX_SETTLE)
+
+    btn, how = find_card_reload_button(web)
+    if btn is None:
+        return False, f"AX_NO_RELOAD_BUTTON: {how}"
+
+    rect = ax_rect(btn)
+    detail_path = (
+        f"AXApplication(Google Chrome) > ... > AXWebArea[chrome://extensions] > ... > "
+        f"AXButton[{label_of(btn)!r}] ({how}); rect={rect}; actions={ax_actions(btn)}"
+    )
+    log(f"found reload control: {detail_path}")
+
+    if dry_run:
+        return False, f"DRY_RUN_OK: would press -> {detail_path}"
+
+    pressed_via = None
+    if ax_press(btn):
+        pressed_via = "AXPress"
+    elif cliclick_center(btn):
+        pressed_via = "cliclick(AX rect)"
+    if pressed_via is None:
+        return False, f"AX_PRESS_FAILED: neither AXPress nor cliclick worked on {detail_path}"
+
+    log(f"pressed reload via {pressed_via}; waiting for the worker to come back")
+    time.sleep(T_AFTER_RELOAD)
+
+    if wait_for_ping():
+        return True, f"reloaded via {pressed_via}; {detail_path}"
+
+    # A reload restarts the extension but the MV3 worker may still be asleep
+    # until something talks to it -- `chrome wake` opens the popup page to
+    # force it up. This is expected on the healthy-extension test path.
+    log("ping still red after reload -> `chrome wake`")
+    w = chrome_cli("wake", timeout=40)
+    vlog(f"wake rc={w.returncode} out={w.stdout.strip()!r} err={w.stderr.strip()!r}")
+    if wait_for_ping():
+        return True, f"reloaded via {pressed_via} + chrome wake; {detail_path}"
+
+    return False, (
+        f"AX_RELOAD_NO_RECOVERY: pressed reload via {pressed_via} but `chrome ping` "
+        f"never went green. wake stderr: {w.stderr.strip()!r}. {detail_path}"
+    )
+
+
+# --------------------------------------------------------------------------
+# Rungs 1 and 3
+# --------------------------------------------------------------------------
+
+
+def rung_reset() -> tuple[bool, str]:
+    r = chrome_cli("reset", timeout=60)
+    vlog(f"reset rc={r.returncode} out={r.stdout.strip()!r} err={r.stderr.strip()!r}")
+    if wait_for_ping():
+        return True, f"chrome reset recovered ({r.stdout.strip()})"
+    return False, f"chrome reset did not recover (rc={r.returncode}): {r.stderr.strip() or r.stdout.strip()}"
+
+
+def rung_restart() -> tuple[bool, str]:
+    """Quit and relaunch Chrome, then wake. Same pattern as chrome-housekeep's
+    restart_chrome(), plus verification.
+
+    Caveat proven by design (and why this rung is LAST): Chrome persists the
+    extension's disabled state in the profile's Preferences, so a restart
+    restores an errored extension to its errored state. This rung fixes a
+    wedged browser, not a broken extension.
+    """
+    # Graceful quit first — SIGTERM-ing every helper via `pkill -f` is an
+    # unclean shutdown that burns the MV3 SW crash budget (the very failure
+    # this tool exists to fix). AppleScript here is app lifecycle, not page
+    # control, so it doesn't violate the no-osascript-for-Chrome rule.
+    subprocess.run(
+        ["osascript", "-e", 'quit app "Google Chrome"'],
+        capture_output=True, timeout=15,
+    )
+    for _ in range(10):
+        if chrome_pid() is None:
+            break
+        time.sleep(1)
+    else:
+        subprocess.run(["pkill", "-f", "Google Chrome"], capture_output=True)
+    time.sleep(T_CHROME_QUIT)
+    subprocess.Popen(["open", "-a", "Google Chrome"])
+    time.sleep(T_CHROME_BOOT)
+    if chrome_pid() is None:
+        return False, "CHROME_RELAUNCH_FAILED: Google Chrome did not come back after `open -a`"
+    w = chrome_cli("wake", timeout=60)
+    vlog(f"wake rc={w.returncode} out={w.stdout.strip()!r} err={w.stderr.strip()!r}")
+    if wait_for_ping(total=30):
+        return True, "Chrome restart + wake recovered"
+    return False, (
+        "CHROME_RESTART_NO_RECOVERY: Chrome restarted but `chrome ping` is still red. "
+        f"wake said: {w.stderr.strip() or w.stdout.strip()!r}"
+    )
+
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
+
+
+def diagnose() -> dict:
+    return {
+        "chrome_running": chrome_pid() is not None,
+        "chrome_pid": chrome_pid(),
+        "ax_trusted": bool(AXIsProcessTrusted()),
+        "ping_ok": ping_ok(timeout=15),
+        "extension_prefs": extension_prefs_state(),
+        "executable": sys.executable,
+        "real_executable": os.path.realpath(sys.executable),
+    }
+
+
+def main() -> int:
+    global VERBOSE
+    p = argparse.ArgumentParser(prog="chrome-heal", description="Autonomously recover the Chrome Control extension.")
+    p.add_argument("--force", action="store_true", help="run the ladder even if `chrome ping` is already healthy")
+    p.add_argument("--rung", choices=["reset", "ax", "restart"], help="run exactly one rung")
+    p.add_argument("--dry-run", action="store_true", help="AX discovery only; press nothing")
+    p.add_argument("--diagnose", action="store_true", help="print health/AX/prefs state and exit")
+    p.add_argument("--json", action="store_true", help="emit a machine-readable result object on stdout")
+    p.add_argument("--verbose", "-v", action="store_true")
+    p.add_argument("--no-close-tab", action="store_true", help="leave the chrome://extensions/ tab open")
+    args = p.parse_args()
+    VERBOSE = args.verbose
+
+    if args.diagnose:
+        print(json.dumps(diagnose(), indent=2))
+        return 0
+
+    started = time.time()
+    attempts: list[dict] = []
+
+    def record(rung: str, ok: bool, detail: str) -> None:
+        attempts.append({"rung": rung, "ok": ok, "detail": detail, "t": round(time.time() - started, 1)})
+        log(f"rung {rung}: {'RECOVERED' if ok else 'no'} -- {detail}")
+
+    def finish(code: int, summary: str) -> int:
+        if not args.no_close_tab and any(a["rung"] == "ax" for a in attempts):
+            if code == 0:
+                close_extensions_tabs()
+        result = {
+            "ok": code == 0,
+            "exit_code": code,
+            "summary": summary,
+            "elapsed_s": round(time.time() - started, 1),
+            "attempts": attempts,
+        }
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            print(summary)
+        return code
+
+    # Rung 0 -- preflight
+    if not args.force and not args.rung:
+        if ping_ok():
+            return finish(0, "healthy: `chrome ping` already succeeds (no action taken)")
+        log("`chrome ping` failed -- starting recovery ladder")
+
+    rungs = [("reset", rung_reset), ("ax", lambda: rung_ax_reload(args.dry_run)), ("restart", rung_restart)]
+    if args.rung:
+        rungs = [r for r in rungs if r[0] == args.rung]
+
+    ax_untrusted = False
+    for name, fn in rungs:
+        ok, detail = fn()
+        record(name, ok, detail)
+        if ok:
+            return finish(0, f"recovered at rung '{name}': {detail}")
+        if name == "ax" and detail.startswith("AX_UNTRUSTED"):
+            ax_untrusted = True
+        if name == "ax" and args.dry_run:
+            return finish(0 if detail.startswith("DRY_RUN_OK") else 1, detail)
+
+    if chrome_pid() is None:
+        return finish(3, "FAILED: Google Chrome is not running and could not be relaunched. " + attempts[-1]["detail"])
+    if ax_untrusted:
+        return finish(2, "FAILED: lower rungs did not recover and the AX rung was unavailable. " + next(a["detail"] for a in attempts if a["rung"] == "ax"))
+
+    prefs = extension_prefs_state()
+    return finish(
+        1,
+        "FAILED: every recovery rung was exhausted. "
+        f"Extension prefs: {json.dumps(prefs)}. "
+        "Most likely the unpacked extension source tree is broken on disk (repair it, then "
+        "re-run chrome-heal) or a Chrome modal is blocking the UI. Last detail: "
+        + attempts[-1]["detail"],
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(main())

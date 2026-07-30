@@ -140,7 +140,11 @@ def extension_prefs_state(ext_id):
         entry = settings.get(ext_id)
         if not isinstance(entry, dict):
             continue
-        # state: 1 = ENABLED, 0 = DISABLED (other values are rarer states).
+        # state: 1 = ENABLED, 0 = DISABLED. Chrome ≥127 omits the key entirely
+        # while the extension is healthy (disable state lives only in
+        # disable_reasons once disabled), so a missing key means ENABLED —
+        # treating it as disabled produced false "DISABLED/errored" diagnoses
+        # on a working extension (July 2026 outage postmortem).
         state = entry.get("state")
         reasons_mask = entry.get("disable_reasons", 0) or 0
         # Some Chrome versions store a single int; older ones a list of ints.
@@ -156,7 +160,7 @@ def extension_prefs_state(ext_id):
             reasons_mask = int(reasons_mask)
         except (TypeError, ValueError):
             reasons_mask = 0
-        enabled = (state == 1) and reasons_mask == 0
+        enabled = state in (None, 1) and reasons_mask == 0
         return {
             "found": True,
             "enabled": enabled,

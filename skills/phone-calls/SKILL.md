@@ -72,8 +72,13 @@ Manual per-turn primitives (`say` / `listen`) still exist for special cases
 conversation with them — each invocation pays process+model startup and the
 callee will hang up on the dead air.
 
-Conversation rules:
-- **Always identify yourself as an AI assistant** at the start of the call.
+`converse` handles the persona itself (see CONVERSE_SYSTEM in the script):
+it introduces itself as "{owner}'s assistant", sounds natural, does **not**
+announce it's an AI on routine errands, but answers honestly and never
+denies being an AI if anyone asks. Set `--goal` with the concrete objective
+and any fallback (e.g. "if 7:30 is unavailable, take anything 7–8pm").
+
+Conversation rules (for the manual `say`/`listen` primitives):
 - Keep each `say` short (1–3 sentences) — long monologues feel robotic and
   the callee will start talking over you.
 - Empty/garbled transcript? Just `listen` again once, then ask them to repeat.
@@ -91,7 +96,8 @@ Conversation rules:
 |---|---|
 | `call doctor` | Check all prerequisites (BlackHole, whisper, TTS, AX) |
 | `call start <tel-or-email> [--facetime] [--video]` | Place call (numbers → cellular via iPhone; emails → FaceTime) |
-| `call say "text" [--voice af_nova] [--engine qwen --style "..."]` | Speak |
+| `call converse --goal "..." [--greeting "..."] [--voice af_heart]` | **Real-time conversation loop (the main path)** |
+| `call say "text" [--voice af_heart] [--engine qwen --style "..."]` | Speak one line (voicemail / pre-made audio) |
 | `call listen [--wait-for-speech] [--max N] [--json] [--raw f.wav]` | Hear + transcribe |
 | `call status` | In-call state + audio routing |
 | `call end` | Hang up + restore audio |
@@ -103,7 +109,7 @@ use it when you need to distinguish silence-timeout from garbled speech.
 
 ## Voices
 
-Default voice is `af_nova` (kokoro, fast ~0.25x RT). Any kokoro voice works
+Default voice is `af_heart` (kokoro's most natural preset, ~0.3x RT). Any kokoro voice works
 (`~/.claude/skills/tts/scripts/speak --voices`). For an expressive custom
 voice use `--engine qwen --style "a warm, upbeat assistant"` (slower, ~7GB RAM
 — pre-generate long lines before the call if using qwen).

@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["sounddevice", "soundfile", "numpy", "kokoro-onnx", "claude-agent-sdk"]
+# dependencies = ["sounddevice", "soundfile", "numpy", "kokoro-onnx", "claude-agent-sdk", "pocket-tts"]
 # ///
 """
 call - Place and conduct FaceTime Audio calls with TTS voice + whisper ears.
@@ -663,12 +663,37 @@ def cmd_converse(args) -> None:
         with transcript_path.open("a") as f:
             f.write(line + "\n")
 
-    # --- preload kokoro once (in-process, no subprocess per phrase)
-    log("loading kokoro TTS...")
-    from kokoro_onnx import Kokoro
-    models = HOME / ".claude/skills/tts/models"
-    kokoro = Kokoro(str(models / "kokoro-v1.0.onnx"), str(models / "voices-v1.0.bin"))
-    KOKORO_RATE = 24000
+    # --- preload the TTS engine once (in-process, no subprocess per phrase).
+    # Both engines emit 24kHz mono float32 -> unified synth(text) -> np.ndarray.
+    import numpy as np
+    TTS_RATE = 24000
+    engine = args.tts_engine
+    if engine == "pocket":
+        # Kyutai Pocket TTS — more natural conversational prosody, RTF ~0.11,
+        # ~30ms first chunk. Falls back to kokoro if it can't load.
+        try:
+            log("loading Pocket TTS...")
+            from pocket_tts import TTSModel
+            _pt = TTSModel.load_model()
+            _voice_state = _pt.get_state_for_audio_prompt(args.voice)
+
+            def synth(text: str) -> "np.ndarray":
+                return np.asarray(_pt.generate_audio(_voice_state, text)).ravel().astype("float32")
+        except Exception as e:
+            log(f"Pocket TTS unavailable ({e}); falling back to kokoro")
+            engine = "kokoro"
+    if engine == "kokoro":
+        log("loading kokoro TTS...")
+        from kokoro_onnx import Kokoro
+        models = HOME / ".claude/skills/tts/models"
+        _kokoro = Kokoro(str(models / "kokoro-v1.0.onnx"), str(models / "voices-v1.0.bin"))
+        kvoice = args.voice if args.voice in _kokoro.get_voices() else "af_heart"
+
+        def synth(text: str) -> "np.ndarray":
+            samples, _ = _kokoro.create(text, voice=kvoice, speed=1.0)
+            return np.asarray(samples).ravel().astype("float32")
+    log(f"TTS engine: {engine}, voice: {args.voice}")
+    KOKORO_RATE = TTS_RATE  # (name kept for the OutputStream below)
 
     # --- persistent output stream + player thread (P3): sd.play() costs
     # ~250ms per call; OutputStream.write() is instant and gapless.
@@ -691,8 +716,7 @@ def cmd_converse(args) -> None:
 
     def say_now(text: str) -> None:
         """Synchronous speak (greeting / fallback): synth + enqueue + drain."""
-        samples, _ = kokoro.create(text, voice=args.voice, speed=1.0)
-        playq.put(samples)
+        playq.put(synth(text))
         playq.join()
         tlog("ME", text)
 
@@ -765,8 +789,7 @@ def cmd_converse(args) -> None:
                         sent = sent[:300]
                         hangup = True
                     if sent:
-                        samples, _ = await asyncio.to_thread(
-                            kokoro.create, sent, voice=args.voice, speed=1.0)
+                        samples = await asyncio.to_thread(synth, sent)
                         playq.put(samples)
                         if first_audio is None:
                             first_audio = time.time() - t0
@@ -783,11 +806,9 @@ def cmd_converse(args) -> None:
             # kokoro's first synth, whisper's first decode, and the SDK's
             # first token all have startup cost.
             try:
-                import numpy as _np
-                await asyncio.to_thread(kokoro.create, "Hello.",
-                                        voice=args.voice, speed=1.0)
+                await asyncio.to_thread(synth, "Hello.")
                 await asyncio.to_thread(
-                    transcribe, _np.zeros(RECORD_RATE // 2, dtype="float32"),
+                    transcribe, np.zeros(RECORD_RATE // 2, dtype="float32"),
                     RECORD_RATE)
                 await client.query("Reply with exactly the word: ready")
                 async for _m in client.receive_response():
@@ -1000,7 +1021,10 @@ def main() -> None:
     sp = sub.add_parser("converse", help="real-time conversation loop (run right after start)")
     sp.add_argument("--goal", required=True, help="what this call is trying to accomplish")
     sp.add_argument("--greeting", help="opening line, spoken when they answer")
-    sp.add_argument("--voice", default="af_heart")
+    sp.add_argument("--tts-engine", choices=["pocket", "kokoro"], default="pocket",
+                    help="pocket=Kyutai Pocket TTS (natural, default); kokoro=fallback")
+    sp.add_argument("--voice", default="alba",
+                    help="voice: pocket (alba/marius/jean/eve/...) or kokoro (af_heart/...)")
     sp.add_argument("--answer-timeout", type=float, default=35,
                     help="seconds to wait for first speech (default 35)")
     sp.add_argument("--turn-timeout", type=float, default=20,

@@ -109,10 +109,20 @@ use it when you need to distinguish silence-timeout from garbled speech.
 
 ## Voices
 
-Default voice is `af_heart` (kokoro's most natural preset, ~0.3x RT). Any kokoro voice works
-(`~/.claude/skills/tts/scripts/speak --voices`). For an expressive custom
-voice use `--engine qwen --style "a warm, upbeat assistant"` (slower, ~7GB RAM
-— pre-generate long lines before the call if using qwen).
+`converse` defaults to **Kyutai Pocket TTS** (`--tts-engine pocket`, voice
+`alba`) — natural conversational prosody, RTF ~0.11, ~30ms first chunk. Other
+Pocket voices: `marius`, `jean`, `eve`, `javert`, … (`--voice <name>`).
+Auditioned at `/tmp/phone-call/tts-samples/phone8k-pocket-tts-*.wav`.
+Pocket downloads its model to the HF cache on first run.
+
+Fallback engine `--tts-engine kokoro` (voice `af_heart`, kokoro's most natural
+preset, grade A vs `af_nova`'s C); converse auto-falls-back to kokoro if Pocket
+fails to load. The one-shot `say` command still uses kokoro.
+
+Considered but slower on this M4: Chatterbox-Turbo (best naturalness, RTF 0.29
+via mlx-audio 4-bit — usable if you want to trade ~1s/turn for voice quality or
+zero-shot cloning); Piper (50× real-time but less natural than kokoro). Full
+comparison with measured RTF: `/tmp/phone-call/tts-research.md`.
 
 ## Requirements & permissions
 

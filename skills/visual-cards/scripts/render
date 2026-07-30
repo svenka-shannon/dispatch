@@ -1,0 +1,158 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["pyyaml", "Pillow"]
+# ///
+"""
+visual-cards/render — turn a YAML card spec into an iMessage-ready JPEG.
+
+Usage:
+    render <spec.yaml> --out <out.jpg>
+    render <spec.yaml>            # writes to /tmp/card-<random>.jpg
+
+YAML shape (see SKILL.md for full format):
+    template: day-itinerary
+    hero_image: /path/to/hero.jpg     # full-bleed background
+    eyebrow: "Nashville · Jul 3"
+    page_tag: "1 / 4"
+    title: "Day 1"
+    subtitle: "Arrival + first honky tonk"
+    tiles:
+      - { image: /path/to/img1.jpg, label: "Hattie B's" }
+      - { image: /path/to/img2.jpg, label: "Lower Broadway" }
+    bullets:
+      - "Land BNA"
+      - "Dinner at Hattie B's"
+    poetic: "No itinerary. Just walk into whichever bar has the best fiddle."
+"""
+import argparse
+import os
+import random
+import re
+import string
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+import yaml
+
+SKILL_DIR = Path(__file__).resolve().parent.parent
+TEMPLATES = SKILL_DIR / "templates"
+CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+
+
+def html_escape(s: str) -> str:
+    return (s.replace("&", "&amp;")
+             .replace("<", "&lt;")
+             .replace(">", "&gt;")
+             .replace('"', "&quot;"))
+
+
+def build_tiles_html(tiles: list[dict]) -> str:
+    parts = []
+    for t in tiles:
+        img = t.get("image", "")
+        label = html_escape(t.get("label", ""))
+        parts.append(
+            f'<div class="poly" style="background-image:url(\'{img}\')">'
+            f'<div class="poly-label">{label}</div></div>'
+        )
+    return "\n".join(parts)
+
+
+def build_bullets_html(bullets: list[str]) -> str:
+    return "\n".join(f"<div>{html_escape(b)}</div>" for b in bullets)
+
+
+def render(spec_path: Path, out_path: Path):
+    with open(spec_path) as f:
+        spec = yaml.safe_load(f)
+
+    template_name = spec.get("template", "day-itinerary")
+    tpl_path = TEMPLATES / f"{template_name}.html"
+    if not tpl_path.exists():
+        sys.exit(f"Error: template not found: {tpl_path}")
+
+    html = tpl_path.read_text()
+    substitutions = {
+        "{{HERO_IMAGE}}": spec.get("hero_image", ""),
+        "{{EYEBROW}}": html_escape(spec.get("eyebrow", "")),
+        "{{PAGE_TAG}}": html_escape(spec.get("page_tag", "")),
+        "{{TITLE}}": html_escape(spec.get("title", "")),
+        "{{SUBTITLE}}": html_escape(spec.get("subtitle", "")),
+        "{{POETIC}}": html_escape(spec.get("poetic", "")),
+        "{{TILES_HTML}}": build_tiles_html(spec.get("tiles", [])),
+        "{{BULLETS_HTML}}": build_bullets_html(spec.get("bullets", [])),
+    }
+    for k, v in substitutions.items():
+        html = html.replace(k, v)
+
+    # Write rendered HTML to a temp dir alongside the assets so relative paths
+    # resolve. We write to a /tmp/<rand> subdir.
+    rand = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
+    work = Path(tempfile.gettempdir()) / f"card-{rand}"
+    work.mkdir(parents=True, exist_ok=True)
+    rendered_html = work / "index.html"
+    rendered_html.write_text(html)
+
+    png_path = work / "card.png"
+    proc = subprocess.run(
+        [CHROME, "--headless", "--disable-gpu", "--no-sandbox",
+         f"--screenshot={png_path}",
+         "--window-size=1080,1620",
+         "--force-device-scale-factor=1",
+         "--hide-scrollbars",
+         f"file://{rendered_html}"],
+        capture_output=True, text=True
+    )
+    if not png_path.exists():
+        sys.exit(f"render failed: {proc.stderr[-500:]}")
+
+    # PNG → JPEG (smaller, iMessage-friendly)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Re-encode PNG with iPhone-screenshot metadata (144 DPI, sRGB profile,
+    # description="Screenshot"). Without this, iOS Messages letterboxes tall
+    # JPEGs/PNGs with a white bar because it can't infer logical size from
+    # the file's missing/72-dpi density unit. (Confirmed root cause May 2026.)
+    out_png = out_path.with_suffix(".png")
+    _reencode_screenshot(png_path, out_png)
+    # If caller asked for .jpg, just rename: we want PNG anyway. Keep .png ext.
+    if out_path.suffix.lower() in (".jpg", ".jpeg"):
+        out_path.unlink(missing_ok=True)
+        out_path = out_png
+    print(out_path)
+    return  # already printed
+
+
+def _reencode_screenshot(src, dst):
+    """Re-encode PNG with iPhone-screenshot-style metadata: 144 DPI, sRGB, Screenshot tag."""
+    from PIL import Image, PngImagePlugin, ImageCms
+    img = Image.open(src).convert("RGB")
+    srgb = ImageCms.createProfile("sRGB")
+    icc_bytes = ImageCms.ImageCmsProfile(srgb).tobytes()
+    pnginfo = PngImagePlugin.PngInfo()
+    pnginfo.add_text("description", "Screenshot")
+    img.save(dst, "PNG", dpi=(144, 144), pnginfo=pnginfo, icc_profile=icc_bytes)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("spec", type=Path, help="YAML spec file")
+    ap.add_argument("--out", "-o", type=Path, default=None,
+                    help="Output JPEG path (default: /tmp/card-<rand>.jpg)")
+    args = ap.parse_args()
+
+    if not args.spec.exists():
+        sys.exit(f"Error: spec not found: {args.spec}")
+
+    out = args.out
+    if out is None:
+        rand = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
+        out = Path(f"/tmp/card-{rand}.jpg")
+
+    render(args.spec, out)
+
+
+if __name__ == "__main__":
+    main()

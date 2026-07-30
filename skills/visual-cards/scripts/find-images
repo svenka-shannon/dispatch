@@ -1,0 +1,86 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = []
+# ///
+"""
+visual-cards/find-images — search Unsplash for free CC photo IDs matching a query,
+download the top N to a working dir.
+
+Usage:
+    find-images "lower broadway nashville" [--n 5] [--out /tmp/imgs]
+"""
+import argparse
+import re
+import subprocess
+import sys
+import urllib.parse
+from pathlib import Path
+
+
+def search_unsplash(query: str, n: int) -> list[str]:
+    """Return up to N Unsplash photo IDs matching the query."""
+    q = urllib.parse.quote(query.replace(" ", "-"))
+    url = f"https://unsplash.com/s/photos/{q}"
+    webfetch = Path.home() / ".claude/skills/webfetch/scripts/webfetch"
+    if not webfetch.exists():
+        sys.exit("Error: webfetch CLI not found at " + str(webfetch))
+
+    out = subprocess.run(
+        [str(webfetch), url], capture_output=True, text=True, timeout=30
+    )
+    # IDs appear like /photos/<id>/download
+    ids = re.findall(r"/photos/([a-zA-Z0-9_-]{8,})/download", out.stdout)
+    # de-dupe preserving order
+    seen, dedup = set(), []
+    for i in ids:
+        if i not in seen:
+            seen.add(i)
+            dedup.append(i)
+        if len(dedup) >= n:
+            break
+    return dedup
+
+
+def download(photo_id: str, out_dir: Path) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"unsplash_{photo_id}.jpg"
+    subprocess.run(
+        ["curl", "-sL", "-A", "Mozilla/5.0",
+         f"https://unsplash.com/photos/{photo_id}/download?force=true",
+         "-o", str(out)],
+        check=False, capture_output=True
+    )
+    if out.exists() and out.stat().st_size > 5000:
+        # Resize to ~1080px wide for card use
+        small = out_dir / f"unsplash_{photo_id}_sm.jpg"
+        subprocess.run(
+            ["sips", "-s", "format", "jpeg", "-Z", "1200",
+             "-s", "formatOptions", "75",
+             str(out), "--out", str(small)],
+            check=False, capture_output=True
+        )
+        return small
+    return out  # may be empty / error page
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("query", help="Search query (e.g. 'nashville broadway honky tonk')")
+    ap.add_argument("--n", type=int, default=5)
+    ap.add_argument("--out", type=Path, default=Path("/tmp/visual-cards-imgs"),
+                    help="Download dir (default: /tmp/visual-cards-imgs)")
+    args = ap.parse_args()
+
+    ids = search_unsplash(args.query, args.n)
+    if not ids:
+        print(f"no photo IDs found for query: {args.query}")
+        sys.exit(1)
+    print(f"found {len(ids)} IDs: {', '.join(ids)}")
+    for i in ids:
+        p = download(i, args.out)
+        print(f"  {p}")
+
+
+if __name__ == "__main__":
+    main()

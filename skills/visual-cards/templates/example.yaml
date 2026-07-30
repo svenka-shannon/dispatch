@@ -1,0 +1,15 @@
+template: day-itinerary
+hero_image: /tmp/nash-cards/ns_T4z_tKVELpM_sm.jpg
+eyebrow: "Nashville · Jul 3"
+page_tag: "1 / 4"
+title: "Day 1"
+subtitle: "Arrival + first honky tonk"
+tiles:
+  - { image: /tmp/nash-cards/hc_z4xYT5fz8Hg_sm.jpg, label: "Hattie B's" }
+  - { image: /tmp/nash-cards/ns_G4BdFqq9k3s_sm.jpg, label: "Lower Broadway" }
+bullets:
+  - "Land BNA · Uber to downtown · drop bags"
+  - "Dinner: Hattie B's hot chicken"
+  - "Walk Lower Broadway · live music in every doorway"
+  - "Nightcap at Robert's Western World"
+poetic: "No itinerary. Just walk into whichever bar has the best fiddle."

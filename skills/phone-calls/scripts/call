@@ -120,10 +120,23 @@ def devices_setup() -> None:
     if not state.get("routed"):
         state["saved_input"] = current_device("input")
         state["saved_output"] = current_device("output")
+        state["saved_system"] = current_device("system")
+        state["saved_volume"] = run(
+            ["osascript", "-e", "get volume settings"]).stdout.strip()
     if not set_device("input", MIC_DEVICE):
         die(f"failed to set default input to {MIC_DEVICE}")
     if not set_device("output", SPK_DEVICE):
         die(f"failed to set default output to {SPK_DEVICE}")
+    # Sound effects (incl. loud DTMF dial tones) use their own device — send
+    # them into the virtual device too and zero the alert volume so nothing
+    # blares from the real speakers while dialing.
+    set_device("system", SPK_DEVICE)
+    run(["osascript", "-e", "set volume alert volume 0"])
+    # Call audio rides the system output path, so the output-volume setting
+    # scales what lands in BlackHole — near-zero volume = whisper-level
+    # capture (~-47dB). Max it out and unmute.
+    run(["osascript", "-e", "set volume output volume 100"])
+    run(["osascript", "-e", "set volume without output muted"])
     state["routed"] = True
     save_state(state)
     log(f"audio routed: input={MIC_DEVICE} output={SPK_DEVICE}")
@@ -133,12 +146,29 @@ def devices_restore() -> None:
     state = load_state()
     out = state.get("saved_output") or "Mac mini Speakers"
     inp = state.get("saved_input")
+    sysdev = state.get("saved_system") or out
     if out in list_audio_devices():
         set_device("output", out)
         log(f"restored output -> {out}")
+    if sysdev in list_audio_devices():
+        set_device("system", sysdev)
     if inp and inp in list_audio_devices():
         set_device("input", inp)
         log(f"restored input -> {inp}")
+    # Restore volumes ("output volume:44, input volume:80, alert volume:75,
+    # output muted:false") so we don't leave the speakers at 100%.
+    saved = state.get("saved_volume", "")
+    try:
+        parts = dict(p.split(":") for p in saved.split(", "))
+        run(["osascript", "-e",
+             f"set volume output volume {int(parts['output volume'])}"])
+        run(["osascript", "-e",
+             f"set volume alert volume {int(parts['alert volume'])}"])
+        if parts.get("output muted") == "true":
+            run(["osascript", "-e", "set volume with output muted"])
+    except (ValueError, KeyError):
+        run(["osascript", "-e", "set volume output volume 50"])
+        run(["osascript", "-e", "set volume alert volume 75"])
     state["routed"] = False
     save_state(state)
 
@@ -266,10 +296,12 @@ def dial_via_phone_app(number: str) -> bool:
     digits = [c for c in number.lstrip("+") if c.isdigit() or c in "*#"]
     if not digits:
         return False
-    # CRITICAL: relaunch Phone AFTER audio routing — it binds its audio devices
-    # at launch, so a Phone.app that was already running keeps piping call
-    # audio to the old output and we capture silence.
+    # CRITICAL: relaunch Phone AND the AV conference daemon AFTER audio
+    # routing. Call audio flows through avconferenced (not Phone.app), and
+    # both bind their audio devices at startup — a stale instance keeps
+    # piping far-end audio to the old output and we capture silence.
     run(["osascript", "-e", 'tell application "Phone" to quit'])
+    run(["killall", "avconferenced"])
     time.sleep(1.5)
     run(["open", "-a", "Phone"])
     time.sleep(3.5)
@@ -524,7 +556,13 @@ def record_vad(device: str, max_seconds: float, wait_for_speech: bool,
 
 
 def transcribe(audio, rate: int) -> str:
+    import numpy as np
     import soundfile as sf
+    peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
+    if peak < 0.001:  # < -60dBFS: genuine silence — boosting it just makes
+        return ""     # whisper hallucinate words from noise
+    if peak < 0.5:    # normalize quiet captures to -3dBFS before whisper
+        audio = audio * (0.7 / peak)
     wav = STATE_DIR / "listen-last.wav"
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     sf.write(str(wav), audio, rate, subtype="PCM_16")
@@ -559,8 +597,11 @@ def cmd_listen(args) -> None:
     text = "" if args.no_transcribe else transcribe(audio, RECORD_RATE)
     seconds = round(len(audio) / RECORD_RATE, 1)
     if args.json:
+        import numpy as np
+        peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
+        peak_db = round(20 * math.log10(peak), 1) if peak > 0 else -120.0
         print(json.dumps({"transcript": text, "speech_detected": speech,
-                          "seconds": seconds}))
+                          "seconds": seconds, "peak_db": peak_db}))
     else:
         print(text if text else "(unintelligible / no transcript)")
 
@@ -574,22 +615,42 @@ GOAL OF THIS CALL: {goal}
 Rules:
 - You receive the other person's words (speech-to-text, may contain transcription errors — infer intent).
 - Reply with ONLY the words to speak aloud. 1-2 short conversational sentences. No markdown, no stage directions, no emoji.
+- Open with a short first sentence (a few words), then continue if needed.
 - Identify yourself as an AI assistant calling for {owner_name} early in the call.
 - Numbers/times: speak them naturally ("seven thirty" not "7:30").
 - If the goal is achieved or the conversation is clearly over, end your reply with the exact token [HANGUP].
-- If you hear hold music / an automated menu, output [WAIT] alone to keep listening.
+- If you hear hold music, an automated menu, or ringing sounds (e.g. "(phone rings)"), output [WAIT] alone to keep listening.
 - Stay on-goal, be warm and brief. Phone people hate monologues."""
 
 
-def cmd_converse(args) -> None:
-    """Real-time conversation loop: persistent audio streams + preloaded TTS +
-    whisper + a fast no-thinking LLM turn via the Agent SDK (haiku)."""
-    import asyncio
-    import numpy as np
-    import sounddevice as sd
-    import soundfile as sf
+_SENT_BOUNDARY = None  # compiled lazily in cmd_converse
 
-    sys.path.insert(0, str(HOME / ".claude/skills/tts/scripts"))
+
+def _find_sentence_cut(buf: str, min_len: int = 20) -> int | None:
+    """Index just past the earliest sentence boundary usable for TTS chunking,
+    or None. Guards common abbreviations."""
+    import re
+    for m in re.finditer(r"[.!?…](?=\s|$)", buf):
+        cand = buf[: m.end()]
+        if len(cand.strip()) < min_len:
+            continue
+        if re.search(r"\b(?:Mr|Mrs|Ms|Dr|St|vs|etc)\.$", cand):
+            continue
+        return m.end()
+    return None
+
+
+def cmd_converse(args) -> None:
+    """Real-time conversation loop, pipelined for latency:
+    thinking-off Haiku streams tokens -> first sentence goes to TTS while the
+    rest streams -> persistent output stream plays chunks gaplessly.
+    ~1.5-2.5s from the caller's last word to first audio."""
+    import asyncio
+    import queue as queue_mod
+    import threading
+
+    import sounddevice as sd
+
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     transcript_path = Path(args.transcript or (STATE_DIR / "converse-transcript.txt"))
 
@@ -604,14 +665,36 @@ def cmd_converse(args) -> None:
     from kokoro_onnx import Kokoro
     models = HOME / ".claude/skills/tts/models"
     kokoro = Kokoro(str(models / "kokoro-v1.0.onnx"), str(models / "voices-v1.0.bin"))
+    KOKORO_RATE = 24000
 
-    def speak(text: str) -> None:
-        samples, rate = kokoro.create(text, voice=args.voice, speed=1.05)
-        sd.play(samples, samplerate=rate, device=MIC_DEVICE)
-        sd.wait()
+    # --- persistent output stream + player thread (P3): sd.play() costs
+    # ~250ms per call; OutputStream.write() is instant and gapless.
+    playq: "queue_mod.Queue" = queue_mod.Queue()
+    out_stream = sd.OutputStream(device=MIC_DEVICE, samplerate=KOKORO_RATE,
+                                 channels=1, dtype="float32")
+    out_stream.start()
+
+    def _player():
+        while True:
+            arr = playq.get()
+            if arr is None:
+                playq.task_done()
+                break
+            out_stream.write(arr.reshape(-1, 1).astype("float32"))
+            playq.task_done()
+
+    player_thread = threading.Thread(target=_player, daemon=True)
+    player_thread.start()
+
+    def say_now(text: str) -> None:
+        """Synchronous speak (greeting / fallback): synth + enqueue + drain."""
+        samples, _ = kokoro.create(text, voice=args.voice, speed=1.05)
+        playq.put(samples)
+        playq.join()
         tlog("ME", text)
 
-    def hear(max_s: float, silence_s: float = 1.0) -> str:
+    def hear(max_s: float, silence_s: float = 0.6) -> str:
+        # 0.6s trailing-silence endpoint (was 1.0) — P4; LiveKit ships 0.5.
         audio, _ = record_vad(device=SPK_DEVICE, max_seconds=max_s,
                               wait_for_speech=True, silence_s=silence_s,
                               min_speech_s=0.25, thresh_db=args.threshold_db)
@@ -619,7 +702,6 @@ def cmd_converse(args) -> None:
             return ""
         return transcribe(audio, RECORD_RATE)
 
-    # --- persistent fast LLM session (haiku, tools off, no thinking)
     from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
 
     owner = run([str(HOME / "dispatch/bin/identity"), "owner.name"]).stdout.strip() or "the owner"
@@ -634,20 +716,51 @@ def cmd_converse(args) -> None:
             system_prompt=system,
             allowed_tools=[],
             max_turns=1,
+            max_thinking_tokens=0,          # P1: thinking-on TTFT is 2.7-6.5s
+            include_partial_messages=True,  # P2: stream token deltas
+            setting_sources=[],
         )
         async with ClaudeSDKClient(options=options) as client:
 
-            async def brain(user_text: str) -> str:
+            async def brain_sentences(user_text: str):
+                """Yield complete sentences as Haiku streams them (P2)."""
                 await client.query(user_text)
-                parts: list[str] = []
+                buf = ""
                 async for msg in client.receive_response():
-                    for block in getattr(msg, "content", []) or []:
-                        t = getattr(block, "text", None)
-                        if t:
-                            parts.append(t)
-                return "".join(parts).strip()
+                    if type(msg).__name__ != "StreamEvent":
+                        continue
+                    ev = msg.event
+                    if (ev.get("type") == "content_block_delta"
+                            and ev.get("delta", {}).get("type") == "text_delta"):
+                        buf += ev["delta"]["text"]
+                        while True:
+                            cut = _find_sentence_cut(buf)
+                            if cut is None:
+                                break
+                            yield buf[:cut].strip()
+                            buf = buf[cut:]
+                if buf.strip():
+                    yield buf.strip()
 
-            # greeting: pre-synthesized feel — speak as soon as speech is heard
+            async def respond(user_text: str) -> tuple[str, bool, bool]:
+                """Stream a reply: speak sentence 1 while the rest streams.
+                Returns (full_text, hangup, wait)."""
+                spoken: list[str] = []
+                hangup = False
+                async for sent in brain_sentences(user_text):
+                    if sent.startswith("[WAIT]"):
+                        return "", False, True
+                    if "[HANGUP]" in sent:
+                        hangup = True
+                        sent = sent.replace("[HANGUP]", "").strip()
+                    if sent:
+                        samples, _ = await asyncio.to_thread(
+                            kokoro.create, sent, voice=args.voice, speed=1.05)
+                        playq.put(samples)
+                        spoken.append(sent)
+                await asyncio.to_thread(playq.join)  # let playback finish
+                return " ".join(spoken), hangup, False
+
             deadline = time.time() + args.answer_timeout
             heard = ""
             while time.time() < deadline and not heard:
@@ -655,11 +768,11 @@ def cmd_converse(args) -> None:
             if not heard:
                 tlog("SYS", "no answer detected; leaving message then hanging up")
                 if args.greeting:
-                    speak(args.greeting)
+                    say_now(args.greeting)
                 return
             tlog("THEM", heard)
             if args.greeting:
-                speak(args.greeting)
+                say_now(args.greeting)
 
             silent_rounds = 0
             end_at = time.time() + args.max_minutes * 60
@@ -673,19 +786,24 @@ def cmd_converse(args) -> None:
                     continue
                 silent_rounds = 0
                 tlog("THEM", heard)
-                reply = await brain(heard)
-                if reply.strip() == "[WAIT]":
+                t0 = time.time()
+                text, hangup, wait = await respond(heard)
+                if wait:
                     tlog("SYS", "waiting (hold/menu)")
                     continue
-                hangup = "[HANGUP]" in reply
-                text = reply.replace("[HANGUP]", "").strip()
                 if text:
-                    speak(text)
+                    tlog("ME", f"{text}  (turn {time.time() - t0:.1f}s)")
                 if hangup:
                     tlog("SYS", "goal met — hanging up")
                     break
 
-    asyncio.run(_loop())
+    try:
+        asyncio.run(_loop())
+    finally:
+        playq.put(None)
+        player_thread.join(timeout=5)
+        out_stream.stop()
+        out_stream.close()
     print(f"conversation finished. Transcript: {transcript_path}")
 
 
@@ -819,8 +937,8 @@ def main() -> None:
                     help="trailing silence seconds to stop (default 1.2)")
     sp.add_argument("--min-speech", type=float, default=0.3,
                     help="min speech seconds to trigger (default 0.3)")
-    sp.add_argument("--threshold-db", type=float, default=-45,
-                    help="speech energy threshold dBFS (default -45)")
+    sp.add_argument("--threshold-db", type=float, default=-55,
+                    help="speech energy threshold dBFS (default -55)")
     sp.add_argument("--raw", help="also save raw wav to this path")
     sp.add_argument("--no-transcribe", action="store_true")
     sp.add_argument("--json", action="store_true")
@@ -836,7 +954,7 @@ def main() -> None:
     sp.add_argument("--turn-timeout", type=float, default=20,
                     help="max seconds to wait for them to speak each turn")
     sp.add_argument("--max-minutes", type=float, default=8)
-    sp.add_argument("--threshold-db", type=float, default=-45)
+    sp.add_argument("--threshold-db", type=float, default=-55)
     sp.add_argument("--transcript", help="transcript file path")
     sp.set_defaults(func=cmd_converse)
 

@@ -1,0 +1,570 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["sounddevice", "soundfile", "numpy"]
+# ///
+"""
+call - Place and conduct FaceTime Audio calls with TTS voice + whisper ears.
+
+The agent speaks by playing TTS audio into a virtual mic (BlackHole 2ch =
+FaceTime's input) and hears by recording FaceTime's output (BlackHole 16ch),
+then transcribing with whisper.cpp.
+
+Subcommands:
+  doctor                      Check all prerequisites
+  devices [--setup|--restore] Show / set / restore audio device routing
+  start <target>              Place a FaceTime Audio call (phone or Apple ID email)
+  say "text"                  Speak into the active call (TTS -> virtual mic)
+  listen                      Record + transcribe what the other side says
+  status                      Show call/audio state
+  end                         Hang up, restore audio devices
+  test-audio                  Loopback self-test of the full audio pipeline (no call)
+
+Typical conversation loop (driven by the agent):
+  call start "+15551234567"
+  call listen --wait-for-speech --max 45     # wait for "Hello?"
+  call say "Hi! This is Svenka, Eric's AI assistant..."
+  call listen --wait-for-speech
+  ... repeat say/listen ...
+  call end
+"""
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+MIC_DEVICE = "BlackHole 2ch"        # we play TTS here; FaceTime uses it as microphone
+SPK_DEVICE = "BlackHole 16ch"       # FaceTime plays far-end audio here; we record it
+STATE_DIR = Path("/tmp/phone-call")
+STATE_FILE = STATE_DIR / "state.json"
+AXCTL = HOME / ".claude/skills/axctl/scripts/axctl"
+SWITCH = "/opt/homebrew/bin/SwitchAudioSource"
+CLICLICK = "/opt/homebrew/bin/cliclick"
+FFMPEG = "/opt/homebrew/bin/ffmpeg"
+WHISPER_CLI = "/opt/homebrew/bin/whisper-cli"
+WHISPER_MODEL = HOME / ".local/share/whisper/ggml-base.en.bin"
+SPEAK_KOKORO = HOME / ".claude/skills/tts/scripts/speak"
+SPEAK_QWEN = HOME / ".claude/skills/tts/scripts/speak-qwen"
+
+RECORD_RATE = 16000  # record at whisper's native rate; CoreAudio resamples
+
+
+def log(msg: str) -> None:
+    print(msg, file=sys.stderr)
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"ERROR: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def run(cmd: list[str], timeout: int = 30, **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **kw)
+
+
+# ---------------------------------------------------------------- state
+
+def load_state() -> dict:
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def save_state(state: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, indent=2))
+
+
+# ---------------------------------------------------------------- audio devices
+
+def list_audio_devices() -> list[str]:
+    out = run([SWITCH, "-a"]).stdout
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def current_device(kind: str) -> str:
+    return run([SWITCH, "-c", "-t", kind]).stdout.strip()
+
+
+def set_device(kind: str, name: str) -> bool:
+    r = run([SWITCH, "-t", kind, "-s", name])
+    return r.returncode == 0
+
+
+def blackhole_installed() -> tuple[bool, bool]:
+    devs = list_audio_devices()
+    return (MIC_DEVICE in devs, SPK_DEVICE in devs)
+
+
+def devices_setup() -> None:
+    """Route FaceTime through the virtual devices, remembering prior defaults."""
+    mic_ok, spk_ok = blackhole_installed()
+    if not (mic_ok and spk_ok):
+        die(
+            f"virtual audio devices missing (need '{MIC_DEVICE}' and '{SPK_DEVICE}').\n"
+            "Install with: brew install blackhole-2ch blackhole-16ch\n"
+            "(requires an admin password; then: sudo killall coreaudiod)"
+        )
+    state = load_state()
+    # Only save originals once per routing session (don't clobber on re-setup)
+    if not state.get("routed"):
+        state["saved_input"] = current_device("input")
+        state["saved_output"] = current_device("output")
+    if not set_device("input", MIC_DEVICE):
+        die(f"failed to set default input to {MIC_DEVICE}")
+    if not set_device("output", SPK_DEVICE):
+        die(f"failed to set default output to {SPK_DEVICE}")
+    state["routed"] = True
+    save_state(state)
+    log(f"audio routed: input={MIC_DEVICE} output={SPK_DEVICE}")
+
+
+def devices_restore() -> None:
+    state = load_state()
+    out = state.get("saved_output") or "Mac mini Speakers"
+    inp = state.get("saved_input")
+    if out in list_audio_devices():
+        set_device("output", out)
+        log(f"restored output -> {out}")
+    if inp and inp in list_audio_devices():
+        set_device("input", inp)
+        log(f"restored input -> {inp}")
+    state["routed"] = False
+    save_state(state)
+
+
+# ---------------------------------------------------------------- UI driving
+
+def axctl_available() -> bool:
+    """True if this process can use the Accessibility API (daemon sessions: yes;
+    plain Terminal: usually no)."""
+    try:
+        r = run(
+            ["uv", "run", "--no-project", "--with",
+             "pyobjc-framework-ApplicationServices", "python", "-c",
+             "from ApplicationServices import AXIsProcessTrusted; print(AXIsProcessTrusted())"],
+            timeout=60,
+        )
+        return "True" in r.stdout
+    except Exception:
+        return False
+
+
+def ax_click_button(app: str, titles: list[str]) -> bool:
+    """Try to click the first button matching any of the given titles."""
+    for title in titles:
+        r = run([str(AXCTL), "click", app, "--title", title], timeout=30)
+        if r.returncode == 0 and "Error" not in r.stderr:
+            log(f"clicked '{title}' in {app} via axctl")
+            return True
+    return False
+
+
+def press_return_fallback() -> bool:
+    """Confirm a default-button dialog by pressing Return via cliclick
+    (the cliclick binary carries its own Accessibility grant)."""
+    if not Path(CLICLICK).exists():
+        return False
+    run(["open", "-a", "FaceTime"])  # make sure the dialog is frontmost
+    time.sleep(1.0)
+    r = run([CLICLICK, "kp:return"])
+    if r.returncode == 0:
+        log("pressed Return via cliclick (default-button confirm)")
+        return True
+    return False
+
+
+# ---------------------------------------------------------------- call control
+
+def normalize_target(target: str) -> str:
+    t = target.strip()
+    if "@" in t:
+        return t
+    digits = "".join(c for c in t if c.isdigit() or c == "+")
+    return digits
+
+
+def cmd_start(args) -> None:
+    target = normalize_target(args.target)
+    devices_setup()
+    scheme = "facetime" if args.video else "facetime-audio"
+    url = f"{scheme}://{target}"
+    log(f"placing call: {url}")
+    r = run(["open", url])
+    if r.returncode != 0:
+        devices_restore()
+        die(f"failed to open {url}: {r.stderr.strip()}")
+    time.sleep(2.5)
+    run(["open", "-a", "FaceTime"])
+
+    # FaceTime shows a confirmation prompt for URL-initiated calls.
+    confirmed = ax_click_button("FaceTime", ["Call", target])
+    if not confirmed:
+        confirmed = press_return_fallback()
+    if not confirmed:
+        log("WARNING: could not confirm the call dialog automatically. "
+            "Check FaceTime UI (axctl tree FaceTime) — the call may not have started.")
+
+    state = load_state()
+    state.update({"in_call": True, "target": target, "started_at": time.time()})
+    save_state(state)
+    print(f"call initiated to {target}. Next: `call listen --wait-for-speech --max 45` "
+          "to wait for them to answer and speak.")
+
+
+def cmd_end(args) -> None:
+    # Best effort: click the leave/end button, then quit FaceTime (reliably ends call)
+    ax_click_button("FaceTime", ["Leave", "End", "End Call"])
+    run(["osascript", "-e", 'tell application "FaceTime" to quit'])
+    devices_restore()
+    state = load_state()
+    dur = ""
+    if state.get("started_at"):
+        dur = f" ({int(time.time() - state['started_at'])}s)"
+    state.update({"in_call": False, "target": None, "started_at": None})
+    save_state(state)
+    print(f"call ended{dur}. Audio devices restored.")
+
+
+def cmd_status(args) -> None:
+    state = load_state()
+    mic_ok, spk_ok = blackhole_installed()
+    ft_running = run(["pgrep", "-x", "FaceTime"]).returncode == 0
+    print(f"blackhole 2ch (virtual mic):     {'OK' if mic_ok else 'MISSING'}")
+    print(f"blackhole 16ch (virtual spkr):   {'OK' if spk_ok else 'MISSING'}")
+    print(f"default input:                   {current_device('input')}")
+    print(f"default output:                  {current_device('output')}")
+    print(f"facetime running:                {ft_running}")
+    print(f"state: in_call={state.get('in_call', False)} target={state.get('target')}")
+    if state.get("started_at"):
+        print(f"call duration: {int(time.time() - state['started_at'])}s")
+
+
+# ---------------------------------------------------------------- speaking
+
+def tts_generate(text: str, engine: str, voice: str, style: str | None,
+                 speed: float) -> Path:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    key = hashlib.sha256(f"{engine}|{voice}|{style}|{speed}|{text}".encode()).hexdigest()[:16]
+    wav = STATE_DIR / f"tts-{key}.wav"
+    if wav.exists():
+        return wav
+    if engine == "qwen":
+        cmd = [str(SPEAK_QWEN), text, "-o", str(wav)]
+        if style:
+            cmd += ["--style", style]
+    else:
+        cmd = [str(SPEAK_KOKORO), text, "-o", str(wav), "-v", voice, "-s", str(speed)]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if r.returncode != 0 or not wav.exists():
+        die(f"TTS failed: {r.stderr.strip()[-500:]}")
+    return wav
+
+
+def play_wav_to_device(wav: Path, device: str) -> float:
+    """Play a wav file into a specific output device. Returns duration seconds."""
+    import numpy as np  # noqa: F401
+    import sounddevice as sd
+    import soundfile as sf
+
+    # Normalize to 48k stereo first — BlackHole's nominal rate — via ffmpeg
+    norm = wav.with_suffix(".48k.wav")
+    if not norm.exists() or norm.stat().st_mtime < wav.stat().st_mtime:
+        r = run([FFMPEG, "-y", "-i", str(wav), "-ar", "48000", "-ac", "2",
+                 str(norm)], timeout=120)
+        if r.returncode != 0:
+            die(f"ffmpeg resample failed: {r.stderr[-300:]}")
+    data, rate = sf.read(str(norm), dtype="float32")
+    sd.play(data, samplerate=rate, device=device)
+    sd.wait()
+    return len(data) / rate
+
+
+def cmd_say(args) -> None:
+    if args.wav:
+        wav = Path(args.wav).expanduser()
+        if not wav.exists():
+            die(f"wav not found: {wav}")
+    elif not args.text.strip():
+        die("nothing to say: pass text or --wav")
+    else:
+        wav = tts_generate(args.text, args.engine, args.voice, args.style, args.speed)
+    mic_ok, _ = blackhole_installed()
+    if not mic_ok:
+        die(f"'{MIC_DEVICE}' not installed — brew install blackhole-2ch blackhole-16ch")
+    dur = play_wav_to_device(wav, args.device or MIC_DEVICE)
+    print(f"spoke {dur:.1f}s of audio into the call")
+
+
+# ---------------------------------------------------------------- listening
+
+def record_vad(device: str, max_seconds: float, wait_for_speech: bool,
+               silence_s: float, min_speech_s: float, thresh_db: float):
+    """Record from `device` with a simple energy VAD.
+
+    Returns (float32 mono 16k numpy array or None, speech_detected: bool).
+    In wait_for_speech mode: waits (up to max_seconds) for speech to start,
+    then records until `silence_s` of trailing silence.
+    Otherwise: records max_seconds flat.
+    """
+    import numpy as np
+    import sounddevice as sd
+
+    block_s = 0.03
+    blocksize = int(RECORD_RATE * block_s)
+    thresh = 10 ** (thresh_db / 20)
+
+    chunks: list = []
+    speech_started = not wait_for_speech
+    speech_detected = False
+    speech_run = 0.0
+    silence_run = 0.0
+    t0 = time.time()
+    recorded = 0.0
+
+    with sd.InputStream(device=device, channels=1, samplerate=RECORD_RATE,
+                        blocksize=blocksize, dtype="float32") as stream:
+        while True:
+            block, _ = stream.read(blocksize)
+            mono = block[:, 0]
+            rms = float(np.sqrt(np.mean(mono ** 2))) if len(mono) else 0.0
+            loud = rms > thresh
+
+            if not speech_started:
+                if loud:
+                    speech_run += block_s
+                    chunks.append(mono.copy())  # keep onset audio
+                    if speech_run >= min_speech_s:
+                        speech_started = True
+                        speech_detected = True
+                        log("speech detected, recording...")
+                else:
+                    speech_run = 0.0
+                    chunks = chunks[-10:]  # keep a little pre-roll
+                if time.time() - t0 > max_seconds:
+                    return None, False
+                continue
+
+            chunks.append(mono.copy())
+            recorded += block_s
+            if loud:
+                speech_detected = True
+                silence_run = 0.0
+            else:
+                silence_run += block_s
+
+            if wait_for_speech and silence_run >= silence_s:
+                break
+            if recorded >= max_seconds:
+                break
+
+    if not chunks:
+        return None, speech_detected
+    return np.concatenate(chunks), speech_detected
+
+
+def transcribe(audio, rate: int) -> str:
+    import soundfile as sf
+    wav = STATE_DIR / "listen-last.wav"
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    sf.write(str(wav), audio, rate, subtype="PCM_16")
+    r = run([WHISPER_CLI, "-m", str(WHISPER_MODEL), "-f", str(wav),
+             "-nt", "--no-prints"], timeout=300)
+    if r.returncode != 0:
+        die(f"whisper failed: {r.stderr[-300:]}")
+    return r.stdout.strip()
+
+
+def cmd_listen(args) -> None:
+    _, spk_ok = blackhole_installed()
+    if not spk_ok:
+        die(f"'{SPK_DEVICE}' not installed — brew install blackhole-2ch blackhole-16ch")
+    audio, speech = record_vad(
+        device=args.device or SPK_DEVICE,
+        max_seconds=args.max,
+        wait_for_speech=args.wait_for_speech,
+        silence_s=args.silence,
+        min_speech_s=args.min_speech,
+        thresh_db=args.threshold_db,
+    )
+    if audio is None:
+        result = {"transcript": "", "speech_detected": False, "seconds": 0.0}
+        print(json.dumps(result) if args.json else
+              "(no speech detected within timeout)")
+        return
+    if args.raw:
+        import soundfile as sf
+        sf.write(args.raw, audio, RECORD_RATE, subtype="PCM_16")
+        log(f"raw audio saved to {args.raw}")
+    text = "" if args.no_transcribe else transcribe(audio, RECORD_RATE)
+    seconds = round(len(audio) / RECORD_RATE, 1)
+    if args.json:
+        print(json.dumps({"transcript": text, "speech_detected": speech,
+                          "seconds": seconds}))
+    else:
+        print(text if text else "(unintelligible / no transcript)")
+
+
+# ---------------------------------------------------------------- self test
+
+def cmd_test_audio(args) -> None:
+    """Loopback test: play TTS into BlackHole 2ch while recording BlackHole 2ch.
+    Anything written to a BlackHole device's output is mirrored to its input,
+    so this exercises TTS -> playback -> capture -> whisper without a call."""
+    mic_ok, _ = blackhole_installed()
+    if not mic_ok:
+        die(f"'{MIC_DEVICE}' not installed — brew install blackhole-2ch blackhole-16ch")
+    phrase = "This is a loopback test of the phone call audio pipeline."
+    log("generating TTS...")
+    wav = tts_generate(phrase, "kokoro", "af_nova", None, 1.0)
+
+    import threading
+    result: dict = {}
+
+    def _record():
+        result["audio"], result["speech"] = record_vad(
+            device=MIC_DEVICE, max_seconds=12, wait_for_speech=True,
+            silence_s=1.0, min_speech_s=0.2, thresh_db=-45)
+
+    t = threading.Thread(target=_record)
+    t.start()
+    time.sleep(0.8)
+    log("playing into virtual mic...")
+    play_wav_to_device(wav, MIC_DEVICE)
+    t.join(timeout=20)
+
+    audio = result.get("audio")
+    if audio is None:
+        die("FAIL: no audio captured from loopback")
+    text = transcribe(audio, RECORD_RATE).lower()
+    log(f"transcript: {text!r}")
+    hits = sum(w in text for w in ("loopback", "test", "audio", "pipeline"))
+    if hits >= 2:
+        print("PASS: full audio pipeline works (TTS -> virtual device -> capture -> whisper)")
+    else:
+        die(f"FAIL: transcript didn't match expected phrase: {text!r}")
+
+
+# ---------------------------------------------------------------- doctor
+
+def cmd_doctor(args) -> None:
+    checks: list[tuple[str, bool, str]] = []
+    mic_ok, spk_ok = blackhole_installed()
+    checks.append(("BlackHole 2ch (virtual mic)", mic_ok,
+                   "brew install blackhole-2ch  (needs admin password)"))
+    checks.append(("BlackHole 16ch (virtual speaker)", spk_ok,
+                   "brew install blackhole-16ch (needs admin password)"))
+    checks.append(("SwitchAudioSource", Path(SWITCH).exists(),
+                   "brew install switchaudio-osx"))
+    checks.append(("ffmpeg", Path(FFMPEG).exists(), "brew install ffmpeg"))
+    checks.append(("whisper-cli", Path(WHISPER_CLI).exists(),
+                   "brew install whisper-cpp"))
+    checks.append(("whisper model (base.en)", WHISPER_MODEL.exists(),
+                   "curl -L -o ~/.local/share/whisper/ggml-base.en.bin "
+                   "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"))
+    checks.append(("kokoro TTS", SPEAK_KOKORO.exists(), "see /tts skill"))
+    checks.append(("cliclick (dialog fallback)", Path(CLICLICK).exists(),
+                   "brew install cliclick"))
+    ax = axctl_available()
+    checks.append(("Accessibility (axctl)", ax,
+                   "works from daemon sessions; from Terminal grant Accessibility "
+                   "to Terminal in System Settings > Privacy & Security"))
+    all_ok = True
+    for name, ok, fix in checks:
+        mark = "✓" if ok else "✗"
+        print(f"  {mark} {name}" + ("" if ok else f"  → {fix}"))
+        if not ok and "Accessibility" not in name:
+            all_ok = False
+    print()
+    if all_ok:
+        print("ready to make calls" + ("" if ax else
+              " (UI confirm will use cliclick Return-key fallback)"))
+    else:
+        print("NOT ready — fix the ✗ items above")
+        sys.exit(2)
+
+
+def cmd_devices(args) -> None:
+    if args.setup:
+        devices_setup()
+    elif args.restore:
+        devices_restore()
+    else:
+        mic_ok, spk_ok = blackhole_installed()
+        print(f"devices: {', '.join(list_audio_devices())}")
+        print(f"blackhole installed: mic(2ch)={mic_ok} spkr(16ch)={spk_ok}")
+        print(f"default input:  {current_device('input')}")
+        print(f"default output: {current_device('output')}")
+
+
+# ---------------------------------------------------------------- main
+
+def main() -> None:
+    p = argparse.ArgumentParser(prog="call", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("start", help="place a FaceTime Audio call")
+    sp.add_argument("target", help="phone number (+1...) or Apple ID email")
+    sp.add_argument("--video", action="store_true", help="FaceTime video instead of audio")
+    sp.set_defaults(func=cmd_start)
+
+    sp = sub.add_parser("say", help="speak text into the active call")
+    sp.add_argument("text", nargs="?", default="")
+    sp.add_argument("--voice", default="af_nova", help="kokoro voice (default af_nova)")
+    sp.add_argument("--engine", choices=["kokoro", "qwen"], default="kokoro")
+    sp.add_argument("--style", help="qwen voice style prompt")
+    sp.add_argument("--speed", type=float, default=1.0)
+    sp.add_argument("--wav", help="play an existing wav instead of TTS")
+    sp.add_argument("--device", help=f"override output device (default {MIC_DEVICE})")
+    sp.set_defaults(func=cmd_say)
+
+    sp = sub.add_parser("listen", help="record + transcribe the far end")
+    sp.add_argument("--max", type=float, default=30, help="max seconds (default 30)")
+    sp.add_argument("--wait-for-speech", action="store_true",
+                    help="wait for speech to start, stop after trailing silence")
+    sp.add_argument("--silence", type=float, default=1.2,
+                    help="trailing silence seconds to stop (default 1.2)")
+    sp.add_argument("--min-speech", type=float, default=0.3,
+                    help="min speech seconds to trigger (default 0.3)")
+    sp.add_argument("--threshold-db", type=float, default=-45,
+                    help="speech energy threshold dBFS (default -45)")
+    sp.add_argument("--raw", help="also save raw wav to this path")
+    sp.add_argument("--no-transcribe", action="store_true")
+    sp.add_argument("--json", action="store_true")
+    sp.add_argument("--device", help=f"override input device (default {SPK_DEVICE})")
+    sp.set_defaults(func=cmd_listen)
+
+    sp = sub.add_parser("end", help="hang up and restore audio devices")
+    sp.set_defaults(func=cmd_end)
+
+    sp = sub.add_parser("status", help="show call/audio state")
+    sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser("devices", help="show or change audio routing")
+    sp.add_argument("--setup", action="store_true", help="route to BlackHole devices")
+    sp.add_argument("--restore", action="store_true", help="restore saved defaults")
+    sp.set_defaults(func=cmd_devices)
+
+    sp = sub.add_parser("doctor", help="check prerequisites")
+    sp.set_defaults(func=cmd_doctor)
+
+    sp = sub.add_parser("test-audio", help="loopback self-test (no call placed)")
+    sp.set_defaults(func=cmd_test_audio)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

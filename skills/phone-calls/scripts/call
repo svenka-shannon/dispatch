@@ -608,19 +608,22 @@ def cmd_listen(args) -> None:
 
 # ---------------------------------------------------------------- converse
 
-CONVERSE_SYSTEM = """You are {assistant_name}, an AI assistant speaking on a LIVE PHONE CALL on behalf of {owner_name}.
+CONVERSE_SYSTEM = """You are {assistant_name}, {owner_name}'s assistant, speaking on a LIVE PHONE CALL on their behalf.
 
 GOAL OF THIS CALL: {goal}
 
-Rules:
-- You receive the other person's words (speech-to-text, may contain transcription errors — infer intent).
+Sound like a person, not a bot:
+- Natural, warm, casual-professional. Use contractions. Brief acknowledgments ("Sure", "Perfect", "Got it") are good.
+- Introduce yourself simply as "{assistant_name}, {owner_name}'s assistant" when a greeting is called for. Do NOT volunteer that you're an AI on routine errands — but if anyone asks whether you're an AI, a robot, or a recording, answer honestly and briefly, then get back to the task. Never deny being an AI.
 - Reply with ONLY the words to speak aloud. 1-2 short conversational sentences. No markdown, no stage directions, no emoji.
 - Open with a short first sentence (a few words), then continue if needed.
-- Identify yourself as an AI assistant calling for {owner_name} early in the call.
 - Numbers/times: speak them naturally ("seven thirty" not "7:30").
+
+Mechanics:
+- You receive the other person's words via speech-to-text — it may contain errors; infer intent.
 - If the goal is achieved or the conversation is clearly over, end your reply with the exact token [HANGUP].
 - If you hear hold music, an automated menu, or ringing sounds (e.g. "(phone rings)"), output [WAIT] alone to keep listening.
-- Stay on-goal, be warm and brief. Phone people hate monologues."""
+- Stay on-goal and brief. Phone people hate monologues."""
 
 
 _SENT_BOUNDARY = None  # compiled lazily in cmd_converse
@@ -688,7 +691,7 @@ def cmd_converse(args) -> None:
 
     def say_now(text: str) -> None:
         """Synchronous speak (greeting / fallback): synth + enqueue + drain."""
-        samples, _ = kokoro.create(text, voice=args.voice, speed=1.05)
+        samples, _ = kokoro.create(text, voice=args.voice, speed=1.0)
         playq.put(samples)
         playq.join()
         tlog("ME", text)
@@ -742,24 +745,38 @@ def cmd_converse(args) -> None:
                 if buf.strip():
                     yield buf.strip()
 
-            async def respond(user_text: str) -> tuple[str, bool, bool]:
-                """Stream a reply: speak sentence 1 while the rest streams.
-                Returns (full_text, hangup, wait)."""
+            async def respond(user_text: str, t0: float) -> tuple[str, bool, bool, float, float]:
+                """Stream a reply: synth+enqueue sentence 1 while the rest
+                streams. Returns as soon as everything is ENQUEUED (NOT after
+                playback) so the brain-timeout never waits on the audio device.
+                Returns (text, hangup, wait, first_audio_s, audio_dur_s)."""
                 spoken: list[str] = []
                 hangup = False
+                first_audio = None
+                audio_dur = 0.0
                 async for sent in brain_sentences(user_text):
                     if sent.startswith("[WAIT]"):
-                        return "", False, True
+                        return "", False, True, 0.0, 0.0
                     if "[HANGUP]" in sent:
                         hangup = True
                         sent = sent.replace("[HANGUP]", "").strip()
+                    # Hard guard: never read a document down the phone.
+                    if len(sent) > 300:
+                        sent = sent[:300]
+                        hangup = True
                     if sent:
                         samples, _ = await asyncio.to_thread(
-                            kokoro.create, sent, voice=args.voice, speed=1.05)
+                            kokoro.create, sent, voice=args.voice, speed=1.0)
                         playq.put(samples)
+                        if first_audio is None:
+                            first_audio = time.time() - t0
+                        audio_dur += len(samples) / KOKORO_RATE
                         spoken.append(sent)
-                await asyncio.to_thread(playq.join)  # let playback finish
-                return " ".join(spoken), hangup, False
+                    if sum(len(s) for s in spoken) > 600:
+                        log("reply length cap hit — truncating turn")
+                        break
+                return (" ".join(spoken), hangup, False,
+                        first_audio or 0.0, audio_dur)
 
             deadline = time.time() + args.answer_timeout
             heard = ""
@@ -787,12 +804,29 @@ def cmd_converse(args) -> None:
                 silent_rounds = 0
                 tlog("THEM", heard)
                 t0 = time.time()
-                text, hangup, wait = await respond(heard)
+                # Timeout wraps ONLY brain+synth+enqueue (target ~1-2s, cap
+                # 30s) — never the audio device, so a stalled speaker can't
+                # hang the turn.
+                try:
+                    text, hangup, wait, first_audio, audio_dur = \
+                        await asyncio.wait_for(respond(heard, t0), timeout=30)
+                except asyncio.TimeoutError:
+                    tlog("SYS", "brain turn timed out (30s) — apologizing, hanging up")
+                    say_now("I'm so sorry, I'm having some technical trouble. I'll try again later. Goodbye!")
+                    break
                 if wait:
                     tlog("SYS", "waiting (hold/menu)")
                     continue
                 if text:
-                    tlog("ME", f"{text}  (turn {time.time() - t0:.1f}s)")
+                    tlog("ME", f"{text}  (reply started {first_audio:.1f}s after they finished)")
+                # Wait for playback to drain before listening again (avoid
+                # talking over ourselves), but BOUND it — a wedged device
+                # can't freeze the call. Slack = audio duration + 4s.
+                try:
+                    await asyncio.wait_for(asyncio.to_thread(playq.join),
+                                           timeout=audio_dur + 4)
+                except asyncio.TimeoutError:
+                    log("playback drain timed out — continuing")
                 if hangup:
                     tlog("SYS", "goal met — hanging up")
                     break
@@ -921,7 +955,7 @@ def main() -> None:
 
     sp = sub.add_parser("say", help="speak text into the active call")
     sp.add_argument("text", nargs="?", default="")
-    sp.add_argument("--voice", default="af_nova", help="kokoro voice (default af_nova)")
+    sp.add_argument("--voice", default="af_heart", help="kokoro voice (default af_nova)")
     sp.add_argument("--engine", choices=["kokoro", "qwen"], default="kokoro")
     sp.add_argument("--style", help="qwen voice style prompt")
     sp.add_argument("--speed", type=float, default=1.0)
@@ -948,7 +982,7 @@ def main() -> None:
     sp = sub.add_parser("converse", help="real-time conversation loop (run right after start)")
     sp.add_argument("--goal", required=True, help="what this call is trying to accomplish")
     sp.add_argument("--greeting", help="opening line, spoken when they answer")
-    sp.add_argument("--voice", default="af_nova")
+    sp.add_argument("--voice", default="af_heart")
     sp.add_argument("--answer-timeout", type=float, default=35,
                     help="seconds to wait for first speech (default 35)")
     sp.add_argument("--turn-timeout", type=float, default=20,

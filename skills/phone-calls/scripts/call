@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["sounddevice", "soundfile", "numpy"]
+# dependencies = ["sounddevice", "soundfile", "numpy", "kokoro-onnx", "claude-agent-sdk"]
 # ///
 """
 call - Place and conduct FaceTime Audio calls with TTS voice + whisper ears.
@@ -246,6 +246,43 @@ def ax_click_button(app: str, titles: list[str]) -> bool:
     return False
 
 
+def ax_click_desc(app: str, desc: str, retries: int = 2) -> bool:
+    """Click an element by AXDescription (SwiftUI apps label buttons this way)."""
+    for _ in range(retries):
+        r = run([str(AXCTL), "click", app, "--desc", desc], timeout=30)
+        if r.returncode == 0 and "Error" not in r.stderr and "Error" not in r.stdout:
+            return True
+        time.sleep(0.7)
+    return False
+
+
+def dial_via_phone_app(number: str) -> bool:
+    """Dial a number with the macOS Phone app keypad via Accessibility.
+
+    Deterministic: open Phone -> Keypad view -> click digit buttons -> Call.
+    Requires AX (daemon-spawned sessions have it; plain Terminal does not).
+    Keypad has no '+' — leading + is dropped (US: 1 + 10 digits works).
+    """
+    digits = [c for c in number.lstrip("+") if c.isdigit() or c in "*#"]
+    if not digits:
+        return False
+    # CRITICAL: relaunch Phone AFTER audio routing — it binds its audio devices
+    # at launch, so a Phone.app that was already running keeps piping call
+    # audio to the old output and we capture silence.
+    run(["osascript", "-e", 'tell application "Phone" to quit'])
+    time.sleep(1.5)
+    run(["open", "-a", "Phone"])
+    time.sleep(3.5)
+    names = {"*": "Star", "#": "Pound"}
+    seq = ",".join(["Keypad"] + [names.get(d, d) for d in digits] + ["Call"])
+    r = run([str(AXCTL), "clickseq", "Phone", seq], timeout=90)
+    if r.returncode != 0:
+        log(f"clickseq dial failed: {(r.stderr or r.stdout).strip()[-200:]}")
+        return False
+    log(f"dialed {''.join(digits)} via Phone app keypad")
+    return True
+
+
 def press_return_fallback() -> bool:
     """Confirm a default-button dialog by pressing Return via cliclick
     (the cliclick binary carries its own Accessibility grant)."""
@@ -284,6 +321,24 @@ def cmd_start(args) -> None:
         scheme = "facetime-audio"
     else:
         scheme = "tel"
+
+    # Preferred dialer for plain numbers: drive the Phone app keypad via AX —
+    # deterministic, no notification banner. Works from daemon sessions.
+    if scheme == "tel" and args.dialer in ("auto", "phone-app"):
+        if dial_via_phone_app(target):
+            state = load_state()
+            state.update({"in_call": True, "target": target,
+                          "started_at": time.time(), "dialer": "phone-app"})
+            save_state(state)
+            print(f"call dialed to {target} via Phone app. Next: "
+                  "`call listen --wait-for-speech --max 45`.")
+            return
+        if args.dialer == "phone-app":
+            devices_restore()
+            die("Phone-app dial failed (no Accessibility in this context?). "
+                "Run from a daemon session, or use --dialer url.")
+        log("Phone-app dial unavailable; falling back to tel:// + banner click")
+
     url = f"{scheme}://{target}"
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     before = STATE_DIR / "popup-before.raw"
@@ -316,8 +371,10 @@ def cmd_start(args) -> None:
 
 
 def cmd_end(args) -> None:
-    # Best effort: click the leave/end button, then quit FaceTime (reliably ends call)
+    # Best effort: click the end button, then quit the calling apps (reliably ends)
+    ax_click_desc("Phone", "End")
     ax_click_button("FaceTime", ["Leave", "End", "End Call"])
+    run(["osascript", "-e", 'tell application "Phone" to quit'])
     run(["osascript", "-e", 'tell application "FaceTime" to quit'])
     devices_restore()
     state = load_state()
@@ -508,6 +565,130 @@ def cmd_listen(args) -> None:
         print(text if text else "(unintelligible / no transcript)")
 
 
+# ---------------------------------------------------------------- converse
+
+CONVERSE_SYSTEM = """You are {assistant_name}, an AI assistant speaking on a LIVE PHONE CALL on behalf of {owner_name}.
+
+GOAL OF THIS CALL: {goal}
+
+Rules:
+- You receive the other person's words (speech-to-text, may contain transcription errors — infer intent).
+- Reply with ONLY the words to speak aloud. 1-2 short conversational sentences. No markdown, no stage directions, no emoji.
+- Identify yourself as an AI assistant calling for {owner_name} early in the call.
+- Numbers/times: speak them naturally ("seven thirty" not "7:30").
+- If the goal is achieved or the conversation is clearly over, end your reply with the exact token [HANGUP].
+- If you hear hold music / an automated menu, output [WAIT] alone to keep listening.
+- Stay on-goal, be warm and brief. Phone people hate monologues."""
+
+
+def cmd_converse(args) -> None:
+    """Real-time conversation loop: persistent audio streams + preloaded TTS +
+    whisper + a fast no-thinking LLM turn via the Agent SDK (haiku)."""
+    import asyncio
+    import numpy as np
+    import sounddevice as sd
+    import soundfile as sf
+
+    sys.path.insert(0, str(HOME / ".claude/skills/tts/scripts"))
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    transcript_path = Path(args.transcript or (STATE_DIR / "converse-transcript.txt"))
+
+    def tlog(who: str, text: str) -> None:
+        line = f"[{time.strftime('%H:%M:%S')}] {who}: {text}"
+        log(line)
+        with transcript_path.open("a") as f:
+            f.write(line + "\n")
+
+    # --- preload kokoro once (in-process, no subprocess per phrase)
+    log("loading kokoro TTS...")
+    from kokoro_onnx import Kokoro
+    models = HOME / ".claude/skills/tts/models"
+    kokoro = Kokoro(str(models / "kokoro-v1.0.onnx"), str(models / "voices-v1.0.bin"))
+
+    def speak(text: str) -> None:
+        samples, rate = kokoro.create(text, voice=args.voice, speed=1.05)
+        sd.play(samples, samplerate=rate, device=MIC_DEVICE)
+        sd.wait()
+        tlog("ME", text)
+
+    def hear(max_s: float, silence_s: float = 1.0) -> str:
+        audio, _ = record_vad(device=SPK_DEVICE, max_seconds=max_s,
+                              wait_for_speech=True, silence_s=silence_s,
+                              min_speech_s=0.25, thresh_db=args.threshold_db)
+        if audio is None:
+            return ""
+        return transcribe(audio, RECORD_RATE)
+
+    # --- persistent fast LLM session (haiku, tools off, no thinking)
+    from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
+
+    owner = run([str(HOME / "dispatch/bin/identity"), "owner.name"]).stdout.strip() or "the owner"
+    assistant = run([str(HOME / "dispatch/bin/identity"), "self"]).stdout.strip() or "an assistant"
+    system = CONVERSE_SYSTEM.format(goal=args.goal, owner_name=owner,
+                                    assistant_name=assistant)
+
+    async def _loop():
+        options = ClaudeAgentOptions(
+            cli_path=HOME / ".local" / "bin" / "claude",  # system CLI for OAuth
+            model="claude-haiku-4-5-20251001",
+            system_prompt=system,
+            allowed_tools=[],
+            max_turns=1,
+        )
+        async with ClaudeSDKClient(options=options) as client:
+
+            async def brain(user_text: str) -> str:
+                await client.query(user_text)
+                parts: list[str] = []
+                async for msg in client.receive_response():
+                    for block in getattr(msg, "content", []) or []:
+                        t = getattr(block, "text", None)
+                        if t:
+                            parts.append(t)
+                return "".join(parts).strip()
+
+            # greeting: pre-synthesized feel — speak as soon as speech is heard
+            deadline = time.time() + args.answer_timeout
+            heard = ""
+            while time.time() < deadline and not heard:
+                heard = hear(max_s=min(15, deadline - time.time()))
+            if not heard:
+                tlog("SYS", "no answer detected; leaving message then hanging up")
+                if args.greeting:
+                    speak(args.greeting)
+                return
+            tlog("THEM", heard)
+            if args.greeting:
+                speak(args.greeting)
+
+            silent_rounds = 0
+            end_at = time.time() + args.max_minutes * 60
+            while time.time() < end_at:
+                heard = hear(max_s=args.turn_timeout)
+                if not heard:
+                    silent_rounds += 1
+                    if silent_rounds >= 2:
+                        tlog("SYS", "two silent rounds — assuming hangup")
+                        break
+                    continue
+                silent_rounds = 0
+                tlog("THEM", heard)
+                reply = await brain(heard)
+                if reply.strip() == "[WAIT]":
+                    tlog("SYS", "waiting (hold/menu)")
+                    continue
+                hangup = "[HANGUP]" in reply
+                text = reply.replace("[HANGUP]", "").strip()
+                if text:
+                    speak(text)
+                if hangup:
+                    tlog("SYS", "goal met — hanging up")
+                    break
+
+    asyncio.run(_loop())
+    print(f"conversation finished. Transcript: {transcript_path}")
+
+
 # ---------------------------------------------------------------- self test
 
 def cmd_test_audio(args) -> None:
@@ -613,6 +794,11 @@ def main() -> None:
     sp.add_argument("--facetime", action="store_true",
                     help="force FaceTime Audio for a phone number "
                          "(default for numbers is cellular via tethered iPhone)")
+    sp.add_argument("--dialer", choices=["auto", "phone-app", "url"],
+                    default="auto",
+                    help="phone-app: AX-drive the Phone app keypad (needs "
+                         "daemon context); url: tel:// + banner click; "
+                         "auto: try phone-app, fall back to url")
     sp.set_defaults(func=cmd_start)
 
     sp = sub.add_parser("say", help="speak text into the active call")
@@ -640,6 +826,19 @@ def main() -> None:
     sp.add_argument("--json", action="store_true")
     sp.add_argument("--device", help=f"override input device (default {SPK_DEVICE})")
     sp.set_defaults(func=cmd_listen)
+
+    sp = sub.add_parser("converse", help="real-time conversation loop (run right after start)")
+    sp.add_argument("--goal", required=True, help="what this call is trying to accomplish")
+    sp.add_argument("--greeting", help="opening line, spoken when they answer")
+    sp.add_argument("--voice", default="af_nova")
+    sp.add_argument("--answer-timeout", type=float, default=35,
+                    help="seconds to wait for first speech (default 35)")
+    sp.add_argument("--turn-timeout", type=float, default=20,
+                    help="max seconds to wait for them to speak each turn")
+    sp.add_argument("--max-minutes", type=float, default=8)
+    sp.add_argument("--threshold-db", type=float, default=-45)
+    sp.add_argument("--transcript", help="transcript file path")
+    sp.set_defaults(func=cmd_converse)
 
     sp = sub.add_parser("end", help="hang up and restore audio devices")
     sp.set_defaults(func=cmd_end)

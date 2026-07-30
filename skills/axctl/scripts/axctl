@@ -423,6 +423,46 @@ def click(
 
 
 @app.command()
+def clickseq(
+    app_name: Annotated[str, typer.Argument(help="Application name")],
+    descs: Annotated[str, typer.Argument(help="Comma-separated AXDescription sequence, e.g. 'Keypad,1,5,5,5,Call'")],
+    delay: Annotated[float, typer.Option("--delay", help="Seconds between clicks")] = 0.15,
+    retries: Annotated[int, typer.Option("--retries", help="Retries per element (element may not exist yet)")] = 6,
+):
+    """
+    Click a sequence of elements by AXDescription in ONE process (fast).
+
+    Re-searches before each click so elements that appear after a prior click
+    (e.g. keypad digits after opening the Keypad view) are found. Exits 1 on
+    the first element that never appears.
+
+    Example: axctl clickseq Phone "Keypad,1,5,1,8,2,5,8,7,8,7,6,Call"
+    """
+    import time as _time
+
+    app_element = get_application_by_name(app_name)
+    if not app_element:
+        err_console.print(f"[red]Error: application '{app_name}' not found[/red]")
+        raise typer.Exit(1)
+
+    for desc in [d.strip() for d in descs.split(",") if d.strip()]:
+        element = None
+        for attempt in range(retries):
+            matches = find_by_description(app_element, desc)
+            if matches:
+                element = matches[0]
+                break
+            _time.sleep(0.5)
+        if element is None:
+            err_console.print(f"[red]Error: element '{desc}' never appeared[/red]")
+            raise typer.Exit(1)
+        perform_action(element, "AXPress")
+        console.print(f"[green]{desc}[/green]", end=" ")
+        _time.sleep(delay)
+    console.print("")
+
+
+@app.command()
 def action(
     app_name: Annotated[str, typer.Argument(help="Application name")],
     action_name: Annotated[str, typer.Argument(help="Action to perform (e.g., AXPress, AXOpen)")],

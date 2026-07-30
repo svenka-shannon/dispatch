@@ -19,11 +19,18 @@ call say "..."   TTS (kokoro) ──► BlackHole 2ch ──► FaceTime microph
 call listen      far end ──► FaceTime output ──► BlackHole 16ch ──► VAD record ──► whisper ──► text
 ```
 
-`call start` sets system default input/output to the BlackHole devices (saving
-your real defaults), opens `tel://<number>` (or `facetime-audio://` for Apple
-IDs), and confirms FaceTime's "place call?" dialog (axctl; falls back to a
-cliclick Return-key press).
-`call end` hangs up (quits FaceTime) and restores audio devices.
+`call start` routes system default input/output to the BlackHole devices
+(saving your real defaults), then dials numbers by AX-driving the **Phone
+app keypad** (quit-and-relaunch first — Phone binds its audio devices at
+launch, so dialing with a stale Phone.app records silence; one `axctl
+clickseq` presses Keypad + digits + Call). Apple ID emails fall back to
+`facetime-audio://` + notification-banner click. `call end` hangs up (quits
+Phone/FaceTime) and restores audio devices.
+
+**Run calls from a daemon-spawned session** (normal chat/task sessions). The
+launchd context holds the Accessibility AND Microphone grants; a plain
+Terminal has mic but no AX, so dialing fails there (`--dialer url` +
+granting Terminal Accessibility is the workaround).
 
 Who can be called:
 - **Any phone number** (restaurants, businesses, landlines, Android): phone
@@ -39,20 +46,31 @@ Calling a business? Expect an IVR/hold music: use `call listen --max 60`
 (fixed window) for menus, and `say` digits won't work — DTMF is not supported
 yet; pick lines that a human answers, or note the limitation to the user.
 
-## Conducting a call (the loop YOU drive)
+## Conducting a call — use `converse` (fast, default)
+
+`converse` is a real-time loop in ONE process: persistent audio streams,
+preloaded kokoro, whisper, and a no-tools Haiku turn via the Agent SDK
+(~3-6s from their last word to your voice — CLI-per-turn is way too slow
+for a live call). YOU set the goal; the loop holds the conversation and
+hangs up when the goal is met.
 
 ```bash
 CALL=~/.claude/skills/phone-calls/scripts/call
 
-$CALL doctor                                   # first time: verify setup
-$CALL start "+15551234567"                     # or an Apple ID email
-$CALL listen --wait-for-speech --max 45        # wait for them to answer + speak
-$CALL say "Hi! This is Svenka, Eric's AI assistant, calling about ..."
-$CALL listen --wait-for-speech                 # hear their reply (prints transcript)
-# ...think, then say/listen repeatedly...
-$CALL say "Thanks, goodbye!"
-$CALL end                                      # ALWAYS end — restores audio devices
+$CALL doctor                       # first time: verify setup
+$CALL start "+15551234567"         # dials via Phone app keypad (AX)
+$CALL converse \
+  --goal "Book a table for 2 at 7:30pm tonight under Maynard; if 7:30 unavailable take anything 7-8pm" \
+  --greeting "Hi! I'm Svenka, an AI assistant calling for Eric Maynard. I'd like to book a table." \
+  --transcript /tmp/phone-call/reservation.txt
+$CALL end                          # ALWAYS end — restores audio devices
+cat /tmp/phone-call/reservation.txt   # then report the outcome to the user
 ```
+
+Manual per-turn primitives (`say` / `listen`) still exist for special cases
+(leaving a voicemail, playing a pre-made recording), but do NOT drive a live
+conversation with them — each invocation pays process+model startup and the
+callee will hang up on the dead air.
 
 Conversation rules:
 - **Always identify yourself as an AI assistant** at the start of the call.

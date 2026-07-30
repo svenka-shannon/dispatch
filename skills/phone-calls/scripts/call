@@ -996,7 +996,7 @@ def cmd_test_audio(args) -> None:
         die(f"'{MIC_DEVICE}' not installed — brew install blackhole-2ch blackhole-16ch")
     phrase = "This is a loopback test of the phone call audio pipeline."
     log("generating TTS...")
-    wav = tts_generate(phrase, "kokoro", "af_nova", None, 1.0)
+    wav = tts_generate(phrase, "kokoro", "af_heart", None, 1.0)
 
     import threading
     result: dict = {}
@@ -1099,7 +1099,7 @@ def main() -> None:
 
     sp = sub.add_parser("say", help="speak text into the active call")
     sp.add_argument("text", nargs="?", default="")
-    sp.add_argument("--voice", default="af_heart", help="kokoro voice (default af_nova)")
+    sp.add_argument("--voice", default="af_heart", help="kokoro voice (default af_heart)")
     sp.add_argument("--engine", choices=["kokoro", "qwen"], default="kokoro")
     sp.add_argument("--style", help="qwen voice style prompt")
     sp.add_argument("--speed", type=float, default=1.0)

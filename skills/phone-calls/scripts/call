@@ -145,6 +145,82 @@ def devices_restore() -> None:
 
 # ---------------------------------------------------------------- UI driving
 
+GRANTED_PY = HOME / ".local/share/uv/python/cpython-3.14.4-macos-aarch64-none/bin/python3.14"
+# top-right region where the "click to call" notification banner appears
+POPUP_REGION = (1300, 0, 620, 320)  # x, y, w, h in screen points
+
+
+def capture_region_raw(out_path: Path) -> tuple[int, int] | None:
+    """Capture POPUP_REGION as raw RGBA via the screen-recording-granted python.
+    Returns (width, height) or None on failure."""
+    x, y, w, h = POPUP_REGION
+    code = f"""
+import Quartz, sys
+r = Quartz.CGRectMake({x}, {y}, {w}, {h})
+img = Quartz.CGDisplayCreateImageForRect(Quartz.CGMainDisplayID(), r)
+if img is None:
+    sys.exit(3)
+prov = Quartz.CGImageGetDataProvider(img)
+data = Quartz.CGDataProviderCopyData(prov)
+w2, h2 = Quartz.CGImageGetWidth(img), Quartz.CGImageGetHeight(img)
+bpr = Quartz.CGImageGetBytesPerRow(img)
+with open({str(out_path)!r}, "wb") as f:
+    f.write(f"{{w2}} {{h2}} {{bpr}}\\n".encode())
+    f.write(bytes(data))
+"""
+    try:
+        r = subprocess.run(
+            ["uv", "run", "--no-project", "--python", str(GRANTED_PY),
+             "--with", "pyobjc-framework-Quartz", "python", "-c", code],
+            capture_output=True, timeout=90)
+        if r.returncode != 0:
+            return None
+        header = out_path.open("rb").readline().split()
+        return int(header[0]), int(header[1])
+    except Exception:
+        return None
+
+
+def _load_raw(path: Path):
+    import numpy as np
+    with path.open("rb") as f:
+        w, h, bpr = (int(v) for v in f.readline().split())
+        buf = f.read()
+    arr = np.frombuffer(buf, dtype=np.uint8)
+    arr = arr[: h * bpr].reshape(h, bpr)[:, : w * 4].reshape(h, w, 4)
+    return arr[:, :, :3].astype("int16")
+
+
+def click_call_popup(before: Path, timeout_s: float = 12) -> bool:
+    """macOS shows call confirmations as a notification banner (top-right).
+    Diff the region against the pre-open capture, click the changed area."""
+    import numpy as np
+    x0, y0, _, _ = POPUP_REGION
+    ref = _load_raw(before)
+    scale_x = ref.shape[1] / POPUP_REGION[2]  # retina pixel -> point scale
+    scale_y = ref.shape[0] / POPUP_REGION[3]
+    deadline = time.time() + timeout_s
+    after = STATE_DIR / "popup-after.raw"
+    while time.time() < deadline:
+        time.sleep(1.5)
+        if capture_region_raw(after) is None:
+            return False
+        cur = _load_raw(after)
+        if cur.shape != ref.shape:
+            return False
+        diff = (np.abs(cur - ref).sum(axis=2) > 40)
+        if diff.sum() < 4000:  # banner is ~350x80pt -> way more pixels
+            continue
+        ys, xs = np.nonzero(diff)
+        cx = x0 + int(xs.mean() / scale_x)
+        cy = y0 + int(ys.mean() / scale_y)
+        r = run([CLICLICK, f"c:{cx},{cy}"])
+        if r.returncode == 0:
+            log(f"clicked call popup at ({cx},{cy})")
+            return True
+        return False
+    return False
+
 def axctl_available() -> bool:
     """True if this process can use the Accessibility API (daemon sessions: yes;
     plain Terminal: usually no)."""
@@ -209,16 +285,23 @@ def cmd_start(args) -> None:
     else:
         scheme = "tel"
     url = f"{scheme}://{target}"
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    before = STATE_DIR / "popup-before.raw"
+    have_ref = capture_region_raw(before) is not None
     log(f"placing call: {url}")
     r = run(["open", url])
     if r.returncode != 0:
         devices_restore()
         die(f"failed to open {url}: {r.stderr.strip()}")
-    time.sleep(2.5)
-    run(["open", "-a", "FaceTime"])
 
-    # FaceTime shows a confirmation prompt for URL-initiated calls.
-    confirmed = ax_click_button("FaceTime", ["Call", "Call Using iPhone", target])
+    # macOS confirms URL-initiated calls with a "click to call" notification
+    # banner in the top-right — click it via screen-diff + cliclick.
+    confirmed = click_call_popup(before) if have_ref else False
+    if not confirmed:
+        # older flow: an in-app FaceTime dialog with a default Call button
+        time.sleep(1.5)
+        run(["open", "-a", "FaceTime"])
+        confirmed = ax_click_button("FaceTime", ["Call", "Call Using iPhone", target])
     if not confirmed:
         confirmed = press_return_fallback()
     if not confirmed:

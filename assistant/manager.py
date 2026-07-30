@@ -2264,18 +2264,38 @@ class Manager:
         return ConsumerRunner(self._bus, configs)
 
     def _start_consumer_thread(self):
-        """Start ConsumerRunner in a background thread with auto-restart."""
+        """Start ConsumerRunner in a background thread with auto-restart.
+
+        Exactly ONE consumer thread may drive the runner. Two instances fence
+        each other forever: each rebuild joins the groups, bumping generations,
+        which raises StaleGenerationError in the other instance, which rebuilds
+        and fences back — an infinite crash loop (8.6k crashes, July 2026).
+        Guards:
+          - a superseded thread (manager._consumer_thread no longer itself)
+            exits instead of competing;
+          - run_forever() returning cleanly (deliberate stop()) ends the
+            thread instead of respawning the runner.
+        """
         def _run():
+            import time
             while True:
+                if getattr(self, "_consumer_thread", None) is not threading.current_thread():
+                    log.info("ConsumerRunner thread superseded — exiting")
+                    return
                 try:
                     log.info("ConsumerRunner started (background thread)")
                     self._consumer_runner.run_forever(poll_interval_ms=500)
+                    # Clean return = deliberate stop() — do NOT respawn.
+                    log.info("ConsumerRunner stopped cleanly — consumer thread exiting")
+                    return
                 except Exception as e:
                     log.error(f"ConsumerRunner crashed: {e} — restarting in 5s")
                     produce_event(self._producer, "system", "consumer.crashed",
                         {"error": str(e)}, source="consumer")
-                    import time
                     time.sleep(5)
+                    if getattr(self, "_consumer_thread", None) is not threading.current_thread():
+                        log.info("ConsumerRunner thread superseded during backoff — exiting")
+                        return
                     # Rebuild consumer runner so it gets fresh DB connections
                     try:
                         self._consumer_runner = self._init_consumers()
@@ -2289,6 +2309,9 @@ class Manager:
             name="bus-consumer-runner",
             daemon=True,
         )
+        # Publish the thread as the one-and-only BEFORE it starts so the
+        # supersession check can never race a fresh thread against itself.
+        self._consumer_thread = thread
         thread.start()
         return thread
 

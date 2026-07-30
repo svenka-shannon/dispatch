@@ -900,6 +900,10 @@ def check_quota_thresholds(usage: dict) -> list[dict[str, Any]]:
         util = block.get("utilization")
         if util is None:
             continue
+        try:
+            util = float(util)
+        except (TypeError, ValueError):
+            continue  # API sometimes returns strings; unparseable → skip
         resets_at = block.get("resets_at", "unknown")
 
         # Normalize resets_at to minute precision for stable cache keys.

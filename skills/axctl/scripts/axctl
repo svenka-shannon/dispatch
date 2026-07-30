@@ -202,8 +202,14 @@ class TreeBuilder:
 
         return obj
 
-    def build_tree(self, element, add_refs: bool = False) -> dict:
-        """Recursively build tree structure."""
+    def build_tree(self, element, add_refs: bool = False, _depth: int = 0) -> dict:
+        """Recursively build tree structure.
+
+        Bounded at _MAX_DEPTH — some apps (e.g. Phone.app in certain states)
+        expose cyclic/very deep AX trees that otherwise blow the stack with a
+        RecursionError.
+        """
+        _MAX_DEPTH = 200
         obj = self._element_to_dict(element)
 
         if add_refs:
@@ -211,9 +217,14 @@ class TreeBuilder:
             obj["_ref"] = ref
             self._ref_map[ref] = element
 
+        if _depth >= _MAX_DEPTH:
+            obj["AXChildren"] = []
+            obj["_truncated"] = True
+            return obj
+
         children = get_children(element)
         obj["AXChildren"] = [
-            self.build_tree(child, add_refs) for child in children
+            self.build_tree(child, add_refs, _depth + 1) for child in children
         ]
 
         return obj

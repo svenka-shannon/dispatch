@@ -316,7 +316,23 @@ def dial_via_phone_app(number: str) -> bool:
             return True
         log(f"clickseq dial attempt {attempt} failed: "
             f"{(r.stderr or r.stdout).strip()[-200:]}")
+    # Keypad never rendered — almost always means the paired iPhone isn't
+    # reachable for Continuity calling (asleep, off-network, or away).
+    if not iphone_available():
+        log("Phone app has no Keypad — the paired iPhone isn't connected for "
+            "Continuity calling (needs the iPhone on, unlocked-ish, same "
+            "Wi-Fi/Bluetooth, Calls on Other Devices enabled).")
     return False
+
+
+def iphone_available() -> bool:
+    """Best-effort: is the paired iPhone reachable for 'Calls from iPhone'?
+    The Phone app only shows the Keypad button when it is; use that as the
+    signal."""
+    run(["open", "-a", "Phone"])
+    time.sleep(2)
+    r = run([str(AXCTL), "search", "Phone", "--desc", "Keypad"], timeout=20)
+    return r.returncode == 0 and "Keypad" in (r.stdout + r.stderr)
 
 
 def press_return_fallback() -> bool:
@@ -371,8 +387,11 @@ def cmd_start(args) -> None:
             return
         if args.dialer == "phone-app":
             devices_restore()
-            die("Phone-app dial failed (no Accessibility in this context?). "
-                "Run from a daemon session, or use --dialer url.")
+            die("Phone-app dial failed: the Keypad never rendered. Usually the "
+                "paired iPhone isn't connected for Continuity calling (iPhone "
+                "on + same Wi-Fi/Bluetooth + Settings>Phone>Calls on Other "
+                "Devices enabled). Less commonly, no Accessibility in this "
+                "context — run from a daemon session, or try --dialer url.")
         log("Phone-app dial unavailable; falling back to tel:// + banner click")
 
     url = f"{scheme}://{target}"

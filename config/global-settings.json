@@ -1,11 +1,11 @@
 {
   "permissions": {
-    "defaultMode": "auto",
     "allow": [
       "Bash(git push origin main)",
       "Bash(git push origin HEAD)",
       "Bash(git push origin HEAD:main)"
-    ]
+    ],
+    "defaultMode": "auto"
   },
   "hooks": {
     "PreToolUse": [
@@ -22,6 +22,8 @@
     ],
     "PostToolUseFailure": []
   },
+  "tui": "fullscreen",
   "skipDangerousModePermissionPrompt": true,
-  "skipAutoPermissionPrompt": true
+  "skipAutoPermissionPrompt": true,
+  "model": "claude-fable-5[1m]"
 }

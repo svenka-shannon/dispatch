@@ -197,7 +197,17 @@ def normalize_target(target: str) -> str:
 def cmd_start(args) -> None:
     target = normalize_target(args.target)
     devices_setup()
-    scheme = "facetime" if args.video else "facetime-audio"
+    # Apple IDs (emails) can only go over FaceTime. Phone numbers default to
+    # tel:// which FaceTime relays over the tethered iPhone's cellular line
+    # (Continuity "Calls from iPhone") — reaches restaurants, landlines, any
+    # number. --facetime forces FaceTime Audio (Apple devices only, no iPhone
+    # needed).
+    if args.video:
+        scheme = "facetime"
+    elif "@" in target or args.facetime:
+        scheme = "facetime-audio"
+    else:
+        scheme = "tel"
     url = f"{scheme}://{target}"
     log(f"placing call: {url}")
     r = run(["open", url])
@@ -208,7 +218,7 @@ def cmd_start(args) -> None:
     run(["open", "-a", "FaceTime"])
 
     # FaceTime shows a confirmation prompt for URL-initiated calls.
-    confirmed = ax_click_button("FaceTime", ["Call", target])
+    confirmed = ax_click_button("FaceTime", ["Call", "Call Using iPhone", target])
     if not confirmed:
         confirmed = press_return_fallback()
     if not confirmed:
@@ -517,6 +527,9 @@ def main() -> None:
     sp = sub.add_parser("start", help="place a FaceTime Audio call")
     sp.add_argument("target", help="phone number (+1...) or Apple ID email")
     sp.add_argument("--video", action="store_true", help="FaceTime video instead of audio")
+    sp.add_argument("--facetime", action="store_true",
+                    help="force FaceTime Audio for a phone number "
+                         "(default for numbers is cellular via tethered iPhone)")
     sp.set_defaults(func=cmd_start)
 
     sp = sub.add_parser("say", help="speak text into the active call")

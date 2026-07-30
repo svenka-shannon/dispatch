@@ -1,6 +1,6 @@
 ---
 name: phone-calls
-description: Make and conduct real voice phone calls (FaceTime Audio) — the agent speaks with TTS and hears via whisper transcription. Use when asked to call someone, phone someone, make a voice call, or talk to someone by phone. Trigger words - call, phone call, ring, dial, facetime, voice call.
+description: Make and conduct real voice phone calls — any phone number (restaurants, businesses) via the tethered iPhone's cellular line, or FaceTime Audio to Apple users. The agent speaks with TTS and hears via whisper transcription. Use when asked to call someone, phone a business, make a reservation by phone, or talk to someone by voice. Trigger words - call, phone call, ring, dial, facetime, voice call, call the restaurant.
 ---
 
 # Phone Calls (FaceTime Audio + TTS + Whisper)
@@ -20,13 +20,24 @@ call listen      far end ──► FaceTime output ──► BlackHole 16ch ─�
 ```
 
 `call start` sets system default input/output to the BlackHole devices (saving
-your real defaults), opens `facetime-audio://<target>`, and confirms FaceTime's
-"place call?" dialog (axctl; falls back to a cliclick Return-key press).
+your real defaults), opens `tel://<number>` (or `facetime-audio://` for Apple
+IDs), and confirms FaceTime's "place call?" dialog (axctl; falls back to a
+cliclick Return-key press).
 `call end` hangs up (quits FaceTime) and restores audio devices.
 
-Who can be called: any Apple user (iPhone/iPad/Mac) by phone number or Apple ID
-email — calls ride FaceTime Audio, no carrier needed. Plain landlines/Android
-are NOT reachable (would need iPhone Continuity or a VoIP provider).
+Who can be called:
+- **Any phone number** (restaurants, businesses, landlines, Android): phone
+  numbers dial as `tel://`, which FaceTime relays over the **tethered
+  iPhone's cellular line** (Continuity "Calls from iPhone"). Requires the
+  iPhone signed into the same Apple ID, on the same Wi-Fi, with
+  Settings → Phone → Calls on Other Devices → this Mac enabled. The call
+  goes out from the iPhone's number.
+- **Apple IDs** (emails) ride FaceTime Audio directly — no iPhone needed.
+  `--facetime` forces FaceTime Audio for a phone number too.
+
+Calling a business? Expect an IVR/hold music: use `call listen --max 60`
+(fixed window) for menus, and `say` digits won't work — DTMF is not supported
+yet; pick lines that a human answers, or note the limitation to the user.
 
 ## Conducting a call (the loop YOU drive)
 
@@ -61,7 +72,7 @@ Conversation rules:
 | Command | Purpose |
 |---|---|
 | `call doctor` | Check all prerequisites (BlackHole, whisper, TTS, AX) |
-| `call start <tel-or-email> [--video]` | Place call |
+| `call start <tel-or-email> [--facetime] [--video]` | Place call (numbers → cellular via iPhone; emails → FaceTime) |
 | `call say "text" [--voice af_nova] [--engine qwen --style "..."]` | Speak |
 | `call listen [--wait-for-speech] [--max N] [--json] [--raw f.wav]` | Hear + transcribe |
 | `call status` | In-call state + audio routing |

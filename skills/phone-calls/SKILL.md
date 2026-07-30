@@ -50,7 +50,7 @@ yet; pick lines that a human answers, or note the limitation to the user.
 
 `converse` is a real-time loop in ONE process: persistent audio streams,
 preloaded kokoro, whisper, and a no-tools Haiku turn via the Agent SDK
-(~3-6s from their last word to your voice — CLI-per-turn is way too slow
+(~1.6-1.7s from their last word to your voice — CLI-per-turn was way too slow
 for a live call). YOU set the goal; the loop holds the conversation and
 hangs up when the goal is met.
 

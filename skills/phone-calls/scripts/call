@@ -778,6 +778,24 @@ def cmd_converse(args) -> None:
                 return (" ".join(spoken), hangup, False,
                         first_audio or 0.0, audio_dur)
 
+            # Warm the pipelines while the phone is still ringing so turn 1
+            # doesn't pay cold-start (~1.5s saved on the first real reply):
+            # kokoro's first synth, whisper's first decode, and the SDK's
+            # first token all have startup cost.
+            try:
+                import numpy as _np
+                await asyncio.to_thread(kokoro.create, "Hello.",
+                                        voice=args.voice, speed=1.0)
+                await asyncio.to_thread(
+                    transcribe, _np.zeros(RECORD_RATE // 2, dtype="float32"),
+                    RECORD_RATE)
+                await client.query("Reply with exactly the word: ready")
+                async for _m in client.receive_response():
+                    pass
+                log("pipelines warmed")
+            except Exception as e:
+                log(f"warmup skipped: {e}")
+
             deadline = time.time() + args.answer_timeout
             heard = ""
             while time.time() < deadline and not heard:

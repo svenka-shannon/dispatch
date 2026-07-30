@@ -856,3 +856,87 @@ class TestConsumerRunnerDeferredCommits:
 
         runner.stop()
         producer.close()
+
+
+# ─── Fencing resilience (self-fencing crash-loop regression) ────────────────
+#
+# July 2026 incident: one fenced consumer (StaleGenerationError) crashed the
+# ENTIRE ConsumerRunner; the restart wrapper + dependency-health recovery then
+# ran two runner instances that fenced each other forever (8.6k crashes).
+# The runner must absorb fencing per-consumer: rejoin that group, keep going.
+
+
+class TestFencingResilience:
+    def test_fenced_consumer_rejoins_without_crashing_runner(self, bus):
+        bus.create_topic("events")
+        producer = bus.producer()
+        producer.send("events", value={"n": 1})
+        producer.flush()
+
+        processed = []
+        runner = ConsumerRunner(bus, [
+            ConsumerConfig(
+                topic="events",
+                group="fence-me",
+                action=actions.call_function(lambda rs: processed.extend(rs)),
+            ),
+        ])
+        runner.run_once()
+        assert len(processed) == 1
+
+        # An interloper (one-shot CLI consumer) joins the same group,
+        # bumping the generation and fencing the runner's member.
+        interloper = bus.consumer(group_id="fence-me", topics=["events"])
+        interloper.close()
+
+        # run_once must NOT raise — the runner rejoins the group in place.
+        old_consumer = runner._consumers["fence-me"]
+        runner.run_once()
+        assert runner._consumers["fence-me"] is not old_consumer  # rejoined
+
+        # And the rejoined consumer still processes new records.
+        producer.send("events", value={"n": 2})
+        producer.flush()
+        runner.run_once()
+        assert [r.value["n"] for r in processed] == [1, 2]
+
+        runner.stop()
+        producer.close()
+
+    def test_fenced_batch_consumer_resets_state_and_repolls(self, bus):
+        bus.create_topic("events")
+        producer = bus.producer()
+        producer.send("events", value={"n": 1})
+        producer.flush()
+
+        batches = []
+        runner = ConsumerRunner(bus, [
+            ConsumerConfig(
+                topic="events",
+                group="fence-batch",
+                batch=BatchConfig(window_seconds=9999),
+                action=actions.call_function(lambda rs: batches.append(list(rs))),
+            ),
+        ])
+        runner.run_once()  # record accumulates in batch state, not dispatched
+        assert runner._batch_states["fence-batch"].records
+
+        interloper = bus.consumer(group_id="fence-batch", topics=["events"])
+        interloper.close()
+
+        runner.run_once()  # fenced → rejoin; batch state must be dropped
+        assert not batches or all(b for b in batches)
+        # Uncommitted record re-polls under the fresh member on a later round.
+        deadline = time.time() + 2
+        seen = set()
+        while time.time() < deadline:
+            runner.run_once()
+            seen = {r.value["n"] for b in batches for r in b}
+            for st in runner._batch_states.values():
+                seen |= {r.value["n"] for r in st.records}
+            if 1 in seen:
+                break
+        assert 1 in seen, "record lost after fencing rejoin"
+
+        runner.stop()
+        producer.close()

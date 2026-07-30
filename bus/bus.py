@@ -287,6 +287,18 @@ class Bus:
                 is_busy INTEGER NOT NULL DEFAULT 0,
                 updated_at INTEGER NOT NULL
             ) WITHOUT ROWID;
+
+            -- Durable per-topic-partition offset counter. Offsets must NEVER
+            -- be reused: deriving next-offset from MAX(records.offset) breaks
+            -- once retention archives every row of a topic (offsets restart at
+            -- 0 while consumer committed offsets stay high, deafening every
+            -- consumer of that topic). This counter only moves forward.
+            CREATE TABLE IF NOT EXISTS topic_offsets (
+                topic TEXT NOT NULL,
+                partition INTEGER NOT NULL,
+                next_offset INTEGER NOT NULL,
+                PRIMARY KEY (topic, partition)
+            ) WITHOUT ROWID;
         """)
 
         # Migration: add archive column to topics table (defaults to 1 = enabled)
@@ -998,18 +1010,42 @@ class Producer:
         return row[0]
 
     def _get_next_offset(self, topic: str, partition: int) -> int:
-        """Get next offset for a topic+partition, using cache to avoid MAX queries."""
+        """Get next offset for a topic+partition, using cache to avoid DB queries.
+
+        Backed by the durable topic_offsets counter so offsets are never reused
+        after retention archives a topic's live rows. On first use (or for DBs
+        predating the counter) it is seeded from the max of: live records,
+        archived records, and any committed consumer offset — so it can never
+        regress below what a consumer has already seen.
+        """
         cache_key = (topic, partition)
         if cache_key in self._offset_cache:
             offset = self._offset_cache[cache_key]
             self._offset_cache[cache_key] = offset + 1
             return offset
-        # First call: query the DB
+        # First call: read the durable counter, seeding it if absent.
         cursor = self._conn.execute(
-            "SELECT COALESCE(MAX(offset), -1) + 1 FROM records WHERE topic = ? AND partition = ?",
+            "SELECT next_offset FROM topic_offsets WHERE topic = ? AND partition = ?",
             (topic, partition),
         )
-        next_offset = cursor.fetchone()[0]
+        row = cursor.fetchone()
+        if row is not None:
+            next_offset = row[0]
+        else:
+            cursor = self._conn.execute(
+                """
+                SELECT MAX(
+                    COALESCE((SELECT MAX(offset) FROM records
+                              WHERE topic = :t AND partition = :p), -1),
+                    COALESCE((SELECT MAX(offset) FROM records_archive
+                              WHERE topic = :t AND partition = :p), -1),
+                    COALESCE((SELECT MAX(committed_offset) FROM consumer_offsets
+                              WHERE topic = :t AND partition = :p), -1)
+                ) + 1
+                """,
+                {"t": topic, "p": partition},
+            )
+            next_offset = cursor.fetchone()[0]
         self._offset_cache[cache_key] = next_offset + 1
         return next_offset
 
@@ -1052,6 +1088,16 @@ class Producer:
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (topic, target_partition, next_offset, item["timestamp"], key,
              item["type"], item["source"], item["payload_json"], item["headers_json"]),
+        )
+
+        # Persist the durable offset counter in the same transaction as the
+        # record insert. Monotonic guard: never move the counter backwards
+        # (e.g. a second producer with a colder cache).
+        self._conn.execute(
+            "INSERT INTO topic_offsets (topic, partition, next_offset) VALUES (?, ?, ?) "
+            "ON CONFLICT(topic, partition) DO UPDATE SET next_offset = excluded.next_offset "
+            "WHERE excluded.next_offset > topic_offsets.next_offset",
+            (topic, target_partition, next_offset + 1),
         )
 
         logger.debug("Produced %s[%d]@%d key=%s type=%s", topic, target_partition, next_offset, key, item["type"])
@@ -1390,12 +1436,7 @@ class Consumer:
             # Initialize offsets for new assignments
             for tp in self._assigned:
                 if self.auto_offset_reset == "latest":
-                    # Get latest offset
-                    cursor3 = self._conn.execute(
-                        "SELECT COALESCE(MAX(offset), -1) FROM records WHERE topic = ? AND partition = ?",
-                        (tp.topic, tp.partition),
-                    )
-                    default_offset = cursor3.fetchone()[0]
+                    default_offset = _latest_offset(self._conn, tp.topic, tp.partition)
                 else:  # "earliest"
                     default_offset = -1
 
@@ -1645,11 +1686,7 @@ class Consumer:
                 continue
             if partition is not None and tp.partition != partition:
                 continue
-            cursor = self._conn.execute(
-                "SELECT COALESCE(MAX(offset), -1) FROM records WHERE topic = ? AND partition = ?",
-                (tp.topic, tp.partition),
-            )
-            max_offset = cursor.fetchone()[0]
+            max_offset = _latest_offset(self._conn, tp.topic, tp.partition)
             self._conn.execute(
                 "INSERT OR REPLACE INTO consumer_offsets "
                 "(group_id, topic, partition, committed_offset, generation, updated_at) "
@@ -1742,6 +1779,27 @@ class Consumer:
 class StaleGenerationError(Exception):
     """Raised when a consumer tries to commit with a stale generation ID."""
     pass
+
+
+def _latest_offset(conn, topic: str, partition: int) -> int:
+    """Latest allocated offset for a topic+partition (-1 if none ever).
+
+    Prefers the durable topic_offsets counter — MAX(records.offset) regresses
+    once retention archives a topic's live rows, which would make "latest"
+    rewind and replay/skip incorrectly.
+    """
+    cursor = conn.execute(
+        "SELECT next_offset - 1 FROM topic_offsets WHERE topic = ? AND partition = ?",
+        (topic, partition),
+    )
+    row = cursor.fetchone()
+    if row is not None:
+        return row[0]
+    cursor = conn.execute(
+        "SELECT COALESCE(MAX(offset), -1) FROM records WHERE topic = ? AND partition = ?",
+        (topic, partition),
+    )
+    return cursor.fetchone()[0]
 
 
 def _now_ms() -> int:

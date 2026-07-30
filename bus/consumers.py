@@ -35,7 +35,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .bus import Bus, Record
+from .bus import Bus, Record, StaleGenerationError
 
 logger = logging.getLogger("bus.consumers")
 
@@ -322,7 +322,10 @@ class ConsumerRunner:
                 state = self._batch_states[config.group]
                 if state.records:
                     self._dispatch(config, state.records)
-                    consumer.commit()
+                    try:
+                        consumer.commit()
+                    except StaleGenerationError:
+                        pass  # fenced during shutdown — records re-poll next start
                     state.reset()
             # Flush any deferred commits on shutdown
             if config.group in self._pending_commit:
@@ -353,8 +356,60 @@ class ConsumerRunner:
         self._last_commit[config.group] = time.monotonic()
         self._pending_commit.discard(config.group)
 
+    def _rejoin_consumer(self, config: ConsumerConfig):
+        """Replace a fenced consumer with a fresh group member.
+
+        A one-shot CLI consumer (bus tail/peek/debug) joining the same group —
+        or a second runner instance — bumps the group generation and fences our
+        member. Fencing one consumer must NOT crash the whole runner: rejoin
+        just that group and carry on. Uncommitted records re-poll under the new
+        member, so any accumulated batch state is dropped (not lost — re-read).
+        """
+        old = self._consumers.pop(config.group, None)
+        if old is not None:
+            try:
+                old.close()  # close() tolerates a fenced commit internally
+            except Exception:
+                pass
+        self._consumers[config.group] = self.bus.consumer(
+            group_id=config.group,
+            topics=[config.topic],
+        )
+        if config.batch and config.group in self._batch_states:
+            # Batch mode commits at poll time, so accumulated records may
+            # already be past the committed offset — dropping them here would
+            # lose them for good. Flush them now instead. (If the fence beat
+            # the commit, the fresh member re-polls them → possible duplicate
+            # dispatch, which batch consumers must tolerate anyway.)
+            state = self._batch_states[config.group]
+            if state.records:
+                try:
+                    self._dispatch(config, state.records)
+                except Exception:
+                    logger.exception(
+                        "Batch flush during '%s' rejoin failed — %d record(s) dropped",
+                        config.group, len(state.records),
+                    )
+            state.reset()
+        self._pending_commit.discard(config.group)
+        logger.warning(
+            "Consumer group '%s' fenced by rebalance — rejoined with a fresh member",
+            config.group,
+        )
+
     def _process_consumer(self, config: ConsumerConfig) -> int:
-        """Process one consumer. Returns number of records dispatched."""
+        """Process one consumer. Returns number of records dispatched.
+
+        StaleGenerationError (from poll or commit) is handled here by rejoining
+        THIS consumer only — it must never crash the whole runner.
+        """
+        try:
+            return self._process_consumer_inner(config)
+        except StaleGenerationError:
+            self._rejoin_consumer(config)
+            return 0
+
+    def _process_consumer_inner(self, config: ConsumerConfig) -> int:
         consumer = self._consumers.get(config.group)
         if not consumer:
             return 0

@@ -2059,3 +2059,106 @@ class TestAssignedPartitionsProperty:
         assigned.clear()  # mutate the copy
         assert len(c.assigned_partitions) == 4  # internal state unchanged
         c.close()
+
+
+# ─── Offset durability across retention (offset-reuse regression) ──────────
+#
+# Regression tests for the July 2026 incident: next-offset was derived from
+# MAX(records.offset), so when retention archived EVERY live row of a topic,
+# offsets restarted at 0 while consumer committed offsets kept their old
+# high-water marks — consumers went permanently deaf on that topic (all
+# task.requested events were silently dropped for days).
+
+
+class TestOffsetDurability:
+    def _drain_via_prune(self, bus, topic):
+        """Force retention to archive every live record of `topic`."""
+        bus._conn.execute(
+            "UPDATE topics SET retention_ms = 1 WHERE name = ?", (topic,)
+        )
+        bus._topic_cache = getattr(bus, "_topic_cache", {})
+        time.sleep(0.002)
+        bus.prune()
+
+    def test_offsets_continue_after_full_drain(self, bus):
+        bus.create_topic("test", retention_ms=60000)
+        p1 = bus.producer()
+        for n in range(3):
+            p1.send("test", value={"n": n}, timestamp=1000 + n)  # ancient
+        p1.flush()
+        p1.close()
+
+        self._drain_via_prune(bus, "test")
+        info = bus.topic_info("test")
+        assert info["total_records"] == 0  # topic fully drained
+
+        # Fresh producer = cold offset cache (simulates daemon restart).
+        p2 = bus.producer()
+        p2.send("test", value={"n": 99})
+        p2.flush()
+        p2.close()
+
+        row = bus._conn.execute(
+            "SELECT MIN(offset), MAX(offset) FROM records WHERE topic='test'"
+        ).fetchone()
+        assert row == (3, 3), f"offset was reused after drain: {row}"
+
+    def test_consumer_not_deafened_by_drain(self, bus):
+        bus.create_topic("test", retention_ms=60000)
+        p1 = bus.producer()
+        for n in range(3):
+            p1.send("test", value={"n": n}, timestamp=1000 + n)
+        p1.flush()
+        p1.close()
+
+        consumer = bus.consumer(group_id="g1", topics=["test"])
+        records = consumer.poll(timeout_ms=0)
+        assert len(records) == 3
+        consumer.commit()  # committed offset now 2
+
+        self._drain_via_prune(bus, "test")
+
+        p2 = bus.producer()  # cold cache
+        p2.send("test", value={"n": "after-drain"})
+        p2.flush()
+        p2.close()
+
+        records = consumer.poll(timeout_ms=0)
+        got = [r.value["n"] for r in records]
+        assert got == ["after-drain"], (
+            f"consumer deaf after drain (committed above restarted offsets): {got}"
+        )
+        consumer.close()
+
+    def test_seed_respects_committed_offsets_without_archive(self, bus):
+        # archive=False topic: prune deletes outright, so committed offsets are
+        # the only surviving evidence of prior allocation.
+        bus.create_topic("test", retention_ms=60000, archive=False)
+        p1 = bus.producer()
+        for n in range(3):
+            p1.send("test", value={"n": n}, timestamp=1000 + n)
+        p1.flush()
+        p1.close()
+
+        consumer = bus.consumer(group_id="g1", topics=["test"])
+        consumer.poll(timeout_ms=0)
+        consumer.commit()
+
+        # Simulate a pre-fix DB: drop the counter, then drain.
+        bus._conn.execute("DELETE FROM topic_offsets WHERE topic='test'")
+        self._drain_via_prune(bus, "test")
+
+        p2 = bus.producer()
+        p2.send("test", value={"n": "next"})
+        p2.flush()
+        p2.close()
+
+        (min_off,) = bus._conn.execute(
+            "SELECT MIN(offset) FROM records WHERE topic='test'"
+        ).fetchone()
+        assert min_off >= 3, f"offset regressed below committed high-water: {min_off}"
+
+        records = consumer.poll(timeout_ms=0)
+        got = [r.value["n"] for r in records]
+        assert got == ["next"]
+        consumer.close()

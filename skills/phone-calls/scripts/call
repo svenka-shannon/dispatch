@@ -296,23 +296,27 @@ def dial_via_phone_app(number: str) -> bool:
     digits = [c for c in number.lstrip("+") if c.isdigit() or c in "*#"]
     if not digits:
         return False
-    # CRITICAL: relaunch Phone AND the AV conference daemon AFTER audio
-    # routing. Call audio flows through avconferenced (not Phone.app), and
-    # both bind their audio devices at startup — a stale instance keeps
-    # piping far-end audio to the old output and we capture silence.
+    # Relaunch Phone AFTER audio routing: it binds its audio devices at launch,
+    # so a stale Phone.app pipes far-end audio to the old output. (We do NOT
+    # kill avconferenced — that destabilizes Phone's UI so the Keypad view
+    # never renders; the volume/output-device fix is what actually restores
+    # capture, not restarting the AV daemon.)
     run(["osascript", "-e", 'tell application "Phone" to quit'])
-    run(["killall", "avconferenced"])
     time.sleep(1.5)
-    run(["open", "-a", "Phone"])
-    time.sleep(3.5)
     names = {"*": "Star", "#": "Pound"}
     seq = ",".join(["Keypad"] + [names.get(d, d) for d in digits] + ["Call"])
-    r = run([str(AXCTL), "clickseq", "Phone", seq], timeout=90)
-    if r.returncode != 0:
-        log(f"clickseq dial failed: {(r.stderr or r.stdout).strip()[-200:]}")
-        return False
-    log(f"dialed {''.join(digits)} via Phone app keypad")
-    return True
+    # Relaunch + dial, with one retry: a cold Phone.app can take >6s to render
+    # the keypad, and clickseq gives up after ~3s per element.
+    for attempt in (1, 2):
+        run(["open", "-a", "Phone"])
+        time.sleep(4.5 if attempt == 1 else 8)
+        r = run([str(AXCTL), "clickseq", "Phone", seq], timeout=120)
+        if r.returncode == 0:
+            log(f"dialed {''.join(digits)} via Phone app keypad")
+            return True
+        log(f"clickseq dial attempt {attempt} failed: "
+            f"{(r.stderr or r.stdout).strip()[-200:]}")
+    return False
 
 
 def press_return_fallback() -> bool:

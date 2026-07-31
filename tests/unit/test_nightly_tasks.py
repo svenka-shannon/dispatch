@@ -329,7 +329,7 @@ class TestScriptTaskDedupBehavioral:
         m._producer = MagicMock()
         m._ephemeral_tasks = {}
         m._running_script_tasks = {}
-        m._completed_task_times = {}
+        m._completed_task_traces = {}
         m._shutdown_flag = False
         m._handle_task_requested = Manager._handle_task_requested.__get__(m, Manager)
         m._run_script_task = AsyncMock()
@@ -479,7 +479,7 @@ class TestNoOutputTruncation:
         m = MagicMock(spec=Manager)
         m._producer = MagicMock()
         m._running_script_tasks = {}
-        m._completed_task_times = {}
+        m._completed_task_traces = {}
         m._shutdown_flag = False
         m._run_script_task = Manager._run_script_task.__get__(m, Manager)
         m._notify_task_event = AsyncMock()
@@ -518,7 +518,7 @@ class TestNoOutputTruncation:
         m = MagicMock(spec=Manager)
         m._producer = MagicMock()
         m._running_script_tasks = {}
-        m._completed_task_times = {}
+        m._completed_task_traces = {}
         m._shutdown_flag = False
         m._run_script_task = Manager._run_script_task.__get__(m, Manager)
         m._notify_task_event = AsyncMock()
@@ -601,7 +601,7 @@ class TestIntegrationFireConsumeExecute:
         m._producer = MagicMock()
         m._ephemeral_tasks = {}
         m._running_script_tasks = {}
-        m._completed_task_times = {}
+        m._completed_task_traces = {}
         m._shutdown_flag = False
         m._handle_task_requested = Manager._handle_task_requested.__get__(m, Manager)
         m._run_script_task = Manager._run_script_task.__get__(m, Manager)
@@ -668,7 +668,7 @@ class TestIntegrationFireConsumeExecute:
         m._producer = MagicMock()
         m._ephemeral_tasks = {}
         m._running_script_tasks = {}
-        m._completed_task_times = {}
+        m._completed_task_traces = {}
         m._shutdown_flag = False
         m._handle_task_requested = Manager._handle_task_requested.__get__(m, Manager)
         m._notify_task_event = AsyncMock()

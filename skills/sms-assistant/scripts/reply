@@ -86,16 +86,34 @@ def produce_tapback(chat_id: str, message_guid: str, reaction: str, backend: str
 
         # Use BEGIN IMMEDIATE to prevent race conditions with the Producer's
         # background writer thread. This ensures offset read + INSERT are atomic.
+        #
+        # Offset MUST come from the durable topic_offsets counter (with the
+        # live-table MAX as a floor), and the counter MUST be advanced after
+        # the INSERT — a bare MAX(offset)+1 here ignores the counter and
+        # permanently wedges the daemon's Producer on this topic (every
+        # daemon batch collides on the stale counter value; 2026-07-30
+        # incident dropped 10 read-receipt events).
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT COALESCE(MAX(\"offset\"), -1) + 1 FROM records WHERE topic = 'imessage.ui' AND partition = 0"
         ).fetchone()
-        next_offset = row[0] if row else 0
+        live_next = row[0] if row else 0
+        row = conn.execute(
+            "SELECT next_offset FROM topic_offsets WHERE topic = 'imessage.ui' AND partition = 0"
+        ).fetchone()
+        counter_next = row[0] if row else 0
+        next_offset = max(live_next, counter_next)
 
         conn.execute(
             "INSERT INTO records (topic, partition, \"offset\", timestamp, key, type, source, payload) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             ("imessage.ui", 0, next_offset, now_ms, f"imessage/{chat_id}", "tapback", "reply-cli", payload)
+        )
+        conn.execute(
+            "INSERT INTO topic_offsets (topic, partition, next_offset) VALUES ('imessage.ui', 0, ?) "
+            "ON CONFLICT(topic, partition) DO UPDATE SET next_offset = excluded.next_offset "
+            "WHERE excluded.next_offset > topic_offsets.next_offset",
+            (next_offset + 1,)
         )
         conn.commit()
         print(f"Tapback {reaction} queued for {message_guid[:30]}...")

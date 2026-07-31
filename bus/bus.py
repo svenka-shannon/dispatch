@@ -1030,7 +1030,21 @@ class Producer:
         )
         row = cursor.fetchone()
         if row is not None:
-            next_offset = row[0]
+            counter = row[0]
+            # Defense in depth: never trust the counter below the live table's
+            # MAX — a foreign writer doing a raw MAX+1 INSERT (e.g. an old
+            # reply-cli) would otherwise wedge this topic forever, with every
+            # daemon batch colliding on the same offset (2026-07-30 incident:
+            # 10 dropped imessage.ui read-receipts). The counter still
+            # guarantees no offset reuse after retention (its whole purpose);
+            # this just lets us self-heal past out-of-band inserts.
+            cursor = self._conn.execute(
+                "SELECT COALESCE(MAX(offset), -1) + 1 FROM records "
+                "WHERE topic = ? AND partition = ?",
+                (topic, partition),
+            )
+            live_next = cursor.fetchone()[0]
+            next_offset = max(counter, live_next)
         else:
             cursor = self._conn.execute(
                 """

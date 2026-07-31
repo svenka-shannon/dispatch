@@ -1470,6 +1470,49 @@ class TestConcurrentAccess:
         bus1.close()
         bus2.close()
 
+    def test_producer_self_heals_past_foreign_raw_insert(self, bus_with_topic):
+        """A foreign writer that raw-INSERTs at MAX(offset)+1 without advancing
+        topic_offsets must not wedge the Producer.
+
+        Regression: 2026-07-30 — the reply CLI's tapback path did exactly this,
+        after which every daemon batch on the topic collided on the stale
+        counter value forever (UNIQUE constraint), silently dropping records.
+        The Producer now floors the counter at the live table's MAX+1.
+        """
+        import json as _json
+        import time as _time
+        bus = bus_with_topic
+        p = bus.producer()
+        p.send("test", value={"n": "before"})
+        p.flush()
+
+        # Foreign raw insert at MAX+1, counter NOT advanced (old reply-cli).
+        (raw_off,) = bus._conn.execute(
+            "SELECT COALESCE(MAX(offset), -1) + 1 FROM records "
+            "WHERE topic = 'test' AND partition = 0"
+        ).fetchone()
+        bus._conn.execute(
+            "INSERT INTO records (topic, partition, offset, timestamp, key, type, source, payload) "
+            "VALUES ('test', 0, ?, ?, 'k', 'foreign', 'raw-writer', ?)",
+            (raw_off, int(_time.time() * 1000), _json.dumps({"n": "foreign"})),
+        )
+        bus._conn.commit()
+
+        # Producer must land ABOVE the foreign row, not collide with it.
+        p.send("test", value={"n": "after"})
+        p.flush()
+        p.close()
+
+        rows = bus._conn.execute(
+            "SELECT offset, payload FROM records WHERE topic = 'test' ORDER BY offset"
+        ).fetchall()
+        offsets = [r[0] for r in rows]
+        assert len(offsets) == len(set(offsets)), f"duplicate offsets: {offsets}"
+        assert _json.loads(rows[-1][1])["n"] == "after", (
+            "producer record after the foreign insert was dropped — "
+            f"rows: {[(o, _json.loads(pl)['n']) for o, pl in rows]}"
+        )
+
     def test_producer_thread_safe_concurrent_sends(self, tmp_path):
         """Single producer used from multiple threads should not corrupt data.
 

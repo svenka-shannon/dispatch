@@ -126,6 +126,17 @@ def cmd_stop(args):
         print("Daemon not running")
         return 1
 
+    # A deliberate stop is not a crash: leave the graceful marker so the
+    # watchdog's next poll gives a 2-min grace instead of texting the admin
+    # "[WATCHDOG] Daemon crashed" mid stop→start sequence (false positive on
+    # 2026-07-30 — cmd_restart wrote this marker but a bare stop did not).
+    try:
+        Path("/tmp/dispatch-graceful-restart").write_text(
+            json.dumps({"timestamp": int(time.time())})
+        )
+    except OSError:
+        pass
+
     print(f"Stopping daemon (PID {pid})...")
 
     # Send SIGTERM to the entire process group (uv wrapper + child python process)

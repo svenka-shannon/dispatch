@@ -2153,7 +2153,12 @@ class Manager:
         self._task_consumer_task: asyncio.Task | None = None
         self._ephemeral_tasks: Dict[str, dict] = {}  # task_id -> tracking info
         self._running_script_tasks: Dict[str, asyncio.Task] = {}  # task_id -> asyncio.Task
-        self._completed_task_times: Dict[str, float] = {}  # task_id -> completion timestamp
+        # Replay-guard: recently-completed trace_ids -> completion ts.
+        # Keyed on trace_id (NOT task_id) so legitimate scheduler re-fires of
+        # the same task_id (e.g. */30 cron) each get a fresh trace and pass
+        # through, while a genuine consumer replay of the same event (same
+        # trace_id) is caught.
+        self._completed_task_traces: Dict[str, float] = {}
 
         # Initialize bus consumers
         self._consumer_runner = self._init_consumers()
@@ -3332,26 +3337,33 @@ class Manager:
                          and self.sessions.sessions[session_key].is_alive())
         script_running = (task_id in self._running_script_tasks
                           and not self._running_script_tasks[task_id].done())
-        # Also reject tasks that completed recently (prevents restart loops
-        # when the bus consumer re-reads the same task.requested event due
-        # to a failed offset commit, e.g. after a StaleGenerationError).
-        COMPLETED_COOLDOWN = 3600  # 1 hour
+        # Also reject events that we've already fully processed — same event
+        # (same trace_id) re-appearing means the bus consumer failed to commit
+        # its offset and is replaying. Keyed on trace_id (not task_id) so a
+        # legitimate scheduler re-fire of the same task (e.g. chrome-housekeep
+        # on */30) with a FRESH trace_id doesn't trip the guard.
+        # Short cooldown: 60s is enough to swallow a burst of consumer retries
+        # without ever overlapping real scheduled runs.
+        COMPLETED_COOLDOWN = 60
+        trace_id = headers.get("trace_id") if headers else None
         recently_completed = (
-            task_id in self._completed_task_times
-            and (time.time() - self._completed_task_times[task_id]) < COMPLETED_COOLDOWN
+            trace_id is not None
+            and trace_id in self._completed_task_traces
+            and (time.time() - self._completed_task_traces[trace_id]) < COMPLETED_COOLDOWN
         )
         if agent_running or script_running or recently_completed:
             reason = ("recently_completed" if recently_completed
                       else "already_running")
-            log.warning(f"Task {task_id} {reason}, skipping duplicate")
+            log.warning(f"Task {task_id} {reason}, skipping duplicate "
+                        f"(trace_id={trace_id})")
             produce_event(self._producer, "tasks", "task.skipped",
                 task_skipped_payload(task_id, reason),
                 key=requested_by, source="task-runner")
-            # Alert admin when a completed task is being replayed — this means
+            # Alert admin when the SAME event is being replayed — this means
             # the consumer failed to commit offsets (sev0 restart loop signal).
-            # Rate-limited: one alert per task per hour (matches cooldown window).
+            # Rate-limited: one alert per trace_id per hour.
             if recently_completed:
-                alert_key = f"_replay_alerted_{task_id}"
+                alert_key = f"_replay_alerted_{trace_id}"
                 last_alert = getattr(self, alert_key, 0)
                 if time.time() - last_alert > 3600:
                     setattr(self, alert_key, time.time())
@@ -3445,6 +3457,9 @@ class Manager:
             "notify": notify,
             "investigation": is_investigation,
             "notify_session": payload.get("notify_session") if is_investigation else None,
+            # Keep the originating event's trace_id so the completion path can
+            # record it in the replay-guard cache (see _completed_task_traces).
+            "trace_id": trace_id,
         }
 
         # Produce task.started event
@@ -3579,9 +3594,11 @@ class Manager:
             except Exception:
                 pass  # Best-effort cleanup
         finally:
-            # Record completion time to prevent restart loops when the bus
+            # Record completion trace_id to prevent restart loops when the bus
             # consumer re-reads the same task.requested event (sev0 fix).
-            self._completed_task_times[task_id] = time.time()
+            trace_id = headers.get("trace_id") if headers else None
+            if trace_id:
+                self._completed_task_traces[trace_id] = time.time()
 
     async def _imessage_tickle(self):
         """Wake Messages.app/IMDPersistenceAgent so pending iMessages flush to chat.db.
@@ -3647,12 +3664,15 @@ class Manager:
             try:
                 await asyncio.sleep(30)
 
-                # Prune expired entries from completed task cooldown tracker
+                # Prune expired entries from completed-trace replay guard.
+                # Threshold matches the dedup window in _handle_task_requested
+                # (COMPLETED_COOLDOWN = 60s) — kept slightly longer here so we
+                # don't drop an entry a request is about to consult.
                 now = time.time()
-                expired = [tid for tid, ts in self._completed_task_times.items()
-                           if now - ts > 3600]
-                for tid in expired:
-                    del self._completed_task_times[tid]
+                expired = [tr for tr, ts in self._completed_task_traces.items()
+                           if now - ts > 300]
+                for tr in expired:
+                    del self._completed_task_traces[tr]
 
                 if not self._ephemeral_tasks:
                     continue
@@ -3682,8 +3702,11 @@ class Manager:
                             task_id, info, session, "completed"
                         )
 
-                        # Clean up — record completion time to prevent restart loops
-                        self._completed_task_times[task_id] = time.time()
+                        # Clean up — record trace_id to prevent restart loops
+                        # (see _completed_task_traces / COMPLETED_COOLDOWN).
+                        _tr = info.get("trace_id")
+                        if _tr:
+                            self._completed_task_traces[_tr] = time.time()
                         await self.sessions.kill_ephemeral_session(task_id)
                         self._ephemeral_tasks.pop(task_id, None)
 
@@ -3723,7 +3746,9 @@ class Manager:
                                 task_id, info, session, "completed"
                             )
 
-                            self._completed_task_times[task_id] = time.time()
+                            _tr = info.get("trace_id")
+                            if _tr:
+                                self._completed_task_traces[_tr] = time.time()
                             await self.sessions.kill_ephemeral_session(task_id)
                             self._ephemeral_tasks.pop(task_id, None)
 
@@ -3752,7 +3777,9 @@ class Manager:
                         )
 
                         # Kill session and clean up
-                        self._completed_task_times[task_id] = time.time()
+                        _tr = info.get("trace_id")
+                        if _tr:
+                            self._completed_task_traces[_tr] = time.time()
                         await self.sessions.kill_ephemeral_session(task_id)
                         self._ephemeral_tasks.pop(task_id, None)
 

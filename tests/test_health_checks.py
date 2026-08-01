@@ -54,7 +54,9 @@ class TestIdleSessionThresholds:
 
     async def test_exactly_at_threshold(self, sdk_backend):
         """Session idle for exactly the threshold should be killed."""
-        await sdk_backend.create_session("User", "test:+15555550006", "admin", source="test")
+        # Use non-admin tier: admin sessions are exempt from idle-kill
+        # (see check_idle_sessions in sdk_backend.py).
+        await sdk_backend.create_session("User", "test:+15555550006", "favorite", source="test")
         session = sdk_backend.sessions["test:+15555550006"]
         session.last_activity = datetime.now() - timedelta(hours=2, seconds=1)
         killed = await sdk_backend.check_idle_sessions(2.0)
@@ -62,7 +64,7 @@ class TestIdleSessionThresholds:
 
     async def test_just_under_threshold(self, sdk_backend):
         """Session idle for just under threshold should survive."""
-        await sdk_backend.create_session("User", "test:+15555550006", "admin", source="test")
+        await sdk_backend.create_session("User", "test:+15555550006", "favorite", source="test")
         session = sdk_backend.sessions["test:+15555550006"]
         session.last_activity = datetime.now() - timedelta(hours=1, minutes=59)
         killed = await sdk_backend.check_idle_sessions(2.0)
@@ -70,8 +72,8 @@ class TestIdleSessionThresholds:
 
     async def test_mixed_idle_and_active(self, sdk_backend):
         """Only idle sessions should be killed, active ones preserved."""
-        await sdk_backend.create_session("Idle", "test:+15555550006", "admin", source="test")
-        await sdk_backend.create_session("Active", "test:+15555550008", "admin", source="test")
+        await sdk_backend.create_session("Idle", "test:+15555550006", "favorite", source="test")
+        await sdk_backend.create_session("Active", "test:+15555550008", "favorite", source="test")
 
         sdk_backend.sessions["test:+15555550006"].last_activity = datetime.now() - timedelta(hours=5)
         sdk_backend.sessions["test:+15555550008"].last_activity = datetime.now()
@@ -81,6 +83,16 @@ class TestIdleSessionThresholds:
         assert "test:+15555550008" not in killed
         # Active session should still exist
         assert "test:+15555550008" in sdk_backend.sessions
+
+    async def test_admin_session_exempt(self, sdk_backend):
+        """Admin-tier sessions should never be idle-killed (kept warm to avoid
+        cold-start latency on top of any macOS chat.db delay)."""
+        await sdk_backend.create_session("Admin", "test:+15555550006", "admin", source="test")
+        session = sdk_backend.sessions["test:+15555550006"]
+        session.last_activity = datetime.now() - timedelta(hours=24)
+        killed = await sdk_backend.check_idle_sessions(2.0)
+        assert "test:+15555550006" not in killed
+        assert "test:+15555550006" in sdk_backend.sessions
 
 
 @pytest.mark.asyncio

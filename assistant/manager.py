@@ -3627,6 +3627,50 @@ class Manager:
         except Exception as e:
             log.warning(f"IMESSAGE_TICKLE | failed: {e}")
 
+    async def _imessage_tickle_escalated(self):
+        """Heavy tickle used when the light osascript ping isn't waking the stack.
+
+        Observed 2026-07-31: inbound iMessage arrived via push, but the chat.db
+        write was deferred ~8 minutes because IMDPersistenceAgent had App-Napped
+        after Messages.app sat idle for 17h. The 30s `count of chats` tickle
+        wasn't enough to wake it. This escalation kickstarts imagent (which owns
+        the persistence path) and brings Messages.app to the foreground briefly
+        so IMDPersistenceAgent flushes its queue.
+
+        Gated by `_last_escalated_tickle_ts` in the caller — do NOT loop-kick.
+        """
+        uid = os.getuid()
+        # 1) Kickstart imagent — the daemon that ferries messages to chat.db.
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "launchctl", "kickstart", "-k", f"gui/{uid}/com.apple.imagent",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=10)
+            log.warning("IMESSAGE_TICKLE_ESCALATED | launchctl kickstart imagent OK")
+        except asyncio.TimeoutError:
+            log.warning("IMESSAGE_TICKLE_ESCALATED | launchctl kickstart imagent timed out")
+        except Exception as e:
+            log.warning(f"IMESSAGE_TICKLE_ESCALATED | launchctl kickstart failed: {e}")
+
+        # 2) Briefly foreground Messages.app so it services its RunLoop.
+        #    `open -a` won't steal focus persistently — user can immediately
+        #    switch back. This is the strongest signal to macOS that the app
+        #    should exit App Nap.
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "open", "-a", "Messages",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=5)
+            log.warning("IMESSAGE_TICKLE_ESCALATED | open -a Messages OK")
+        except asyncio.TimeoutError:
+            log.warning("IMESSAGE_TICKLE_ESCALATED | open -a Messages timed out")
+        except Exception as e:
+            log.warning(f"IMESSAGE_TICKLE_ESCALATED | open failed: {e}")
+
     async def _periodic_wal_checkpoint(self):
         """Run WAL checkpoint on a separate timer, outside the poll cycle.
 
@@ -5836,6 +5880,22 @@ You have 15 minutes. Work efficiently.
         last_imessage_tickle = time.time() - 25
         IMESSAGE_TICKLE_INTERVAL = 30
 
+        # Escalated tickle: when the 30s light tickle isn't enough to wake
+        # IMDPersistenceAgent (observed 2026-07-31 — 8min chat.db write delay
+        # after Messages.app sat idle for 17h), fire launchctl kickstart +
+        # brief foreground of Messages.app. Only trigger when BOTH:
+        #   - last_rowid hasn't advanced for >5min (chat.db appears frozen)
+        #   - Messages.app has been idle >1hr (no inbound activity)
+        # Debounced so we don't loop-kick every poll iteration.
+        _now_init = time.time()
+        last_rowid_change_ts = _now_init
+        last_rowid_snapshot = self.last_rowid
+        last_inbound_activity_ts = _now_init
+        last_escalated_tickle_ts = 0.0  # never fired yet
+        STALE_CHATDB_THRESHOLD = 300      # 5 min without a new rowid
+        MESSAGES_IDLE_THRESHOLD = 3600    # 1 hr with no inbound
+        ESCALATED_TICKLE_DEBOUNCE = 900   # don't re-escalate for 15 min
+
         # Nightly consolidation is now handled by cron reminders firing
         # task.requested events. See scripts/setup-nightly-tasks.py.
         # Verify nightly task reminders exist at startup
@@ -5989,11 +6049,55 @@ You have 15 minutes. Work efficiently.
                     await self.reminders.process_due_reminders()
                     last_reminder_check = time.time()
 
+                # Track inbound activity + rowid movement for the escalated
+                # tickle heuristic. If either messages OR reactions arrived, or
+                # last_rowid advanced (e.g. from _save_state above), refresh
+                # both trackers.
+                _now_tick = time.time()
+                if messages or reactions:
+                    last_inbound_activity_ts = _now_tick
+                if self.last_rowid != last_rowid_snapshot:
+                    last_rowid_snapshot = self.last_rowid
+                    last_rowid_change_ts = _now_tick
+
                 # Periodic Messages.app tickle (fire-and-forget) — keeps
                 # IMDPersistenceAgent flushing chat.db despite App Nap.
-                if time.time() - last_imessage_tickle > IMESSAGE_TICKLE_INTERVAL:
+                if _now_tick - last_imessage_tickle > IMESSAGE_TICKLE_INTERVAL:
                     asyncio.create_task(self._imessage_tickle(), name="imessage-tickle")
-                    last_imessage_tickle = time.time()
+                    last_imessage_tickle = _now_tick
+
+                # Escalated tickle: only when chat.db appears frozen AND
+                # Messages.app has been idle long enough that App Nap likely
+                # kicked in. Debounced so a single stale window fires once.
+                chatdb_stale_s = _now_tick - last_rowid_change_ts
+                messages_idle_s = _now_tick - last_inbound_activity_ts
+                since_last_escalation = _now_tick - last_escalated_tickle_ts
+                if (chatdb_stale_s > STALE_CHATDB_THRESHOLD
+                        and messages_idle_s > MESSAGES_IDLE_THRESHOLD
+                        and since_last_escalation > ESCALATED_TICKLE_DEBOUNCE):
+                    log.warning(
+                        f"IMESSAGE_TICKLE_ESCALATED | firing | "
+                        f"chatdb_stale={chatdb_stale_s:.0f}s "
+                        f"messages_idle={messages_idle_s:.0f}s "
+                        f"last_rowid={self.last_rowid}"
+                    )
+                    try:
+                        produce_event(
+                            self._producer, "system", "imessage.tickle_escalated",
+                            {
+                                "chatdb_stale_seconds": round(chatdb_stale_s, 1),
+                                "messages_idle_seconds": round(messages_idle_s, 1),
+                                "last_rowid": self.last_rowid,
+                            },
+                            source="daemon",
+                        )
+                    except Exception as e:
+                        log.debug(f"IMESSAGE_TICKLE_ESCALATED | bus produce failed: {e}")
+                    asyncio.create_task(
+                        self._imessage_tickle_escalated(),
+                        name="imessage-tickle-escalated",
+                    )
+                    last_escalated_tickle_ts = _now_tick
 
                 # Fast health check (Tier 1: regex-based fatal error detection)
                 if time.time() - last_fast_health > FAST_HEALTH_INTERVAL:

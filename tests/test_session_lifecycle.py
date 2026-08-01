@@ -322,7 +322,8 @@ class TestIdleSessionReaping:
     """Test idle session killing."""
 
     async def test_idle_session_killed(self, sdk_backend):
-        await sdk_backend.create_session("User", "test:+15555550006", "admin", source="test")
+        # Non-admin tier: admin sessions are exempt from idle-kill.
+        await sdk_backend.create_session("User", "test:+15555550006", "favorite", source="test")
         session = sdk_backend.sessions["test:+15555550006"]
         # Backdate last_activity
         session.last_activity = datetime.now() - timedelta(hours=3)
@@ -330,7 +331,7 @@ class TestIdleSessionReaping:
         assert "test:+15555550006" in killed
 
     async def test_active_session_not_killed(self, sdk_backend):
-        await sdk_backend.create_session("User", "test:+15555550006", "admin", source="test")
+        await sdk_backend.create_session("User", "test:+15555550006", "favorite", source="test")
         session = sdk_backend.sessions["test:+15555550006"]
         session.last_activity = datetime.now()  # Recent
         killed = await sdk_backend.check_idle_sessions(2.0)

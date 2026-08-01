@@ -2210,6 +2210,11 @@ Respond via: ~/.claude/skills/sms-assistant/scripts/send-sms "{admin_phone}" "[M
         for chat_id, session in sessions_snapshot:
             if chat_id == MASTER_SESSION:
                 continue  # Don't idle-kill master session
+            # Admin-tier sessions stay warm indefinitely — cold-starts on
+            # admin's next inbound compound any macOS-side chat.db delay
+            # (see IMDPersistenceAgent App-Nap escalated tickle in manager).
+            if getattr(session, "tier", None) == "admin":
+                continue
             idle_seconds = (now - session.last_activity).total_seconds()
             if idle_seconds > timeout_hours * 3600:
                 idle_hours = idle_seconds / 3600

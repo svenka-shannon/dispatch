@@ -299,10 +299,11 @@ class TestSDKBackendBusEvents:
     async def test_idle_killed_produces_event(self, sdk_backend_with_bus, bus_db):
         """check_idle_sessions produces session.idle_killed for idle sessions."""
         backend = sdk_backend_with_bus
+        # Non-admin tier: admin sessions are exempt from idle-kill.
         await backend.create_session(
             contact_name="Eve",
             chat_id="+15555555555",
-            tier="admin",
+            tier="favorite",
             source="test",
         )
 

@@ -113,7 +113,7 @@ log = logging.getLogger(__name__)
 # and `betas` to the `claude` CLI as `--model` / `--betas`, which works
 # identically for OAuth (Max plan) and ANTHROPIC_API_KEY auth modes.
 _MODEL_ALIASES = {
-    "opus": "claude-opus-4-7",
+    "opus": "claude-opus-5",
     "sonnet": "claude-sonnet-4-6",
     "haiku": "claude-haiku-4-5",
 }
@@ -122,8 +122,9 @@ _MODEL_ALIASES = {
 def _resolve_model_and_betas(model: str) -> tuple[str, list[str]]:
     """Resolve a model alias or full ID to (model_id, betas).
 
-    Opus 4.7 and Sonnet 4.x get the 1M-context beta header. Other models
-    (Haiku, older versions) pass through with no betas.
+    Opus 4.7 and Sonnet 4.x get the 1M-context beta header. Opus 5 has 1M
+    context by default (no beta needed); Haiku and older versions pass
+    through with no betas.
     """
     model_id = _MODEL_ALIASES.get(model, model)
     betas: list[str] = []

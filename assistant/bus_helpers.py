@@ -15,6 +15,7 @@ Topic/type taxonomy (v6):
                 session.idle_killed, session.prewarmed, session.tier_mismatch,
                 session.prompt_built, session.receive_error,
                 session.stop_failed, session.model_changed, session.stuck_nudge,
+                session.auth_failure (keyed by session_name),
                 permission.denied, command.restart (keyed by chat_id)
     system    — daemon.started/stopped/crashed/recovered,
                 health.check_completed, health.check_failed,

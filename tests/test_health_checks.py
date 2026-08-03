@@ -188,6 +188,15 @@ class TestCheckFatalRegex:
         result = check_fatal_regex(entries)
         assert result == "auth_error"
 
+    def test_detects_oauth_expired_plaintext(self):
+        """The Aug 2026 outage text: no JSON blob, just plain assistant text."""
+        from assistant.health import check_fatal_regex
+        entries = [_make_assistant_entry(
+            'Failed to authenticate: OAuth session expired and could not be refreshed'
+        )]
+        result = check_fatal_regex(entries)
+        assert result == "auth_error"
+
     def test_detects_auth_error(self):
         """Test that authentication_error is also detected (the actual API error type)."""
         from assistant.health import check_fatal_regex

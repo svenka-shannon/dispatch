@@ -83,7 +83,7 @@ if TYPE_CHECKING:
         PreCompactHookInput | NotificationHookInput
     )
 
-from assistant.common import SESSION_EFFORT, SKILLS_DIR, UV
+from assistant.common import AUTH_FAILURE_FLAG, SESSION_EFFORT, SKILLS_DIR, UV
 from assistant import perf, auth_mode
 from assistant.bus_helpers import produce_event, produce_session_event, compaction_triggered_payload
 
@@ -112,6 +112,20 @@ log = logging.getLogger(__name__)
 # Pin model aliases to current full model IDs. The SDK forwards both `model`
 # and `betas` to the `claude` CLI as `--model` / `--betas`, which works
 # identically for OAuth (Max plan) and ANTHROPIC_API_KEY auth modes.
+# CLI auth failures surface as assistant text, not a typed error — the turn
+# "completes" in ~20ms with is_error=true and the session otherwise looks
+# healthy (Aug 2026 outage: OAuth refresh token died, sessions silently ate
+# every message for a day). Matched text raises the auth-failure flag that the
+# oauth_token dependency check escalates on.
+_AUTH_FAILURE_RE = re.compile(
+    r"Failed to authenticate"
+    r"|OAuth (?:session|token) (?:has )?expired"
+    r"|could not be refreshed"
+    r"|Invalid API key"
+    r"|authentication_error",
+    re.IGNORECASE,
+)
+
 _MODEL_ALIASES = {
     "opus": "claude-opus-5",
     "sonnet": "claude-sonnet-4-6",
@@ -445,6 +459,36 @@ class SDKSession:
         self._block_limit_until = datetime.now() + timedelta(seconds=self.BLOCK_LIMIT_SUPPRESS_SECONDS)
         self._block_limit_notified = True
         self._log.info(f"BLOCK_LIMIT | suppressing for {self.BLOCK_LIMIT_SUPPRESS_SECONDS}s until {self._block_limit_until.isoformat()}")
+
+    def _note_auth_failure(self, text: str) -> None:
+        """Record an auth-failure turn so the oauth_token dependency check can escalate.
+
+        Writes state/auth_failure.json (read by the dependency probe) and emits a
+        session.auth_failure bus event. The flag is cleared by the first successful
+        turn (any session) or by the probe once the keychain shows a fresh token.
+        """
+        self._log.error(f"AUTH_FAILURE | {text}")
+        try:
+            AUTH_FAILURE_FLAG.write_text(json.dumps({
+                "ts": datetime.now().astimezone().isoformat(),
+                "session_name": self._session_name,
+                "detail": text[:300],
+            }))
+        except OSError as e:
+            self._log.warning(f"AUTH_FAILURE | could not write flag: {e}")
+        produce_event(self._producer, "sessions", "session.auth_failure", {
+            "session_name": self._session_name,
+            "chat_id": self.chat_id,
+            "contact_name": self.contact_name,
+            "detail": text[:300],
+        }, key=self._session_name, source="sdk_session")
+
+    @staticmethod
+    def _clear_auth_failure_flag() -> None:
+        try:
+            AUTH_FAILURE_FLAG.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def _maybe_handle_oauth_quota_error(self, error_text: str) -> bool:
         """If error_text indicates OAuth quota exhaustion, switch to API key.
@@ -1086,6 +1130,8 @@ class SDKSession:
 
                     if block.text:
                         self.last_assistant_text = block.text
+                        if _AUTH_FAILURE_RE.search(block.text):
+                            self._note_auth_failure(block.text)
 
                     # Detect block limit messages from the API
                     self._detect_block_limit(block.text)
@@ -1174,6 +1220,7 @@ class SDKSession:
                 self._consecutive_error_turns += 1
             else:
                 self._consecutive_error_turns = 0
+                self._clear_auth_failure_flag()
             self._log.info(
                 f"TURN | #{self.turn_count} | "
                 f"duration={message.duration_ms}ms | error={message.is_error} | "

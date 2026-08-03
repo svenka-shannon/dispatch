@@ -36,7 +36,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from assistant.common import SIGNAL_SOCKET
+from assistant.common import AUTH_FAILURE_FLAG, SIGNAL_SOCKET
 from assistant.dependency_health import (
     DependencyCheck,
     DependencyHealthRunner,
@@ -580,6 +580,66 @@ def _fd_leak_probe(manager: Any) -> ProbeResult:
 
 
 # ──────────────────────────────────────────────────────────────
+# oauth_token
+# ──────────────────────────────────────────────────────────────
+
+def _keychain_token_expires_at_ms() -> int | None:
+    """Read claudeAiOauth.expiresAt (ms epoch) from the macOS keychain."""
+    try:
+        raw = subprocess.check_output(
+            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        ).decode().strip()
+        expires = json.loads(raw).get("claudeAiOauth", {}).get("expiresAt")
+        return int(expires) if expires else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _oauth_probe() -> ProbeResult:
+    """DOWN while sessions are failing turns with OAuth auth errors.
+
+    The flag file is raised by SDKSession when a turn's output matches an
+    auth-failure pattern (Aug 2026: "OAuth session expired and could not be
+    refreshed" — every message silently eaten for a day while the daemon
+    looked healthy). There is no automated recovery — only a human re-login
+    fixes a dead refresh token — so DOWN escalates straight to an SMS, which
+    goes out via the send-sms CLI and does not need the API.
+
+    The flag clears on the first successful turn, or here once the keychain
+    shows a token that is valid again (re-login happened with no traffic since).
+    """
+    if not AUTH_FAILURE_FLAG.exists():
+        return ProbeResult.ok("no auth failures flagged")
+    try:
+        flag = json.loads(AUTH_FAILURE_FLAG.read_text())
+    except (OSError, ValueError):
+        flag = {}
+
+    expires_ms = _keychain_token_expires_at_ms()
+    now_ms = int(time.time() * 1000)
+    if expires_ms and expires_ms > now_ms:
+        # Fresh credentials in the keychain — the user re-logged in.
+        try:
+            AUTH_FAILURE_FLAG.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return ProbeResult.ok("keychain token valid again; cleared auth-failure flag")
+
+    return ProbeResult.down(
+        "Claude OAuth session expired and could not be refreshed — every SDK "
+        "turn is failing instantly and messages are being silently dropped. "
+        "Fix: on the mini, run `claude` and `/login` (or `claude login`). "
+        "This alert auto-clears once a turn succeeds.",
+        flagged_at=flag.get("ts"),
+        flagged_by=flag.get("session_name"),
+        error_detail=flag.get("detail"),
+        token_expires_at_ms=expires_ms,
+    )
+
+
+# ──────────────────────────────────────────────────────────────
 # Registry builder
 # ──────────────────────────────────────────────────────────────
 
@@ -664,6 +724,16 @@ def build_default_registry(manager: Any) -> DependencyHealthRunner:
         recover_timeout_s=30.0,
         recovery_alarm_k=3,
         reescalate_after_s=6 * 3600,         # disk problems are slow; don't nag hourly
+    ))
+
+    # ── oauth_token ───────────────────────────────────────────
+    runner.register(DependencyCheck(
+        name="oauth_token",
+        probe=_oauth_probe,
+        recover=None,                        # dead refresh token needs a human /login → escalate
+        interval_s=120,                      # flag → SMS within ~2 min
+        probe_timeout_s=15.0,
+        reescalate_after_s=4 * 3600,
     ))
 
     # ── fd_leak ───────────────────────────────────────────────

@@ -45,6 +45,11 @@ FATAL_PATTERNS: list[tuple[str, str]] = [
     (r"image dimensions exceed max allowed size", "image_too_large"),
     (r"Could not process image", "image_processing_failed"),
     (r"\"authentication_\w+\"", "auth_error"),
+    # CLI auth failures arrive as plain assistant text, not a JSON error blob
+    # (Aug 2026: "Failed to authenticate: OAuth session expired and could not
+    # be refreshed" ate every message for a day undetected).
+    (r"Failed to authenticate", "auth_error"),
+    (r"OAuth (?:session|token) (?:has )?expired", "auth_error"),
     (r"\"billing_error\"", "billing_error"),
 ]
 

@@ -59,7 +59,10 @@ STATES *NOT* HANDLED (still need a human)
 -----------------------------------------
   * The unpacked extension directory is missing/corrupt on disk. Chrome will
     refuse to reload it; the reload button either vanishes or re-errors. The
-    fix is repairing the source tree, not clicking anything.
+    fix is repairing the source tree, not clicking anything. chrome-heal only
+    *claims* this after verify_extension_source() has actually stat'd the
+    manifest and its declared entry points, and it names the offending file --
+    it never guesses (see the 2026-08-03 false alarm in that function).
   * Chrome shows a modal ("Restore pages?", profile sign-in, an update
     relaunch prompt) that steals the window. chrome-heal reports it rather
     than blind-clicking unknown dialogs.
@@ -253,6 +256,117 @@ def extension_prefs_state() -> dict:
             "unpacked_path": entry.get("path"),
         }
     return {"found": False, "ext_id": ext_id, "reason": "not in Default profile prefs"}
+
+
+DEFAULT_EXT_PATH = Path.home() / "dispatch/skills/chrome-control/extension"
+
+
+def _manifest_entry_points(manifest: dict) -> list[str]:
+    """Relative paths the manifest declares Chrome must be able to load.
+
+    Only the files whose absence actually breaks the load: the MV3 service
+    worker, every content script, and the action popup. Icons are deliberately
+    excluded — a missing icon degrades the card's artwork, it does not error the
+    extension, and treating it as corruption would recreate the very
+    over-claiming this check exists to prevent.
+    """
+    paths: list[str] = []
+    sw = (manifest.get("background") or {}).get("service_worker")
+    if isinstance(sw, str) and sw:
+        paths.append(sw)
+    for cs in manifest.get("content_scripts") or []:
+        if isinstance(cs, dict):
+            for js in cs.get("js") or []:
+                if isinstance(js, str) and js:
+                    paths.append(js)
+    popup = (manifest.get("action") or {}).get("default_popup")
+    if isinstance(popup, str) and popup:
+        paths.append(popup)
+    return paths
+
+
+def verify_extension_source(path: str | os.PathLike | None = None) -> dict:
+    """Actually stat the unpacked extension tree instead of guessing about it.
+
+    chrome-heal used to end every exhausted run by asserting "the unpacked
+    extension source tree is broken on disk" without ever looking. On
+    2026-08-03 that fired twice while every file was intact (the real failure
+    was AX_NO_RELOAD_BUTTON), sending the admin to repair a non-problem. This
+    turns that guess into a measurement.
+
+    Returns a dict with:
+      checked  — False if we could not even resolve/read the directory
+      ok       — True iff the dir, manifest.json and every manifest-declared
+                 entry point exist and are non-empty
+      missing  — list of "<file> (<why>)" strings for anything broken
+      verified — list of entry points confirmed present and non-empty
+    """
+    if path is None:
+        path = extension_prefs_state().get("unpacked_path") or DEFAULT_EXT_PATH
+    root = Path(path)
+    out: dict = {"path": str(root), "checked": False, "ok": False, "missing": [], "verified": []}
+
+    if not root.is_dir():
+        out["checked"] = True
+        out["missing"].append(f"{root} (directory does not exist)")
+        return out
+
+    manifest_path = root / "manifest.json"
+    if not manifest_path.is_file():
+        out["checked"] = True
+        out["missing"].append(f"{manifest_path} (missing)")
+        return out
+    try:
+        raw = manifest_path.read_text()
+    except OSError as e:
+        out["reason"] = f"could not read {manifest_path}: {e}"
+        return out
+    if not raw.strip():
+        out["checked"] = True
+        out["missing"].append(f"{manifest_path} (empty)")
+        return out
+    try:
+        manifest = json.loads(raw)
+    except ValueError as e:
+        out["checked"] = True
+        out["missing"].append(f"{manifest_path} (invalid JSON: {e})")
+        return out
+
+    out["checked"] = True
+    out["verified"].append("manifest.json")
+    for rel in _manifest_entry_points(manifest):
+        f = root / rel
+        if not f.is_file():
+            out["missing"].append(f"{rel} (declared in manifest.json, missing)")
+        elif f.stat().st_size == 0:
+            out["missing"].append(f"{rel} (declared in manifest.json, zero bytes)")
+        else:
+            out["verified"].append(rel)
+    out["ok"] = not out["missing"]
+    return out
+
+
+def source_tree_verdict(src: dict) -> str:
+    """One sentence about the source tree, honest about what was measured."""
+    if not src.get("checked"):
+        return (
+            f"Could not inspect the unpacked source tree at {src['path']} "
+            f"({src.get('reason', 'unknown error')}) — no claim made about its integrity."
+        )
+    if not src.get("ok"):
+        return (
+            f"The unpacked extension source tree at {src['path']} IS broken: "
+            + "; ".join(src["missing"])
+            + ". Repair those files, then re-run chrome-heal."
+        )
+    return (
+        f"The unpacked source tree at {src['path']} is INTACT "
+        f"(verified {len(src['verified'])} files: {', '.join(src['verified'])}) — "
+        "do NOT go looking for a corrupt extension. The likely cause is MV3 "
+        "service-worker eviction Chrome would not revive, a chrome://extensions "
+        "layout change that hid the reload control from the Accessibility tree, "
+        "or a Chrome modal stealing the window."
+    )
 
 
 # --------------------------------------------------------------------------
@@ -535,9 +649,14 @@ def attempt_load_unpacked(web, dry_run: bool = False) -> tuple[bool, str]:
     native-messaging allowlist stays valid.
     """
     prefs = extension_prefs_state()
-    ext_path = prefs.get("unpacked_path") or str(Path.home() / "dispatch/skills/chrome-control/extension")
-    if not (Path(ext_path) / "manifest.json").is_file():
-        return False, f"LOAD_UNPACKED_NO_SOURCE: {ext_path}/manifest.json missing — repair the tree first"
+    ext_path = prefs.get("unpacked_path") or str(DEFAULT_EXT_PATH)
+    src = verify_extension_source(ext_path)
+    if src["checked"] and not src["ok"]:
+        return False, (
+            f"LOAD_UNPACKED_NO_SOURCE: {ext_path} is not loadable — "
+            + "; ".join(src["missing"])
+            + " — repair the tree first"
+        )
 
     btn = find_load_unpacked_button(web)
     if btn is None:
@@ -826,6 +945,7 @@ def diagnose() -> dict:
         "ax_trusted": bool(AXIsProcessTrusted()),
         "ping_ok": ping_ok(timeout=15),
         "extension_prefs": extension_prefs_state(),
+        "extension_source": verify_extension_source(extension_prefs_state().get("unpacked_path")),
         "executable": sys.executable,
         "real_executable": os.path.realpath(sys.executable),
     }
@@ -898,13 +1018,30 @@ def main() -> int:
     if ax_untrusted:
         return finish(2, "FAILED: lower rungs did not recover and the AX rung was unavailable. " + next(a["detail"] for a in attempts if a["rung"] == "ax"))
 
+    # Last recovery rung before we escalate: the extension may have revived on
+    # its own while we were working (an MV3 service worker can come back
+    # whenever something talks to it). On 2026-08-03 a ping here would have
+    # shown healthy and suppressed the escalation entirely.
+    if ping_ok(timeout=15):
+        return finish(
+            0,
+            "healthy: no rung reported success, but `chrome ping` now succeeds — the "
+            "service worker came back on its own during recovery (no escalation needed). "
+            "Last rung detail: " + attempts[-1]["detail"],
+        )
+
     prefs = extension_prefs_state()
+    # Diagnose from what we MEASURED, never from what we assume. The previous
+    # wording asserted a broken source tree unconditionally; on 2026-08-03 that
+    # fired twice with every file intact.
+    src = verify_extension_source(prefs.get("unpacked_path"))
     return finish(
         1,
         "FAILED: every recovery rung was exhausted. "
         f"Extension prefs: {json.dumps(prefs)}. "
-        "Most likely the unpacked extension source tree is broken on disk (repair it, then "
-        "re-run chrome-heal) or a Chrome modal is blocking the UI. Last detail: "
+        + source_tree_verdict(src)
+        + " Manual fix: open chrome://extensions, turn on Developer mode, and click "
+        "the reload (⟳) button on the Chrome Control card. Last detail: "
         + attempts[-1]["detail"],
     )
 

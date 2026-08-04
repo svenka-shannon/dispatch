@@ -46,6 +46,234 @@ def log_perf(metric: str, value: float, **labels) -> None:
         pass  # Never fail on perf logging
 
 
+# ---------------------------------------------------------------------------
+# Wedged-Messages.app detection and recovery
+#
+# Messages.app can enter a state where the AppleScript account enumeration
+# (`1st account whose service type = iMessage`) blocks forever while the app
+# still answers trivial queries like `get name`. Observed 2026-08-04 00:09-00:21
+# EDT: every outbound send hung for ~12 minutes and the session went silent.
+#
+# Two layers of protection:
+#   1. `with timeout of N seconds` INSIDE the AppleScript turns the infinite
+#      block into a returnable AppleEvent error (-1712).
+#   2. A `timeout=` on the osascript subprocess catches the case where even the
+#      in-script timeout doesn't fire (osascript itself wedged).
+# When either fires we force-restart Messages.app and retry the send once.
+# ---------------------------------------------------------------------------
+
+# AppleScript-level timeouts (seconds). Text sends are near-instant; attachment
+# sends legitimately take longer because Messages copies/uploads the file.
+APPLESCRIPT_TEXT_TIMEOUT = 20
+APPLESCRIPT_FILE_TIMEOUT = 45
+# The subprocess timeout must be strictly larger than the AppleScript timeout so
+# the in-script `with timeout` gets a chance to produce a real error first.
+SUBPROCESS_TIMEOUT_MARGIN = 10
+
+# Signatures of "Messages.app is wedged", not "the send legitimately failed".
+WEDGE_MARKERS = ("-1712", "AppleEvent timed out")
+
+# Recovery timings (seconds).
+UNWEDGE_KILL_SETTLE = 3
+UNWEDGE_RELAUNCH_SETTLE = 8
+UNWEDGE_PROBE_TIMEOUT = 15
+
+BUS_DB_PATH = Path.home() / "dispatch" / "state" / "bus.db"
+
+
+def emit_bus_event(event_type: str, payload: dict, key: str | None = None) -> None:
+    """Fire-and-forget event onto the `system` bus topic.
+
+    send-sms is a standalone `uv run --script` CLI and cannot import the
+    daemon's Producer (it would spawn a writer thread and pull in the whole
+    assistant package for a sub-second process). This uses the same direct
+    sqlite3 insert idiom as `skills/sms-assistant/scripts/reply`: the offset
+    comes from the durable topic_offsets counter with the live-table MAX as a
+    floor, and the counter is advanced after the INSERT, so the daemon's
+    Producer is never wedged by a stale counter.
+    """
+    try:
+        import sqlite3
+
+        if not BUS_DB_PATH.exists():
+            return
+        conn = sqlite3.connect(str(BUS_DB_PATH), timeout=5)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                'SELECT COALESCE(MAX("offset"), -1) + 1 FROM records '
+                "WHERE topic = 'system' AND partition = 0"
+            ).fetchone()
+            live_next = row[0] if row else 0
+            row = conn.execute(
+                "SELECT next_offset FROM topic_offsets WHERE topic = 'system' AND partition = 0"
+            ).fetchone()
+            counter_next = row[0] if row else 0
+            next_offset = max(live_next, counter_next)
+            conn.execute(
+                'INSERT INTO records (topic, partition, "offset", timestamp, key, type, source, payload) '
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("system", 0, next_offset, int(time.time() * 1000), key,
+                 event_type, "send-sms", json.dumps(payload)),
+            )
+            conn.execute(
+                "INSERT INTO topic_offsets (topic, partition, next_offset) VALUES ('system', 0, ?) "
+                "ON CONFLICT(topic, partition) DO UPDATE SET next_offset = excluded.next_offset "
+                "WHERE excluded.next_offset > topic_offsets.next_offset",
+                (next_offset + 1,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass  # Never fail a send because of observability
+
+
+def messages_pid() -> int | None:
+    """PID of the main Messages.app process, or None if it isn't running."""
+    try:
+        out = subprocess.run(
+            ["pgrep", "-f", "Messages.app/Contents/MacOS/Messages"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    pids = [int(p) for p in out.split() if p.strip().isdigit()]
+    return pids[0] if pids else None
+
+
+def messages_responsive() -> bool:
+    """Cheap probe: can Messages still enumerate its iMessage account?
+
+    Probes the account OBJECT, not `name of` it — accounts have no `name`
+    property, so `get name of 1st account ...` returns error -1728 even on a
+    perfectly healthy Messages.app. Any non-timeout outcome (including a normal
+    AppleScript error) means the app is answering, which is all we need.
+    """
+    script = f'''
+    with timeout of {UNWEDGE_PROBE_TIMEOUT} seconds
+        tell application "Messages"
+            get 1st account whose service type = iMessage
+        end tell
+    end timeout
+    '''
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True,
+            timeout=UNWEDGE_PROBE_TIMEOUT + SUBPROCESS_TIMEOUT_MARGIN,
+        )
+    except subprocess.TimeoutExpired:
+        return False
+    return not is_wedge_error(result.stderr or "")
+
+
+def unwedge_messages_app() -> bool:
+    """Force-restart Messages.app to clear the wedged-AppleScript state.
+
+    kill -9 is deliberate and NOT a shortcut. During the 2026-08-04 incident
+    both `tell application "Messages" to quit` and a plain `pkill -x Messages`
+    were tried and BOTH failed — the same PID survived. Only SIGKILL followed by
+    `open -a Messages` cleared it, after which sends worked immediately.
+
+    Returns True if Messages came back and answers the account probe.
+    """
+    pid = messages_pid()
+    print(f"UNWEDGE|detected wedged Messages.app (pid={pid})", file=sys.stderr)
+    if pid is not None:
+        try:
+            subprocess.run(["kill", "-9", str(pid)], capture_output=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            print(f"UNWEDGE|failed to kill -9 pid {pid}", file=sys.stderr)
+            return False
+        time.sleep(UNWEDGE_KILL_SETTLE)
+
+    try:
+        subprocess.run(["open", "-a", "Messages"], capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        print("UNWEDGE|`open -a Messages` failed", file=sys.stderr)
+        return False
+    time.sleep(UNWEDGE_RELAUNCH_SETTLE)
+
+    ok = messages_responsive()
+    print(f"UNWEDGE|{'recovered' if ok else 'still wedged after relaunch'}", file=sys.stderr)
+    return ok
+
+
+def is_wedge_error(text: str) -> bool:
+    """True if osascript output carries an AppleEvent-timeout signature."""
+    return any(marker in text for marker in WEDGE_MARKERS)
+
+
+def _timeout_result(script: str, seconds: int) -> subprocess.CompletedProcess:
+    """A CompletedProcess standing in for an osascript that never returned."""
+    return subprocess.CompletedProcess(
+        args=["osascript", "-e", script], returncode=124,
+        stdout="", stderr=f"osascript did not return within {seconds}s (AppleEvent timed out)",
+    )
+
+
+def run_osascript(script: str, applescript_timeout: int, context: str) -> subprocess.CompletedProcess:
+    """Run a send AppleScript, recovering once from a wedged Messages.app.
+
+    Happy path is identical to a bare subprocess.run: same CompletedProcess,
+    same stdout/stderr/returncode. Only on a wedge signature do we force-restart
+    Messages.app and retry exactly once (never more) — a wedged app has already
+    cost the caller ~30s by this point, and looping would multiply that.
+
+    Note: a retry can in principle duplicate a message if the first send
+    actually reached the server before the reply hung. A duplicate is strictly
+    better than a silently-dropped reply, which is the failure this fixes.
+    """
+    subprocess_timeout = applescript_timeout + SUBPROCESS_TIMEOUT_MARGIN
+
+    def attempt() -> subprocess.CompletedProcess:
+        try:
+            return subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=subprocess_timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return _timeout_result(script, subprocess_timeout)
+
+    result = attempt()
+    if result.returncode == 0 or not is_wedge_error(result.stderr or ""):
+        return result
+
+    emit_bus_event(
+        "imessage.send_wedged",
+        {
+            "context": context,
+            "applescript_timeout_s": applescript_timeout,
+            "subprocess_timeout_s": subprocess_timeout,
+            "returncode": result.returncode,
+            "stderr": (result.stderr or "").strip(),
+            "messages_pid": messages_pid(),
+        },
+        key="send-sms",
+    )
+
+    if not unwedge_messages_app():
+        print(
+            "ERROR: Messages.app is wedged and could not be restarted; "
+            f"send aborted ({context})",
+            file=sys.stderr,
+        )
+        return result
+
+    print(f"UNWEDGE|retrying send ({context})", file=sys.stderr)
+    retry = attempt()
+    if retry.returncode != 0 and is_wedge_error(retry.stderr or ""):
+        print(
+            "ERROR: send timed out again after unwedging Messages.app; giving up "
+            f"({context}): {(retry.stderr or '').strip()}",
+            file=sys.stderr,
+        )
+    return retry
+
+
 def is_group_chat_id(identifier: str) -> bool:
     """Check if identifier looks like a group chat ID (hex string 20+ chars)."""
     return bool(re.match(r'^[a-f0-9]{20,}$', identifier.lower()))
@@ -221,17 +449,16 @@ def send_text_individual(phone: str, message: str) -> bool:
     # Escape for AppleScript (backslashes first, then quotes)
     escaped = message.replace('\\', '\\\\').replace('"', '\\"')
     script = f'''
-    tell application "Messages"
-        set targetService to 1st account whose service type = iMessage
-        set targetBuddy to buddy "{resolved}" of targetService
-        send "{escaped}" to targetBuddy
-    end tell
+    with timeout of {APPLESCRIPT_TEXT_TIMEOUT} seconds
+        tell application "Messages"
+            set targetService to 1st account whose service type = iMessage
+            set targetBuddy to buddy "{resolved}" of targetService
+            send "{escaped}" to targetBuddy
+        end tell
+    end timeout
     return "SENT|{resolved}"
     '''
-    result = subprocess.run(
-        ["osascript", "-e", script],
-        capture_output=True, text=True
-    )
+    result = run_osascript(script, APPLESCRIPT_TEXT_TIMEOUT, "text_individual")
     if result.returncode == 0:
         print(result.stdout.strip())
         return True
@@ -245,20 +472,19 @@ def send_text_group(chat_id: str, message: str) -> bool:
     # Escape for AppleScript (backslashes first, then quotes)
     escaped = message.replace('\\', '\\\\').replace('"', '\\"')
     script = f'''
-    tell application "Messages"
-        repeat with aChat in chats
-            if id of aChat contains "{chat_id}" then
-                send "{escaped}" to aChat
-                return "SENT_GROUP|{chat_id}"
-            end if
-        end repeat
-        return "ERROR|chat_not_found"
-    end tell
+    with timeout of {APPLESCRIPT_TEXT_TIMEOUT} seconds
+        tell application "Messages"
+            repeat with aChat in chats
+                if id of aChat contains "{chat_id}" then
+                    send "{escaped}" to aChat
+                    return "SENT_GROUP|{chat_id}"
+                end if
+            end repeat
+            return "ERROR|chat_not_found"
+        end tell
+    end timeout
     '''
-    result = subprocess.run(
-        ["osascript", "-e", script],
-        capture_output=True, text=True
-    )
+    result = run_osascript(script, APPLESCRIPT_TEXT_TIMEOUT, "text_group")
     output = result.stdout.strip()
     if result.returncode == 0 and "SENT_GROUP" in output:
         print(output)
@@ -290,17 +516,16 @@ def send_image_individual(phone: str, image_path: str) -> bool:
 
         script = f'''
         set theFile to POSIX file "{temp_path}"
-        tell application "Messages"
-            set targetService to 1st account whose service type = iMessage
-            set targetBuddy to buddy "{resolved}" of targetService
-            send file theFile to targetBuddy
-        end tell
+        with timeout of {APPLESCRIPT_FILE_TIMEOUT} seconds
+            tell application "Messages"
+                set targetService to 1st account whose service type = iMessage
+                set targetBuddy to buddy "{resolved}" of targetService
+                send file theFile to targetBuddy
+            end tell
+        end timeout
         return "SENT_IMAGE|{resolved}|{filename}"
         '''
-        result = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True, text=True
-        )
+        result = run_osascript(script, APPLESCRIPT_FILE_TIMEOUT, "image_individual")
 
         # Wait for send to start before cleanup
         time.sleep(2)
@@ -332,20 +557,19 @@ def send_image_group(chat_id: str, image_path: str) -> bool:
 
         script = f'''
         set theFile to POSIX file "{temp_path}"
-        tell application "Messages"
-            repeat with aChat in chats
-                if id of aChat contains "{chat_id}" then
-                    send file theFile to aChat
-                    return "SENT_IMAGE_GROUP|{chat_id}|{filename}"
-                end if
-            end repeat
-            return "ERROR|chat_not_found"
-        end tell
+        with timeout of {APPLESCRIPT_FILE_TIMEOUT} seconds
+            tell application "Messages"
+                repeat with aChat in chats
+                    if id of aChat contains "{chat_id}" then
+                        send file theFile to aChat
+                        return "SENT_IMAGE_GROUP|{chat_id}|{filename}"
+                    end if
+                end repeat
+                return "ERROR|chat_not_found"
+            end tell
+        end timeout
         '''
-        result = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True, text=True
-        )
+        result = run_osascript(script, APPLESCRIPT_FILE_TIMEOUT, "image_group")
 
         # Wait for send to start before cleanup
         time.sleep(2)
@@ -385,17 +609,16 @@ def send_file_individual(phone: str, file_path: str) -> bool:
 
         script = f'''
         set theFile to POSIX file "{temp_path}"
-        tell application "Messages"
-            set targetService to 1st account whose service type = iMessage
-            set targetBuddy to buddy "{resolved}" of targetService
-            send file theFile to targetBuddy
-        end tell
+        with timeout of {APPLESCRIPT_FILE_TIMEOUT} seconds
+            tell application "Messages"
+                set targetService to 1st account whose service type = iMessage
+                set targetBuddy to buddy "{resolved}" of targetService
+                send file theFile to targetBuddy
+            end tell
+        end timeout
         return "SENT_FILE|{resolved}|{filename}"
         '''
-        result = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True, text=True
-        )
+        result = run_osascript(script, APPLESCRIPT_FILE_TIMEOUT, "file_individual")
 
         # Wait for send to start before cleanup
         time.sleep(2)
@@ -427,20 +650,19 @@ def send_file_group(chat_id: str, file_path: str) -> bool:
 
         script = f'''
         set theFile to POSIX file "{temp_path}"
-        tell application "Messages"
-            repeat with aChat in chats
-                if id of aChat contains "{chat_id}" then
-                    send file theFile to aChat
-                    return "SENT_FILE_GROUP|{chat_id}|{filename}"
-                end if
-            end repeat
-            return "ERROR|chat_not_found"
-        end tell
+        with timeout of {APPLESCRIPT_FILE_TIMEOUT} seconds
+            tell application "Messages"
+                repeat with aChat in chats
+                    if id of aChat contains "{chat_id}" then
+                        send file theFile to aChat
+                        return "SENT_FILE_GROUP|{chat_id}|{filename}"
+                    end if
+                end repeat
+                return "ERROR|chat_not_found"
+            end tell
+        end timeout
         '''
-        result = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True, text=True
-        )
+        result = run_osascript(script, APPLESCRIPT_FILE_TIMEOUT, "file_group")
 
         # Wait for send to start before cleanup
         time.sleep(2)

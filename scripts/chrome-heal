@@ -48,6 +48,9 @@ STATES HANDLED
   * MV3 service worker evicted ............................. rung 1 (or 3)
   * extension errored / disabled ("needs a reload") ........ rung 2
   * extension toggled off (AXToggle/AXCheckBox off) ........ rung 2
+  * extension DROPPED (card gone, prefs state=null) ........ rung 2 (Load
+                      unpacked automated: presses the button, drives the
+                      NSOpenPanel blind via Cmd+Shift+G keystrokes)
   * Developer mode off (hides the reload button) ........... rung 2
   * Chrome's SW subsystem wedged ........................... rung 3
   * Chrome not running at all .............................. rung 3 (relaunch)
@@ -495,6 +498,95 @@ def find_card_reload_button(root):
     )
 
 
+def find_load_unpacked_button(root):
+    """The page-level 'Load unpacked' button (renders only with Developer mode on)."""
+    for el, role, label, _d in walk(root):
+        if role in ("AXButton", "AXLink") and "load unpacked" in label.lower():
+            return el
+    return None
+
+
+def send_keys(*cliclick_args: str) -> bool:
+    """Send keystrokes to the frontmost app via cliclick (kd:/t:/kp:/ku:)."""
+    vlog(f"cliclick {' '.join(cliclick_args)}")
+    try:
+        r = subprocess.run([CLICLICK, *cliclick_args], capture_output=True, text=True, timeout=15)
+        return r.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def attempt_load_unpacked(web, dry_run: bool = False) -> tuple[bool, str]:
+    """Re-register the unpacked extension when its card is GONE from the page.
+
+    Chrome drops an unpacked extension entirely (no card, prefs entry left
+    with state=null) when its registration breaks — seen Aug 2026 after the
+    MV3 SW died on a stale registration. No card means no reload button, so
+    the ax rung's press path can't help; the human fix was Developer mode →
+    Load unpacked → pick the folder. This automates exactly that:
+
+      press 'Load unpacked' → NSOpenPanel opens (a separate remote-view
+      process, opaque to Chrome's AX tree, so the panel is driven blind with
+      keystrokes) → Cmd+Shift+G → type the folder path → Return (navigate)
+      → Return (Select). Verify with `chrome ping`.
+
+    The unpacked-extension ID is derived from the absolute path, so
+    re-loading from the same folder keeps the same extension ID and the
+    native-messaging allowlist stays valid.
+    """
+    prefs = extension_prefs_state()
+    ext_path = prefs.get("unpacked_path") or str(Path.home() / "dispatch/skills/chrome-control/extension")
+    if not (Path(ext_path) / "manifest.json").is_file():
+        return False, f"LOAD_UNPACKED_NO_SOURCE: {ext_path}/manifest.json missing — repair the tree first"
+
+    btn = find_load_unpacked_button(web)
+    if btn is None:
+        return False, (
+            "LOAD_UNPACKED_NO_BUTTON: no 'Load unpacked' button on chrome://extensions/ "
+            "(Developer mode off despite toggle attempt, or page layout changed)"
+        )
+    if dry_run:
+        return False, f"DRY_RUN_OK: would press 'Load unpacked' and load {ext_path}"
+
+    # The panel takes keystrokes from the frontmost app — make sure that's Chrome.
+    subprocess.run(["open", "-a", "Google Chrome"], capture_output=True, check=False)
+    time.sleep(0.5)
+
+    if not (ax_press(btn) or cliclick_center(btn)):
+        return False, "LOAD_UNPACKED_PRESS_FAILED: could not press the 'Load unpacked' button"
+    time.sleep(1.5)  # NSOpenPanel animation
+
+    ok = (
+        send_keys("kd:cmd,shift", "t:g", "ku:cmd,shift")  # Go to folder sheet
+        and (time.sleep(0.8) or True)
+        and send_keys(f"t:{ext_path}")
+        and (time.sleep(0.5) or True)
+        and send_keys("kp:return")                        # navigate to folder
+        and (time.sleep(1.2) or True)
+        and send_keys("kp:return")                        # default button: Select
+    )
+    if not ok:
+        send_keys("kp:esc")
+        send_keys("kp:esc")
+        return False, "LOAD_UNPACKED_KEYS_FAILED: cliclick keystroke sequence failed — panel dismissed"
+
+    time.sleep(T_AFTER_RELOAD)
+    if wait_for_ping():
+        return True, f"re-registered the extension via Load unpacked ({ext_path})"
+    w = chrome_cli("wake", timeout=40)
+    vlog(f"post-load-unpacked wake rc={w.returncode}")
+    if wait_for_ping():
+        return True, f"re-registered the extension via Load unpacked + chrome wake ({ext_path})"
+    # Didn't recover — close any panel we may have left open.
+    send_keys("kp:esc")
+    send_keys("kp:esc")
+    return False, (
+        f"LOAD_UNPACKED_NO_RECOVERY: drove the Load unpacked dialog for {ext_path} but "
+        "`chrome ping` never went green — the panel may not have accepted the path, or "
+        "the extension errored on load"
+    )
+
+
 def find_developer_mode_toggle(root):
     """The page-level 'Developer mode' switch (AXCheckBox/AXToggle/AXSwitch)."""
     for el, role, label, _d in walk(root):
@@ -625,6 +717,11 @@ def rung_ax_reload(dry_run: bool = False) -> tuple[bool, str]:
 
     btn, how = find_card_reload_button(web)
     if btn is None:
+        if "no node labelled" in how:
+            # The card is GONE, not just missing its button — Chrome dropped
+            # the unpacked extension's registration. Re-register it.
+            log("card missing from chrome://extensions -> attempting Load unpacked")
+            return attempt_load_unpacked(web, dry_run=dry_run)
         return False, f"AX_NO_RELOAD_BUTTON: {how}"
 
     rect = ax_rect(btn)

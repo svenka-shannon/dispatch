@@ -1,0 +1,615 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = []
+# ///
+"""email — read Gmail over IMAP, with no browser and no third-party deps.
+
+WHY THIS EXISTS
+---------------
+Reading Gmail through browser automation is fragile: Gmail enforces Trusted
+Types (so JS injection is blocked), the DOM changes constantly, and the whole
+path depends on the chrome-control extension being alive. IMAP is a stable,
+scriptable protocol that keeps working when Chrome does not.
+
+CREDENTIAL
+----------
+A Gmail **App Password** (not the account password — Google rejects those for
+IMAP) stored in the macOS Keychain. Nothing is ever written to a file:
+
+    security add-generic-password -a svenka -s gmail-app-password -w 'xxxxxxxxxxxxxxxx'
+
+Generate one at https://myaccount.google.com/apppasswords (requires 2FA on).
+Read back with: security find-generic-password -a svenka -s gmail-app-password -w
+
+USAGE
+-----
+    email list [--limit N] [--from ADDR] [--subject TEXT] [--since DAYS] [--unread]
+    email read <uid> [--mark-read] [--headers-all] [--raw]
+    email search <query> [--limit N] [--gmail | --imap]
+    email mailboxes
+
+    Common flags: --mailbox NAME (default INBOX), --json, --account ADDR
+
+EXAMPLES
+--------
+    email list --limit 20 --unread
+    email list --from stripe.com --since 7
+    email search 'SUBJECT "invoice" SINCE 01-Aug-2026'
+    email search 'from:stripe has:attachment' --gmail
+    email read 184213
+
+NOTES
+-----
+  * IDs are IMAP **UIDs** — stable for the life of the mailbox, unlike
+    sequence numbers. `list`/`search` print them; `read` takes one.
+  * Message bodies are printed IN FULL. Never truncated. `--limit` caps the
+    number of *records*, never the content of one.
+  * Mailboxes are opened read-only, so listing/reading does NOT mark anything
+    as read. Pass `read --mark-read` if you deliberately want the \\Seen flag.
+"""
+from __future__ import annotations
+
+import argparse
+import email as email_pkg
+import imaplib
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+from email.header import decode_header, make_header
+from email.utils import parsedate_to_datetime
+from html.parser import HTMLParser
+
+IMAP_HOST = os.environ.get("DISPATCH_IMAP_HOST", "imap.gmail.com")
+IMAP_PORT = int(os.environ.get("DISPATCH_IMAP_PORT", "993"))
+DEFAULT_ACCOUNT = os.environ.get("DISPATCH_EMAIL_ADDRESS", "svenka.shannon@gmail.com")
+KEYCHAIN_SERVICE = os.environ.get("DISPATCH_EMAIL_KEYCHAIN_SERVICE", "gmail-app-password")
+KEYCHAIN_ACCOUNT = os.environ.get("DISPATCH_EMAIL_KEYCHAIN_ACCOUNT", "svenka")
+SOCKET_TIMEOUT = 45
+
+# IMAP SEARCH keys — used to tell a raw IMAP query from a Gmail-syntax one.
+IMAP_KEYS = {
+    "ALL", "ANSWERED", "BCC", "BEFORE", "BODY", "CC", "DELETED", "DRAFT",
+    "FLAGGED", "FROM", "HEADER", "KEYWORD", "LARGER", "NEW", "NOT", "OLD",
+    "ON", "OR", "RECENT", "SEEN", "SENTBEFORE", "SENTON", "SENTSINCE",
+    "SINCE", "SMALLER", "SUBJECT", "TEXT", "TO", "UID", "UNANSWERED",
+    "UNDELETED", "UNDRAFT", "UNFLAGGED", "UNKEYWORD", "UNSEEN",
+}
+
+
+class CliError(Exception):
+    """A failure worth showing the user verbatim, without a traceback."""
+
+
+# --------------------------------------------------------------------------
+# credential
+# --------------------------------------------------------------------------
+
+
+def keychain_password() -> str:
+    """Fetch the Gmail app password from the macOS Keychain.
+
+    Fails loudly and actionably: a missing credential is by far the most likely
+    first-run problem, so the error IS the fix.
+    """
+    try:
+        r = subprocess.run(
+            ["security", "find-generic-password", "-a", KEYCHAIN_ACCOUNT,
+             "-s", KEYCHAIN_SERVICE, "-w"],
+            capture_output=True, text=True, timeout=20,
+        )
+    except FileNotFoundError:
+        raise CliError("`security` not found — this tool requires macOS Keychain.")
+    except subprocess.TimeoutExpired:
+        raise CliError(
+            "`security find-generic-password` timed out (20s). The Keychain may be "
+            "locked or showing an unlock prompt; unlock it and retry."
+        )
+    if r.returncode != 0 or not r.stdout.strip():
+        raise CliError(
+            "No Gmail app password in the Keychain "
+            f"(service={KEYCHAIN_SERVICE!r}, account={KEYCHAIN_ACCOUNT!r}).\n"
+            "\n"
+            "Fix — generate an App Password at https://myaccount.google.com/apppasswords\n"
+            f"(signed in as {DEFAULT_ACCOUNT}; needs 2-Step Verification on), then store it:\n"
+            "\n"
+            f"    security add-generic-password -a {KEYCHAIN_ACCOUNT} "
+            f"-s {KEYCHAIN_SERVICE} -w 'xxxxxxxxxxxxxxxx'\n"
+            "\n"
+            "Add -U to that command to overwrite an existing entry. Use the App\n"
+            "Password, NOT the account password — Google rejects account passwords\n"
+            "for IMAP. Spaces in the 16-character password are optional.\n"
+            f"(security said: {(r.stderr or '').strip() or 'item not found'})"
+        )
+    # App passwords are shown as "abcd efgh ijkl mnop"; Google accepts either form,
+    # but stripping spaces avoids a class of copy-paste failures.
+    return r.stdout.strip().replace(" ", "")
+
+
+# --------------------------------------------------------------------------
+# connection
+# --------------------------------------------------------------------------
+
+
+def connect(account: str, mailbox: str, readonly: bool = True) -> imaplib.IMAP4_SSL:
+    password = keychain_password()
+    try:
+        conn = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, timeout=SOCKET_TIMEOUT)
+    except OSError as e:
+        raise CliError(f"Could not reach {IMAP_HOST}:{IMAP_PORT} — {e}")
+    try:
+        conn.login(account, password)
+    except imaplib.IMAP4.error as e:
+        detail = str(e)
+        raise CliError(
+            f"IMAP login failed for {account}: {detail}\n"
+            "\n"
+            "Checklist:\n"
+            f"  * The Keychain item (service={KEYCHAIN_SERVICE!r}, account="
+            f"{KEYCHAIN_ACCOUNT!r}) must hold a Gmail **App Password**, not the\n"
+            "    account password.\n"
+            "  * The App Password must belong to this same Google account.\n"
+            "  * Re-store it with:  security add-generic-password -U -a "
+            f"{KEYCHAIN_ACCOUNT} -s {KEYCHAIN_SERVICE} -w 'xxxxxxxxxxxxxxxx'"
+        )
+    try:
+        typ, data = conn.select(imap_quote(mailbox), readonly=readonly)
+    except imaplib.IMAP4.error as e:
+        conn.logout()
+        raise CliError(f"Could not open mailbox {mailbox!r}: {e}")
+    if typ != "OK":
+        conn.logout()
+        raise CliError(f"Could not open mailbox {mailbox!r}: {decode(data and data[0])}")
+    return conn
+
+
+def imap_quote(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def decode(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return str(value)
+
+
+def uid_search(conn: imaplib.IMAP4_SSL, criteria: list[str]) -> list[int]:
+    """UID SEARCH with UTF-8 support, newest last."""
+    if not criteria:
+        criteria = ["ALL"]
+    needs_utf8 = any(not c.isascii() for c in criteria)
+    if needs_utf8:
+        args = ["CHARSET", "UTF-8"] + criteria
+        encoded = [a.encode("utf-8") for a in args]
+        typ, data = conn.uid("SEARCH", *encoded)
+    else:
+        typ, data = conn.uid("SEARCH", None, *criteria)
+    if typ != "OK":
+        raise CliError(f"IMAP SEARCH failed: {decode(data and data[0])}")
+    raw = decode(data[0] if data else b"")
+    return [int(x) for x in raw.split() if x.isdigit()]
+
+
+# --------------------------------------------------------------------------
+# parsing helpers
+# --------------------------------------------------------------------------
+
+
+def header_str(raw) -> str:
+    """Decode an RFC 2047 header into plain text (never raises)."""
+    if raw is None:
+        return ""
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    try:
+        return str(make_header(decode_header(raw)))
+    except Exception:
+        return raw
+
+
+def fmt_date(raw: str) -> str:
+    try:
+        dt = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return raw or ""
+    if dt is None:
+        return raw or ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+class _HTMLToText(HTMLParser):
+    """Minimal, dependency-free HTML → text. Keeps every word; drops markup."""
+
+    _BLOCK = {
+        "p", "div", "br", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6",
+        "table", "section", "article", "header", "footer", "blockquote", "pre",
+    }
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self._skip = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style", "head"):
+            self._skip += 1
+        elif tag in self._BLOCK:
+            self.parts.append("\n")
+        elif tag == "a":
+            href = dict(attrs).get("href")
+            if href and not href.startswith(("javascript:", "#")):
+                self._pending_href = href
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style", "head"):
+            self._skip = max(0, self._skip - 1)
+        elif tag in self._BLOCK:
+            self.parts.append("\n")
+        elif tag == "a":
+            href = getattr(self, "_pending_href", None)
+            if href:
+                self.parts.append(f" <{href}>")
+                self._pending_href = None
+
+    def handle_data(self, data):
+        if not self._skip:
+            self.parts.append(data)
+
+    def text(self) -> str:
+        out = "".join(self.parts)
+        out = re.sub(r"[ \t\r\f\v]+", " ", out)
+        out = re.sub(r" ?\n ?", "\n", out)
+        out = re.sub(r"\n{3,}", "\n\n", out)
+        return out.strip()
+
+
+def html_to_text(html: str) -> str:
+    parser = _HTMLToText()
+    try:
+        parser.feed(html)
+        parser.close()
+    except Exception:
+        return html  # never lose content to a parser hiccup
+    return parser.text()
+
+
+def part_text(part) -> str:
+    payload = part.get_payload(decode=True)
+    if payload is None:
+        return ""
+    charset = part.get_content_charset() or "utf-8"
+    try:
+        return payload.decode(charset, "replace")
+    except LookupError:
+        return payload.decode("utf-8", "replace")
+
+
+def extract_body(msg) -> tuple[str, str]:
+    """(body_text, source) — prefers text/plain, falls back to stripped HTML."""
+    plains, htmls = [], []
+    for part in msg.walk():
+        if part.get_content_maintype() == "multipart":
+            continue
+        disp = str(part.get("Content-Disposition") or "")
+        if "attachment" in disp.lower():
+            continue
+        ctype = part.get_content_type()
+        if ctype == "text/plain":
+            plains.append(part_text(part))
+        elif ctype == "text/html":
+            htmls.append(part_text(part))
+    if any(p.strip() for p in plains):
+        return "\n".join(plains).strip(), "text/plain"
+    if any(h.strip() for h in htmls):
+        return html_to_text("\n".join(htmls)).strip(), "text/html (stripped)"
+    return "", "none"
+
+
+def attachments(msg) -> list[dict]:
+    out = []
+    for part in msg.walk():
+        disp = str(part.get("Content-Disposition") or "")
+        filename = part.get_filename()
+        if "attachment" not in disp.lower() and not filename:
+            continue
+        payload = part.get_payload(decode=True) or b""
+        out.append(
+            {
+                "filename": header_str(filename) or "(unnamed)",
+                "content_type": part.get_content_type(),
+                "bytes": len(payload),
+            }
+        )
+    return out
+
+
+# --------------------------------------------------------------------------
+# fetching
+# --------------------------------------------------------------------------
+
+
+ENVELOPE_ITEM = "(UID FLAGS BODY.PEEK[HEADER.FIELDS (DATE FROM TO CC SUBJECT MESSAGE-ID)])"
+_UID_RE = re.compile(rb"UID (\d+)")
+_FLAGS_RE = re.compile(rb"FLAGS \(([^)]*)\)")
+
+
+def fetch_envelopes(conn: imaplib.IMAP4_SSL, uids: list[int]) -> list[dict]:
+    if not uids:
+        return []
+    typ, data = conn.uid("FETCH", ",".join(str(u) for u in uids), ENVELOPE_ITEM)
+    if typ != "OK":
+        raise CliError(f"IMAP FETCH failed: {decode(data and data[0])}")
+
+    rows: list[dict] = []
+    for item in data:
+        if not isinstance(item, tuple) or len(item) < 2:
+            continue
+        meta, raw_headers = item[0], item[1]
+        uid_m = _UID_RE.search(meta)
+        flags_m = _FLAGS_RE.search(meta)
+        flags = decode(flags_m.group(1)).split() if flags_m else []
+        headers = email_pkg.message_from_bytes(raw_headers)
+        rows.append(
+            {
+                "uid": int(uid_m.group(1)) if uid_m else None,
+                "date": header_str(headers.get("Date")),
+                "date_display": fmt_date(header_str(headers.get("Date"))),
+                "from": header_str(headers.get("From")),
+                "to": header_str(headers.get("To")),
+                "cc": header_str(headers.get("Cc")),
+                "subject": header_str(headers.get("Subject")),
+                "message_id": header_str(headers.get("Message-ID")),
+                "flags": flags,
+                "unread": "\\Seen" not in flags,
+            }
+        )
+    order = {u: i for i, u in enumerate(uids)}
+    rows.sort(key=lambda r: order.get(r["uid"], 0))
+    return rows
+
+
+def fetch_message(conn: imaplib.IMAP4_SSL, uid: int, peek: bool = True):
+    item = "(BODY.PEEK[])" if peek else "(RFC822)"
+    typ, data = conn.uid("FETCH", str(uid), item)
+    if typ != "OK":
+        raise CliError(f"IMAP FETCH failed for UID {uid}: {decode(data and data[0])}")
+    for entry in data:
+        if isinstance(entry, tuple) and len(entry) >= 2 and entry[1]:
+            return email_pkg.message_from_bytes(entry[1])
+    raise CliError(
+        f"No message with UID {uid} in this mailbox. UIDs are per-mailbox — if it came "
+        "from `email list --mailbox X`, pass the same --mailbox to `email read`."
+    )
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+
+
+def print_list(rows: list[dict], as_json: bool, mailbox: str, total: int) -> None:
+    if as_json:
+        print(json.dumps({"mailbox": mailbox, "matched": total, "shown": len(rows),
+                          "messages": rows}, indent=2))
+        return
+    if not rows:
+        print(f"No messages matched in {mailbox}.")
+        return
+    print(f"{len(rows)} of {total} matching message(s) in {mailbox}, newest first:\n")
+    for r in rows:
+        mark = "UNREAD" if r["unread"] else "read  "
+        print(f"[{r['uid']}] {mark}  {r['date_display']}")
+        print(f"    From:    {r['from']}")
+        print(f"    Subject: {r['subject']}")
+        print()
+    print(f"Read one with:  email read <uid>{'' if mailbox == 'INBOX' else f' --mailbox {mailbox!r}'}")
+
+
+def print_message(msg, uid: int, as_json: bool, headers_all: bool, raw: bool) -> None:
+    if raw:
+        sys.stdout.write(msg.as_string())
+        return
+    body, source = extract_body(msg)
+    atts = attachments(msg)
+    if as_json:
+        payload = {
+            "uid": uid,
+            "date": header_str(msg.get("Date")),
+            "from": header_str(msg.get("From")),
+            "to": header_str(msg.get("To")),
+            "cc": header_str(msg.get("Cc")),
+            "subject": header_str(msg.get("Subject")),
+            "message_id": header_str(msg.get("Message-ID")),
+            "body": body,
+            "body_source": source,
+            "attachments": atts,
+        }
+        if headers_all:
+            payload["headers"] = {k: header_str(v) for k, v in msg.items()}
+        print(json.dumps(payload, indent=2))
+        return
+
+    print(f"UID:     {uid}")
+    print(f"Date:    {header_str(msg.get('Date'))}")
+    print(f"From:    {header_str(msg.get('From'))}")
+    if msg.get("To"):
+        print(f"To:      {header_str(msg.get('To'))}")
+    if msg.get("Cc"):
+        print(f"Cc:      {header_str(msg.get('Cc'))}")
+    print(f"Subject: {header_str(msg.get('Subject'))}")
+    if headers_all:
+        print("\n--- all headers ---")
+        for k, v in msg.items():
+            print(f"{k}: {header_str(v)}")
+    if atts:
+        print("\nAttachments:")
+        for a in atts:
+            print(f"  - {a['filename']} ({a['content_type']}, {a['bytes']} bytes)")
+    print(f"\n--- body ({source}) ---")
+    print(body if body else "(no text body)")
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+
+
+def build_criteria(args) -> list[str]:
+    criteria: list[str] = []
+    if args.unread:
+        criteria.append("UNSEEN")
+    if getattr(args, "sender", None):
+        criteria += ["FROM", imap_quote(args.sender)]
+    if getattr(args, "subject", None):
+        criteria += ["SUBJECT", imap_quote(args.subject)]
+    if getattr(args, "since", None):
+        day = (datetime.now(timezone.utc) - timedelta(days=args.since)).strftime("%d-%b-%Y")
+        criteria += ["SINCE", day]
+    return criteria or ["ALL"]
+
+
+def cmd_list(args) -> int:
+    conn = connect(args.account, args.mailbox)
+    try:
+        uids = uid_search(conn, build_criteria(args))
+        newest = list(reversed(uids))[: args.limit]
+        rows = fetch_envelopes(conn, newest)
+        rows.sort(key=lambda r: newest.index(r["uid"]) if r["uid"] in newest else 0)
+        print_list(rows, args.json, args.mailbox, len(uids))
+    finally:
+        close(conn)
+    return 0
+
+
+def cmd_search(args) -> int:
+    query = args.query
+    first = query.strip().split(" ", 1)[0].upper().lstrip("(")
+    use_gmail = args.gmail or (not args.imap and first not in IMAP_KEYS)
+    criteria = ["X-GM-RAW", imap_quote(query)] if use_gmail else [query]
+
+    conn = connect(args.account, args.mailbox)
+    try:
+        try:
+            uids = uid_search(conn, criteria)
+        except CliError as e:
+            if use_gmail and not args.gmail:
+                raise CliError(
+                    f"{e}\n\nInterpreted {query!r} as a Gmail-syntax query (X-GM-RAW). "
+                    "Force raw IMAP syntax with --imap, e.g. "
+                    "email search 'SUBJECT \"invoice\" SINCE 01-Aug-2026' --imap"
+                )
+            raise
+        newest = list(reversed(uids))[: args.limit]
+        rows = fetch_envelopes(conn, newest)
+        if not args.json:
+            print(f"Query: {query!r} ({'Gmail syntax' if use_gmail else 'IMAP syntax'})")
+        print_list(rows, args.json, args.mailbox, len(uids))
+    finally:
+        close(conn)
+    return 0
+
+
+def cmd_read(args) -> int:
+    conn = connect(args.account, args.mailbox, readonly=not args.mark_read)
+    try:
+        msg = fetch_message(conn, args.uid, peek=not args.mark_read)
+        print_message(msg, args.uid, args.json, args.headers_all, args.raw)
+        if args.mark_read:
+            conn.uid("STORE", str(args.uid), "+FLAGS", "(\\Seen)")
+    finally:
+        close(conn)
+    return 0
+
+
+def cmd_mailboxes(args) -> int:
+    conn = connect(args.account, "INBOX")
+    try:
+        typ, data = conn.list()
+        if typ != "OK":
+            raise CliError("IMAP LIST failed")
+        names = []
+        for line in data:
+            line = decode(line)
+            m = re.search(r'"[^"]*" (?:"(?P<q>[^"]+)"|(?P<u>\S+))\s*$', line)
+            if m:
+                names.append(m.group("q") or m.group("u"))
+        if args.json:
+            print(json.dumps({"mailboxes": names}, indent=2))
+        else:
+            for n in names:
+                print(n)
+    finally:
+        close(conn)
+    return 0
+
+
+def close(conn) -> None:
+    try:
+        conn.close()
+    except Exception:
+        pass
+    try:
+        conn.logout()
+    except Exception:
+        pass
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        prog="email",
+        description="Read Gmail over IMAP (stdlib only). Credential lives in the macOS Keychain.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    p.add_argument("--account", default=DEFAULT_ACCOUNT, help=f"IMAP account (default {DEFAULT_ACCOUNT})")
+    p.add_argument("--mailbox", default="INBOX", help="mailbox/folder (default INBOX)")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    lst = sub.add_parser("list", help="list messages, newest first")
+    lst.add_argument("--limit", type=int, default=20, help="max messages to show (default 20)")
+    lst.add_argument("--from", dest="sender", help="filter by sender substring")
+    lst.add_argument("--subject", help="filter by subject substring")
+    lst.add_argument("--since", type=int, help="only messages from the last N days")
+    lst.add_argument("--unread", action="store_true", help="only unread (UNSEEN) messages")
+    lst.set_defaults(func=cmd_list)
+
+    rd = sub.add_parser("read", help="print one message in full (never truncated)")
+    rd.add_argument("uid", type=int, help="UID from `email list` / `email search`")
+    rd.add_argument("--mark-read", action="store_true", help="also set the \\Seen flag")
+    rd.add_argument("--headers-all", action="store_true", help="dump every header")
+    rd.add_argument("--raw", action="store_true", help="print the raw RFC822 source")
+    rd.set_defaults(func=cmd_read)
+
+    se = sub.add_parser("search", help="search with Gmail or IMAP syntax")
+    se.add_argument("query", help="e.g. 'from:stripe has:attachment' or 'SUBJECT \"invoice\"'")
+    se.add_argument("--limit", type=int, default=20, help="max messages to show (default 20)")
+    se.add_argument("--gmail", action="store_true", help="force Gmail syntax (X-GM-RAW)")
+    se.add_argument("--imap", action="store_true", help="force raw IMAP SEARCH syntax")
+    se.set_defaults(func=cmd_search)
+
+    mb = sub.add_parser("mailboxes", help="list mailboxes/labels")
+    mb.set_defaults(func=cmd_mailboxes)
+
+    args = p.parse_args()
+    try:
+        return args.func(args)
+    except CliError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    except imaplib.IMAP4.error as e:
+        print(f"error: IMAP failure: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

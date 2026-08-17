@@ -1,24 +1,50 @@
 ---
 name: google-suite
-description: Access Google services (Gmail, Calendar, Drive, Docs, Sheets, Tasks, Contacts, Chat) via gws CLI. Trigger words - google, gmail, email, calendar, drive, docs, sheets, tasks, meeting, event.
+description: API reference for the gws CLI (Google Workspace - Calendar, Drive, Docs, Sheets, Tasks, Contacts, Chat). NOTE - gws is NOT installed on this machine and there are no Google credentials, so nothing here runs until someone installs and authenticates it; for Gmail use the `email` skill (IMAP) instead. Trigger words - google workspace, gws, calendar, drive, docs, sheets, tasks, meeting, event.
 ---
 
 # Google Suite Skill
 
-Access all Google Workspace APIs via the `gws` CLI (googleworkspace/cli). This is the official Google Workspace CLI.
+Reference for the `gws` CLI (googleworkspace/cli), the official Google Workspace CLI.
 
-## CLI Location
+## ⚠️ STATUS: NOT INSTALLED ON THIS MACHINE
 
-Binary: `~/.local/bin/gws`
-
-## Authentication
-
-Already authenticated via browser OAuth. To re-auth or add accounts:
+**`gws` is not installed and no Google OAuth credentials exist here.** Everything below is
+API *reference* for after someone installs and authenticates it — none of it runs today.
+This file previously claimed the binary lived at `~/.local/bin/gws` and was "already
+authenticated via browser OAuth"; both claims were false and cost a session real time
+(2026-08-16). Verify before relying on it:
 
 ```bash
-gws auth login              # Browser-based OAuth
-gws auth status             # Check current auth
+command -v gws || echo "gws NOT installed"
 ```
+
+### For Gmail, use the `email` skill instead
+
+`~/.claude/skills/email/scripts/email` reads Gmail over IMAP with Python stdlib only —
+no OAuth, no browser, no `gws`. It works today (credential: a Gmail App Password in the
+macOS Keychain). See `/email`.
+
+```bash
+email list --limit 20 --unread
+email read <uid>
+email search 'from:stripe has:attachment' --gmail
+```
+
+Calendar / Drive / Docs / Sheets / Tasks have **no working CLI on this machine** right now.
+
+### Installing gws (if you actually need it)
+
+```bash
+brew install googleworkspace-cli   # installs the `gws` binary
+gws auth login                     # browser-based OAuth — needs a human at the browser
+gws auth status                    # confirm
+```
+
+Installing gives you the binary, not access: `gws auth login` opens an OAuth consent flow
+that a human must complete, and a Google Cloud project with the relevant APIs enabled may
+be required. Do not report Google Workspace access as available until `gws auth status`
+succeeds.
 
 ## CLI Syntax
 
@@ -129,6 +155,9 @@ The `recipe-*` sub-skills provide step-by-step guides for common operations:
 | ... and more |
 
 ## Quick Examples
+
+**Reminder: none of these run on this machine yet — `gws` is not installed (see the status
+section at the top). For Gmail, use `email list` / `email read` / `email search` instead.**
 
 ### Gmail
 

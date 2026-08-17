@@ -99,6 +99,21 @@ So a wedged Chrome is self-healing now. If `chrome wake` prints *"Service worker
 - *"Confirmed: Chrome has the chrome-control extension DISABLED/errored (…)"* — previously **the one genuinely human-required state** (Chrome stops auto-restarting an extension after ~5 service-worker crashes; Chrome ≥149 also auto-disables unpacked dev-mode extensions after a browser update). Now handled by chrome-heal's AX rung. Manual fallback: reload it **once** at `chrome://extensions/` → Developer mode → reload ⟳ (or toggle it off/on). Pass along the reason in the parens if there is one.
 - *"Chrome's Preferences say the extension is still ENABLED"* — a **different** failure: Chrome's service-worker subsystem is wedged, not the extension. Ask the admin to fully quit and reopen Google Chrome first; only if that doesn't fix it, fall back to the `chrome://extensions/` reload.
 - *"Could not confirm the extension's state…"* — couldn't read the Default profile's Preferences (the extension may be loaded in a different Chrome profile). Best ask: reload it once at `chrome://extensions/`, and restart Chrome if that doesn't help.
+- *"PROFILE MISMATCH — the extension is installed in Default (Svenka) but Chrome's active profile is Profile 1 (Eric)"* — **not a broken extension.** chrome-heal now surveys every Chrome profile (`Local State` → `info_cache` + `last_active_profiles`) instead of only reading `Default`, so "Chrome is on the wrong profile" no longer masquerades as "the extension is missing/broken" (the 2026-08-03 outage). The fix it prints is exact: `open -a "Google Chrome" --args --profile-directory="Default"`.
+
+### The recover.html rung (no human, no Accessibility)
+
+The nastiest failure is the **"deaf" service worker**: Chrome reports the worker as *running* but no event listener ever fires, so `ping`/`wake`/`reset` all fail. (Idle eviction is *not* it — native messaging grants a strong keepalive.) An extension **page** runs in a separate renderer from the worker, and it can call `chrome.runtime.reload()` even when the worker is dead or deaf. That is what `extension/recover.html` + `recover.js` do:
+
+```bash
+open -a "Google Chrome" "chrome-extension://cpmffhepnhgdhdamobkamndnfndilngo/recover.html"
+sleep 5 && chrome ping     # ALWAYS verify with a real ping
+```
+
+- No `web_accessible_resources` entry is needed — that key only gates navigation from *web* origins; browser/omnibox-initiated navigation to `chrome-extension://` is allowed. **Verified empirically on Chrome 151.**
+- The page reloads the extension (new native-host PID + new socket), then the tab disappears with the renderer; `chrome-heal` closes any leftover.
+- It is `chrome-heal`'s **rung 2** (`chrome-heal --rung page`), between `reset` and the AX rung, and it reports success **only** when `chrome ping` is green.
+- It cannot fix a *disabled* extension (a disabled extension can't serve its own pages) — that falls through to the AX rung.
 
 `chrome wake` exits 0 only when it actually reconnected, non-zero otherwise — so `chrome reset`, the daemon's chrome-control check, and chat sessions can all branch on it.
 

@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<!--
+  recover.html — human-free recovery for a dead/"deaf" MV3 service worker.
+
+  WHY: Chrome's MV3 service worker can enter a state where it is nominally
+  "running" but no event listeners ever fire (the "deaf service worker" bug
+  class). In that state `chrome ping`, `chrome wake` and `chrome reset` all
+  fail and the documented fix is a HUMAN clicking the reload (⟳) button on
+  chrome://extensions.
+
+  An extension *page* like this one runs in its own renderer process, entirely
+  separate from the service worker, and it can call chrome.runtime.reload()
+  even when the worker is dead or deaf. Browser-initiated navigation (omnibox
+  / `open -a "Google Chrome" chrome-extension://<id>/recover.html`) to an
+  extension page is permitted, so this file turns the human step into a shell
+  command. See scripts/chrome-heal (rung "page").
+-->
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Chrome Control — Recovery</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #0b0d10;
+      color: #e6e8eb;
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+    }
+    .card {
+      width: min(560px, 90vw);
+      padding: 28px 32px;
+      border: 1px solid #23272d;
+      border-radius: 12px;
+      background: #12151a;
+    }
+    h1 { margin: 0 0 4px; font-size: 18px; font-weight: 600; }
+    .sub { margin: 0 0 20px; font-size: 13px; color: #8b939e; }
+    .row { display: flex; align-items: center; gap: 10px; margin-top: 12px; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: #eab308; flex: none; }
+    .dot.ok { background: #22c55e; }
+    .dot.err { background: #ef4444; }
+    #status { font-size: 15px; font-weight: 500; }
+    #detail { margin-top: 14px; font-size: 12px; line-height: 1.5; color: #8b939e; white-space: pre-wrap; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #a5b4fc; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Chrome Control — Recovery</h1>
+    <p class="sub">Reloading the extension from a page context (the service worker is not involved).</p>
+    <div class="row">
+      <div class="dot" id="dot"></div>
+      <div id="status">Starting…</div>
+    </div>
+    <div id="detail"></div>
+  </div>
+  <script src="recover.js"></script>
+</body>
+</html>

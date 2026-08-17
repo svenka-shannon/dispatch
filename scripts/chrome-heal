@@ -27,7 +27,18 @@ THE LADDER
   Rung 0  preflight   `chrome ping`. Already healthy -> exit 0 (unless --force).
   Rung 1  reset       `chrome reset` (kills wedged native_host, auto-wakes the
                       service worker). Fixes: hung native host, evicted SW.
-  Rung 2  ax-reload   Drive chrome://extensions/ through the macOS
+  Rung 2  page        Navigate Chrome to the extension's own recover.html
+                      (`open -a "Google Chrome" chrome-extension://<id>/recover.html`).
+                      That page runs in a *renderer*, not the service worker,
+                      so it can call chrome.runtime.reload() even when the
+                      worker is dead or "deaf" (running but firing no
+                      listeners -- the M147/M148 bug class). This is the
+                      programmatic equivalent of the human ⟳ click, with no
+                      Accessibility permission and no UI driving. Requires the
+                      extension to still be *enabled* (a disabled extension
+                      cannot serve its own pages) -- that case falls through
+                      to the AX rung.
+  Rung 3  ax-reload   Drive chrome://extensions/ through the macOS
                       Accessibility API and press the card's reload button --
                       the programmatic equivalent of the human fix. Fixes: the
                       errored/disabled unpacked-extension state, which is the
@@ -35,25 +46,31 @@ THE LADDER
                       Developer mode on and the per-extension enable toggle on
                       if either is off. Falls back to cliclick at the AX
                       element's own screen rect if AXPress is unavailable.
-  Rung 3  restart     Quit Chrome (pkill), relaunch, `chrome wake`. Fixes: a
+  Rung 4  restart     Quit Chrome (pkill), relaunch, `chrome wake`. Fixes: a
                       wedged Chrome service-worker subsystem. Note a restart
                       does NOT reliably clear a hard "errored" unpacked
                       extension -- Chrome restores the disabled state from
-                      Preferences -- which is exactly why rung 2 exists and
+                      Preferences -- which is exactly why rung 3 exists and
                       runs first.
 
 STATES HANDLED
 --------------
   * native_host wedged / pegged at 100% CPU ................ rung 1
-  * MV3 service worker evicted ............................. rung 1 (or 3)
-  * extension errored / disabled ("needs a reload") ........ rung 2
-  * extension toggled off (AXToggle/AXCheckBox off) ........ rung 2
-  * extension DROPPED (card gone, prefs state=null) ........ rung 2 (Load
+  * MV3 service worker evicted ............................. rung 1 (or 2)
+  * "deaf" service worker (running, no listeners fire) ..... rung 2
+  * extension errored / disabled ("needs a reload") ........ rung 3
+  * extension toggled off (AXToggle/AXCheckBox off) ........ rung 3
+  * extension DROPPED (card gone, prefs state=null) ........ rung 3 (Load
                       unpacked automated: presses the button, drives the
                       NSOpenPanel blind via Cmd+Shift+G keystrokes)
-  * Developer mode off (hides the reload button) ........... rung 2
-  * Chrome's SW subsystem wedged ........................... rung 3
-  * Chrome not running at all .............................. rung 3 (relaunch)
+  * Developer mode off (hides the reload button) ........... rung 3
+  * Chrome's SW subsystem wedged ........................... rung 4
+  * Chrome not running at all .............................. rung 4 (relaunch)
+  * Chrome sitting on a profile that lacks the extension ... diagnosed by
+                      name (profile_verdict) instead of being misreported as
+                      a broken/missing extension -- see the 2026-08-03 outage,
+                      where the extension was healthy in the "Svenka" profile
+                      the whole time.
 
 STATES *NOT* HANDLED (still need a human)
 -----------------------------------------
@@ -77,7 +94,7 @@ USAGE
 -----
     scripts/chrome-heal                 # heal if unhealthy, no-op if healthy
     scripts/chrome-heal --force         # run the ladder even if ping is OK
-    scripts/chrome-heal --rung ax       # run exactly one rung (reset|ax|restart)
+    scripts/chrome-heal --rung page     # one rung (reset|page|ax|restart)
     scripts/chrome-heal --dry-run       # AX discovery only; presses nothing
     scripts/chrome-heal --diagnose      # print health + AX + prefs state, exit
     scripts/chrome-heal --json          # machine-readable result on stdout
@@ -116,12 +133,15 @@ NATIVE_HOST_MANIFEST = (
     Path.home()
     / "Library/Application Support/Google/Chrome/NativeMessagingHosts/com.dispatch.chrome_control.json"
 )
-CHROME_DEFAULT_PROFILE_DIR = Path.home() / "Library/Application Support/Google/Chrome/Default"
+CHROME_USER_DATA_DIR = Path.home() / "Library/Application Support/Google/Chrome"
+CHROME_DEFAULT_PROFILE_DIR = CHROME_USER_DATA_DIR / "Default"
 CLICLICK = "/opt/homebrew/bin/cliclick"
 
 EXTENSIONS_URL = "chrome://extensions/"
 # The extension's user-visible name as it appears on the chrome://extensions card.
 EXT_NAME = "Chrome Control"
+# Page shipped inside the extension that reloads it from a renderer context.
+RECOVER_PAGE = "recover.html"
 
 # --- timings (seconds). Tuned on a 2026 Apple-silicon Mac; see the report. ---
 T_PAGE_LOAD = 3.0  # after `open chrome://extensions/` before the AX tree is usable
@@ -131,6 +151,8 @@ T_PING_POLL = 0.5  # poll interval while waiting for `chrome ping` to go green
 T_PING_WAIT = 20.0  # total wait for ping after a reload/wake
 T_CHROME_QUIT = 3.0  # after pkill before relaunching
 T_CHROME_BOOT = 6.0  # after `open -a Google Chrome` before talking to it
+T_RECOVER_SETTLE = 4.0  # after opening recover.html before expecting the reload
+T_RECOVER_PING_WAIT = 25.0  # total ping budget after the page-triggered reload
 
 VERBOSE = False
 
@@ -205,9 +227,61 @@ def extension_id() -> str | None:
     return None
 
 
-def extension_prefs_state() -> dict:
-    """Read the Default profile's prefs to see if Chrome thinks the extension
-    is enabled.
+def chrome_local_state() -> dict:
+    """Chrome's `Local State` (profile roster + which profile(s) were last used)."""
+    try:
+        with open(CHROME_USER_DATA_DIR / "Local State") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def chrome_profiles() -> list[dict]:
+    """Every Chrome profile on this machine, and which one Chrome is sitting on.
+
+    WHY THIS EXISTS: on 2026-08-03 chrome-heal reported the extension as
+    missing/broken while it was installed and healthy -- Chrome was simply
+    showing a *different profile* ("Eric") than the one holding the extension
+    ("Svenka"). Reading only the Default profile cannot tell those apart, and
+    the misdiagnosis sent a human hunting a nonexistent corruption.
+
+    `last_used` / `last_active_profiles` come from Local State; Chrome writes
+    them when the active profile changes, so they are a good (not perfect)
+    proxy for "the profile whose window is in front".
+    """
+    prof = chrome_local_state().get("profile", {}) or {}
+    info = prof.get("info_cache", {}) or {}
+    last_used = prof.get("last_used") or "Default"
+    active = [p for p in (prof.get("last_active_profiles") or []) if p] or [last_used]
+
+    dirs = list(info.keys())
+    if not dirs:  # Local State unreadable -- fall back to scanning the disk
+        try:
+            dirs = sorted(
+                d.name
+                for d in CHROME_USER_DATA_DIR.iterdir()
+                if d.is_dir() and ((d / "Secure Preferences").is_file() or (d / "Preferences").is_file())
+            )
+        except OSError:
+            dirs = ["Default"]
+
+    out = []
+    for d in dirs:
+        meta = info.get(d, {}) or {}
+        out.append(
+            {
+                "dir": d,
+                "name": meta.get("name") or d,
+                "user_name": meta.get("user_name") or "",
+                "active": d in active,
+                "last_used": d == last_used,
+            }
+        )
+    return out
+
+
+def _read_ext_entry(profile_dir: str, ext_id: str) -> dict | None:
+    """The extension's prefs entry inside one profile, normalised.
 
     Two gotchas this handles that the chrome-control CLI's own
     `extension_prefs_state()` does not:
@@ -220,12 +294,9 @@ def extension_prefs_state() -> dict:
         extension (verified against this machine's live, working extension).
         Enabled == state in (None, 1) AND disable_reasons == 0.
     """
-    ext_id = extension_id()
-    if not ext_id:
-        return {"found": False, "reason": "could not resolve extension id"}
     for fname in ("Secure Preferences", "Preferences"):
         try:
-            with open(CHROME_DEFAULT_PROFILE_DIR / fname) as f:
+            with open(CHROME_USER_DATA_DIR / profile_dir / fname) as f:
                 prefs = json.load(f)
         except (OSError, ValueError):
             continue
@@ -255,7 +326,143 @@ def extension_prefs_state() -> dict:
             "disable_reasons": mask,
             "unpacked_path": entry.get("path"),
         }
-    return {"found": False, "ext_id": ext_id, "reason": "not in Default profile prefs"}
+    return None
+
+
+def extension_profile_survey() -> dict:
+    """Where the extension is installed, per profile, and where Chrome is looking.
+
+    This is what distinguishes "not installed in the profile Chrome is showing"
+    from "installed but broken" -- two states that look identical if you only
+    ever read the Default profile.
+    """
+    ext_id = extension_id()
+    survey: dict = {
+        "ext_id": ext_id,
+        "profiles": [],
+        "installed_in": [],
+        "active": [],
+        "wrong_profile": False,
+    }
+    if not ext_id:
+        survey["reason"] = "could not resolve extension id from the native-host manifest"
+        return survey
+
+    for p in chrome_profiles():
+        entry = _read_ext_entry(p["dir"], ext_id)
+        rec = dict(p)
+        rec["installed"] = entry is not None
+        if entry:
+            rec.update(
+                {
+                    "enabled": entry["enabled"],
+                    "state": entry["state"],
+                    "disable_reasons": entry["disable_reasons"],
+                    "unpacked_path": entry["unpacked_path"],
+                    "source": entry["source"],
+                }
+            )
+            survey["installed_in"].append(p["dir"])
+        if p["active"]:
+            survey["active"].append(p["dir"])
+        survey["profiles"].append(rec)
+
+    survey["wrong_profile"] = bool(survey["installed_in"]) and not (
+        set(survey["installed_in"]) & set(survey["active"])
+    )
+    return survey
+
+
+def extension_prefs_state() -> dict:
+    """Chrome's view of the extension, taken from the most relevant profile.
+
+    Prefers the profile Chrome is actually sitting on; falls back to any
+    profile that has the extension so the caller still learns the unpacked
+    path. Always carries the profile context so nothing downstream can repeat
+    the "it's missing!" misdiagnosis of the 2026-08-03 outage.
+    """
+    survey = extension_profile_survey()
+    ext_id = survey.get("ext_id")
+    if not ext_id:
+        return {"found": False, "reason": survey.get("reason", "could not resolve extension id")}
+
+    installed = [p for p in survey["profiles"] if p.get("installed")]
+    chosen = next((p for p in installed if p.get("active")), None) or (installed[0] if installed else None)
+
+    common = {
+        "ext_id": ext_id,
+        "profiles_installed_in": [p["dir"] for p in installed],
+        "profile_names_installed_in": [p["name"] for p in installed],
+        "active_profiles": survey["active"],
+        "wrong_profile": survey["wrong_profile"],
+    }
+    if chosen is None:
+        return {
+            "found": False,
+            "reason": "not present in ANY Chrome profile's prefs "
+            f"(checked: {', '.join(p['dir'] for p in survey['profiles']) or 'none'})",
+            **common,
+        }
+    return {
+        "found": True,
+        "profile": chosen["dir"],
+        "profile_name": chosen["name"],
+        "profile_is_active": chosen["active"],
+        "source": chosen["source"],
+        "enabled": chosen["enabled"],
+        "state": chosen["state"],
+        "disable_reasons": chosen["disable_reasons"],
+        "unpacked_path": chosen["unpacked_path"],
+        **common,
+    }
+
+
+def profile_verdict(survey: dict | None = None) -> str:
+    """One honest sentence separating 'wrong profile' from 'broken extension'."""
+    if survey is None:
+        survey = extension_profile_survey()
+    if not survey.get("ext_id"):
+        return (
+            "Could not resolve the extension id from the native-host manifest, so no "
+            "per-profile claim is made. Check "
+            f"{NATIVE_HOST_MANIFEST}."
+        )
+    names = {p["dir"]: p["name"] for p in survey["profiles"]}
+    active = ", ".join(f"{d} ({names.get(d, d)})" for d in survey["active"]) or "unknown"
+    if not survey["installed_in"]:
+        return (
+            "The extension is NOT installed in ANY Chrome profile "
+            f"(checked {len(survey['profiles'])}: {', '.join(names.values()) or 'none'}). "
+            "This is a MISSING INSTALL, not a broken extension: load it unpacked from "
+            f"{DEFAULT_EXT_PATH} on chrome://extensions with Developer mode on."
+        )
+    installed = ", ".join(f"{d} ({names.get(d, d)})" for d in survey["installed_in"])
+    if survey["wrong_profile"]:
+        target = survey["installed_in"][0]
+        return (
+            f"PROFILE MISMATCH -- the extension is installed in {installed} but Chrome's "
+            f"active profile is {active}. The extension is NOT broken; Chrome is on the "
+            "wrong profile. Fix: "
+            f"open -a \"Google Chrome\" --args --profile-directory=\"{target}\" "
+            "(then re-run chrome-heal)."
+        )
+    disabled = [
+        p
+        for p in survey["profiles"]
+        if p.get("installed") and p.get("active") and not p.get("enabled")
+    ]
+    if disabled:
+        p = disabled[0]
+        return (
+            f"The extension IS installed in the active profile {p['dir']} ({p['name']}) but "
+            f"Chrome has it DISABLED (state={p.get('state')}, "
+            f"disable_reasons={p.get('disable_reasons')}) -- a genuinely broken/disabled "
+            "extension, not a profile problem."
+        )
+    return (
+        f"The extension is installed and enabled in the active profile ({active}); it is also "
+        f"present in {installed}. Not a wrong-profile problem and not a missing install."
+    )
 
 
 DEFAULT_EXT_PATH = Path.home() / "dispatch/skills/chrome-control/extension"
@@ -745,8 +952,8 @@ def find_enable_toggle(root):
     return None
 
 
-def close_extensions_tabs() -> None:
-    """Close chrome://extensions tabs we opened, via the chrome CLI."""
+def close_tabs_matching(url_substring: str) -> None:
+    """Close every tab whose URL contains `url_substring`, via the chrome CLI."""
     r = chrome_cli("tabs", timeout=20)
     if r.returncode != 0:
         return
@@ -754,12 +961,17 @@ def close_extensions_tabs() -> None:
     # NEXT line, so the id must come from the line preceding the URL match.
     lines = r.stdout.splitlines()
     for i, line in enumerate(lines):
-        if "chrome://extensions" not in line or i == 0:
+        if url_substring not in line or i == 0:
             continue
         m = re.match(r"^(\d+)\s", lines[i - 1])
         if m:
-            vlog(f"closing extensions tab {m.group(1)}")
+            vlog(f"closing tab {m.group(1)} matching {url_substring!r}")
             chrome_cli("close", m.group(1), timeout=20)
+
+
+def close_extensions_tabs() -> None:
+    """Close chrome://extensions tabs we opened, via the chrome CLI."""
+    close_tabs_matching("chrome://extensions")
 
 
 def rung_ax_reload(dry_run: bool = False) -> tuple[bool, str]:
@@ -883,8 +1095,78 @@ def rung_ax_reload(dry_run: bool = False) -> tuple[bool, str]:
 
 
 # --------------------------------------------------------------------------
-# Rungs 1 and 3
+# Rungs 1, 2 and 4
 # --------------------------------------------------------------------------
+
+
+def rung_recover_page() -> tuple[bool, str]:
+    """Reload the extension from its own recover.html page (no human, no AX).
+
+    An extension page is a separate renderer from the MV3 service worker, so
+    `chrome.runtime.reload()` still works there when the worker is dead or
+    "deaf" (running but firing no listeners -- Chromium's M147/M148 bug class,
+    and the failure mode a strong native-messaging keepalive does NOT prevent).
+    Browser-initiated navigation to chrome-extension:// URLs is allowed --
+    `web_accessible_resources` only gates navigation from *web* origins -- so a
+    plain `open -a "Google Chrome" <url>` is enough. Verified empirically on
+    Chrome 151: the page loads with no web_accessible_resources entry, the
+    extension reloads (new native-host PID + new socket), and `chrome ping`
+    goes green.
+
+    Honesty contract: this rung reports success ONLY when `chrome ping` -- real
+    end-to-end connectivity -- succeeds. chrome-heal has a history of calling
+    "RECOVERED" off a weaker signal; nothing here weakens it again.
+    """
+    ext_id = extension_id()
+    if not ext_id:
+        return False, (
+            "RECOVER_PAGE_NO_EXT_ID: could not resolve the extension id from "
+            f"{NATIVE_HOST_MANIFEST} -- cannot build the recover.html URL."
+        )
+
+    ext_root = Path(extension_prefs_state().get("unpacked_path") or DEFAULT_EXT_PATH)
+    page_file = ext_root / RECOVER_PAGE
+    if not page_file.is_file():
+        return False, (
+            f"RECOVER_PAGE_MISSING: {page_file} does not exist, so the extension cannot "
+            "serve its own recovery page. Restore it from the repo "
+            "(skills/chrome-control/extension/recover.html)."
+        )
+
+    url = f"chrome-extension://{ext_id}/{RECOVER_PAGE}"
+    try:
+        r = subprocess.run(
+            ["open", "-a", "Google Chrome", url], capture_output=True, text=True, timeout=25
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"RECOVER_PAGE_OPEN_TIMEOUT: `open -a 'Google Chrome' {url}` hung for 25s"
+    if r.returncode != 0:
+        return False, (
+            f"RECOVER_PAGE_OPEN_FAILED: `open -a 'Google Chrome' {url}` rc={r.returncode}: "
+            f"{(r.stderr or r.stdout).strip()!r}"
+        )
+    vlog(f"opened {url}; waiting {T_RECOVER_SETTLE}s for the page to call chrome.runtime.reload()")
+    time.sleep(T_RECOVER_SETTLE)
+
+    if wait_for_ping(total=T_RECOVER_PING_WAIT):
+        close_tabs_matching(RECOVER_PAGE)
+        return True, f"recover.html reloaded the extension and `chrome ping` is green ({url})"
+
+    # The reload may have landed while the worker stayed asleep -- poke it once,
+    # then re-verify with a real ping (never assume).
+    w = chrome_cli("wake", timeout=60)
+    vlog(f"wake rc={w.returncode} out={w.stdout.strip()!r} err={w.stderr.strip()!r}")
+    if wait_for_ping(total=15):
+        close_tabs_matching(RECOVER_PAGE)
+        return True, f"recover.html + `chrome wake` recovered; `chrome ping` is green ({url})"
+
+    survey = extension_profile_survey()
+    return False, (
+        f"RECOVER_PAGE_NO_RECOVERY: opened {url} but `chrome ping` never went green "
+        f"(waited {T_RECOVER_SETTLE + T_RECOVER_PING_WAIT + 15:.0f}s). This is expected when the "
+        "extension is DISABLED (a disabled extension cannot serve its own pages) or when "
+        "Chrome is on a profile without it. " + profile_verdict(survey)
+    )
 
 
 def rung_reset() -> tuple[bool, str]:
@@ -939,12 +1221,21 @@ def rung_restart() -> tuple[bool, str]:
 
 
 def diagnose() -> dict:
+    survey = extension_profile_survey()
     return {
         "chrome_running": chrome_pid() is not None,
         "chrome_pid": chrome_pid(),
         "ax_trusted": bool(AXIsProcessTrusted()),
         "ping_ok": ping_ok(timeout=15),
         "extension_prefs": extension_prefs_state(),
+        "profiles": survey,
+        "profile_verdict": profile_verdict(survey),
+        "recover_page": str(
+            Path(extension_prefs_state().get("unpacked_path") or DEFAULT_EXT_PATH) / RECOVER_PAGE
+        ),
+        "recover_page_exists": (
+            Path(extension_prefs_state().get("unpacked_path") or DEFAULT_EXT_PATH) / RECOVER_PAGE
+        ).is_file(),
         "extension_source": verify_extension_source(extension_prefs_state().get("unpacked_path")),
         "executable": sys.executable,
         "real_executable": os.path.realpath(sys.executable),
@@ -955,7 +1246,7 @@ def main() -> int:
     global VERBOSE
     p = argparse.ArgumentParser(prog="chrome-heal", description="Autonomously recover the Chrome Control extension.")
     p.add_argument("--force", action="store_true", help="run the ladder even if `chrome ping` is already healthy")
-    p.add_argument("--rung", choices=["reset", "ax", "restart"], help="run exactly one rung")
+    p.add_argument("--rung", choices=["reset", "page", "ax", "restart"], help="run exactly one rung")
     p.add_argument("--dry-run", action="store_true", help="AX discovery only; press nothing")
     p.add_argument("--diagnose", action="store_true", help="print health/AX/prefs state and exit")
     p.add_argument("--json", action="store_true", help="emit a machine-readable result object on stdout")
@@ -998,9 +1289,29 @@ def main() -> int:
             return finish(0, "healthy: `chrome ping` already succeeds (no action taken)")
         log("`chrome ping` failed -- starting recovery ladder")
 
-    rungs = [("reset", rung_reset), ("ax", lambda: rung_ax_reload(args.dry_run)), ("restart", rung_restart)]
+    # Order matters: cheapest and least disruptive first. The page rung runs
+    # before the AX rung because it needs no Accessibility grant, opens no
+    # chrome://extensions UI, and fixes the deaf-worker case the AX rung can
+    # only fix by driving the mouse.
+    rungs = [
+        ("reset", rung_reset),
+        ("page", rung_recover_page),
+        ("ax", lambda: rung_ax_reload(args.dry_run)),
+        ("restart", rung_restart),
+    ]
     if args.rung:
         rungs = [r for r in rungs if r[0] == args.rung]
+    if args.dry_run:
+        # dry-run means "press nothing"; the page rung really does reload the
+        # extension, so it never runs under --dry-run.
+        rungs = [r for r in rungs if r[0] != "page"]
+        if not rungs:
+            return finish(
+                0,
+                "DRY_RUN_OK: the 'page' rung is a real mutation (it reloads the extension) "
+                "and is skipped under --dry-run. It would run: "
+                f"open -a \"Google Chrome\" chrome-extension://{extension_id()}/{RECOVER_PAGE}",
+            )
 
     ax_untrusted = False
     for name, fn in rungs:
@@ -1035,10 +1346,16 @@ def main() -> int:
     # wording asserted a broken source tree unconditionally; on 2026-08-03 that
     # fired twice with every file intact.
     src = verify_extension_source(prefs.get("unpacked_path"))
+    # ... and say which PROFILE we measured. The same outage was really "Chrome
+    # was showing the Eric profile"; without this line the report reads as a
+    # broken extension and sends a human on a hunt for corruption.
+    survey = extension_profile_survey()
     return finish(
         1,
         "FAILED: every recovery rung was exhausted. "
         f"Extension prefs: {json.dumps(prefs)}. "
+        + profile_verdict(survey)
+        + " "
         + source_tree_verdict(src)
         + " Manual fix: open chrome://extensions, turn on Developer mode, and click "
         "the reload (⟳) button on the Chrome Control card. Last detail: "

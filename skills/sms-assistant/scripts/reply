@@ -28,6 +28,10 @@ SEND_SMS = Path.home() / ".claude/skills/sms-assistant/scripts/send-sms"
 SEND_SIGNAL = Path.home() / ".claude/skills/signal/scripts/send-signal"
 SEND_SIGNAL_GROUP = Path.home() / ".claude/skills/signal/scripts/send-signal-group"
 SEND_DISCORD = Path.home() / ".claude/skills/discord/scripts/send-discord"
+
+# Length guard — see main(). Keep texts short; split or use a visual card.
+MAX_LINES = 8
+MAX_CHARS = 600
 REPLY_APP = Path.home() / ".claude/skills/dispatch-app/scripts/reply-app"
 REPLY_DISPATCH_API = Path.home() / ".claude/skills/dispatch-app/scripts/reply-dispatch-api"
 REPLY_VOICE = Path.home() / ".claude/skills/pocket-sven/scripts/reply-voice"
@@ -133,7 +137,29 @@ def main():
     parser.add_argument("--guid", help="Message GUID to react to (required with --react)")
     parser.add_argument("--allow-raw-filepath", action="store_true",
                         help="Allow sending filepath as text (normally rejected)")
+    parser.add_argument("--long", action="store_true",
+                        help="Acknowledge this message exceeds the length guard and send anyway")
     args = parser.parse_args()
+
+    # --- Length guard -------------------------------------------------------
+    # Eric has asked for short texts at least three times (2026-06-04,
+    # 2026-07-30, 2026-08-16). The rule lived only in admin-rules.md and got
+    # ignored anyway, so it is enforced mechanically here.
+    # Sending a wall of text now requires a deliberate --long flag.
+    if args.message and not args.react:
+        n_lines = len(args.message.splitlines())
+        n_chars = len(args.message)
+        if (n_lines > MAX_LINES or n_chars > MAX_CHARS) and not args.long:
+            print(
+                f"BLOCKED: message is {n_lines} lines / {n_chars} chars "
+                f"(limit {MAX_LINES} lines / {MAX_CHARS} chars).\n"
+                "Lead with the answer. Split it into several short texts, or "
+                "render a visual card (see the visual-cards skill) for "
+                "comparisons and shortlists.\n"
+                "If it genuinely must go as one long message, re-run with --long.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
 
     # Validate mutually exclusive: react OR message, not both
     if args.react and (args.message or args.image or args.file):

@@ -84,6 +84,12 @@ from assistant.bus_helpers import (
     produce_read_receipt,
 )
 
+# Max consecutive stuck-session nudges before the watchdog gives up on a
+# session until it next goes active. The per-session backoff spaces nudges out
+# but never terminates; without a cap a session that the watchdog misjudges is
+# nudged forever (2026-08-26: ~6 nudges over two days, none of them warranted).
+STUCK_NUDGE_MAX_CONSECUTIVE = 3
+
 # Import SignalDB for message persistence (lazy import to avoid startup errors)
 _signal_db = None
 _signal_db_lock = threading.Lock()
@@ -136,6 +142,36 @@ try:
 except Exception:
     METRO_PORT = 8081
 
+def _refresh_graceful_restart_marker() -> None:
+    """Refresh the watchdog's graceful-restart marker.
+
+    bin/watchdog treats the daemon as crashed whenever `claude-assistant
+    status` fails — including during a slow startup, before the IPC socket
+    is listening. On 2026-09-18 a blocking expo export + install during
+    startup kept the socket down long enough that the watchdog SIGKILLed
+    the daemon mid-startup (launchctl LastExitStatus 9). A marker younger
+    than 120s makes the watchdog skip recovery, so we write it at startup
+    and refresh it right before any blocking child-process setup.
+
+    Preserves initiator_chat_id (written by `claude-assistant restart`,
+    read by SDKBackend._read_restart_initiator) by updating the timestamp
+    in the existing JSON; falls back to a fresh {"timestamp": ...} marker.
+    """
+    marker = Path("/tmp/dispatch-graceful-restart")
+    data: Dict[str, Any] = {}
+    try:
+        existing = json.loads(marker.read_text())
+        if isinstance(existing, dict):
+            data = existing
+    except Exception:
+        pass
+    data["timestamp"] = int(time.time())
+    try:
+        marker.write_text(json.dumps(data))
+    except OSError:
+        pass
+
+
 # macOS epoch offset (2001-01-01 to 1970-01-01)
 MACOS_EPOCH_OFFSET = 978307200
 
@@ -158,6 +194,41 @@ lifecycle_handler = logging.FileHandler(LOGS_DIR / "session_lifecycle.log")
 lifecycle_handler.setFormatter(logging.Formatter('%(asctime)s | %(message)s'))
 lifecycle_log.addHandler(lifecycle_handler)
 lifecycle_log.setLevel(logging.INFO)
+
+
+def _ephemeral_task_failure_reason(session: Any, info: dict) -> Optional[str]:
+    """Decide whether an ending agent task should be reported as task.failed.
+
+    Called by the task supervisor when an ephemeral session is gone or about
+    to be idle-cleaned. Returns a human-readable reason for task.failed, or
+    None to report task.completed (the historical behaviour).
+
+    Scoped to notify=true, non-investigation agent tasks: those are the ones a
+    human is waiting to hear from. 2026-10-18 nightly skillify was idle-killed
+    mid-pipeline, never sent its SMS, and still posted a green task.completed.
+
+    Module-level (not a Manager method) so tests that use MagicMock(spec=Manager)
+    exercise the real logic instead of a truthy mock.
+    """
+    if not info.get("notify") or info.get("investigation"):
+        return None
+    if session is None:
+        return "session ended before the task completed (session vanished)"
+    if getattr(session, "has_inflight_work", False) is True:
+        bg = getattr(session, "active_background_tasks", 0)
+        return (f"killed by idle-cleanup with work still in flight "
+                f"(turn in progress or {bg} background task(s) pending)")
+    if getattr(session, "last_result_is_error", None) is True:
+        return "last turn ended with an error"
+    alive = session.is_alive() if hasattr(session, "is_alive") else True
+    if not alive:
+        errs = getattr(session, "_error_count", 0)
+        return f"session died before completing normally (error_count={errs})"
+    # Explicit notify=true agent tasks are expected to message the requester
+    # themselves (e.g. skillify: "send a concise summary ... via SMS").
+    if info.get("notify_explicit") and getattr(session, "last_send_at", "unset") is None:
+        return "finished without sending its notification message"
+    return None
 
 
 class ContactsManager:
@@ -1695,7 +1766,7 @@ class IPCServer:
         if is_sms and contact_name and tier:
             final_prompt = wrap_sms(final_prompt, contact_name, tier, chat_id, reply_to_guid=reply_to, source=source, app=is_app)
         if is_admin:
-            final_prompt = wrap_admin(final_prompt)
+            final_prompt = wrap_admin(final_prompt, chat_id=chat_id)
 
         # Append tier-specific rules reminder suffix (only for tiers with rules files)
         if tier in ["admin", "partner", "family", "favorite", "bots", "unknown"]:
@@ -1705,6 +1776,21 @@ class IPCServer:
 
         # Determine if this is a group
         is_group = is_group_chat_id(chat_id)
+
+        # For a group injection the CLI resolves contact_name from the chat's
+        # display_name, which for an unnamed group is a mangled join of the
+        # participant handles (the 2026-08-27 incident rendered
+        # "FROM .com-9496-eric", which the receiving session correctly read as a
+        # forged sender field). An admin override comes from the owner, not from
+        # the group, so name it that way.
+        admin_sender_name = None
+        if is_admin:
+            try:
+                from assistant import config
+
+                admin_sender_name = config.get("owner.name", "Admin")
+            except Exception:
+                admin_sender_name = "Admin"
 
         # Build attachments list if attachment provided
         attachments = None
@@ -1720,12 +1806,15 @@ class IPCServer:
                 await self.backend.inject_group_message(
                     chat_id=chat_id,
                     display_name=contact_name or "Group",
-                    sender_name=contact_name or "Admin",
+                    sender_name=admin_sender_name or contact_name or "Admin",
                     sender_tier=tier or "admin",
                     text=final_prompt,
                     attachments=attachments,
                     source=source,
                     message_timestamp=message_timestamp,
+                    # Daemon-generated: an ADMIN OVERRIDE block must keep its
+                    # own delimiters. Only correspondent text gets defanged.
+                    trusted=is_admin,
                 )
             else:
                 await self.backend.inject_message(
@@ -1733,6 +1822,7 @@ class IPCServer:
                     attachments=attachments,
                     source=source,
                     message_timestamp=message_timestamp,
+                    trusted=is_admin,
                 )
 
             reg_data = self.registry.get(chat_id)
@@ -2033,6 +2123,63 @@ class ChildSupervisor:
         lifecycle_log.info(f"{self.name} | STOPPED")
 
 
+# chat.db associated_message_type for each tapback (removal = +1000).
+TAPBACK_ASSOCIATED_TYPE = {
+    "heart": 2000, "thumbsup": 2001, "thumbsdown": 2002,
+    "haha": 2003, "exclamation": 2004, "question": 2005,
+}
+
+
+def _strip_tapback_guid(g: str) -> str:
+    """Normalize p:0/UUID, bp:UUID, s:0/UUID → UUID."""
+    return re.sub(r'^(?:[ps]:\d+/|bp:)', '', g or '')
+
+
+def decide_tapback(
+    target_guid: str,
+    reaction_name: str,
+    recent_rows: List[tuple],
+    prior_own_reaction_types: Optional[List[int]] = None,
+    already_sent: bool = False,
+) -> tuple:
+    """Decide whether a queued tapback may be performed.
+
+    tapback.scpt (Cmd+T) always reacts to the NEWEST INCOMING message in the
+    visible chat, so a tapback is only safe when the target IS that message.
+
+    Args:
+        target_guid: GUID the caller wants to react to (any prefix form).
+        reaction_name: normalized name ("thumbsup", "heart", ...).
+        recent_rows: chat.db rows newest-first as
+            (guid, is_from_me, associated_message_type). Outbound rows and
+            reaction rows (associated_message_type != 0) are ignored when
+            deciding "newest inbound".
+        prior_own_reaction_types: associated_message_type of OUR reactions on
+            the target, newest-first (from chat.db).
+        already_sent: True if this daemon already performed the same
+            (chat, target, reaction) recently (covers chat.db write lag).
+
+    Returns (ok: bool, reason: str).
+    """
+    target = _strip_tapback_guid(target_guid)
+    inbound = [
+        _strip_tapback_guid(g)
+        for g, is_from_me, assoc_type in recent_rows
+        if g and not is_from_me and not assoc_type
+    ]
+    if not inbound:
+        return False, "tapback skipped: no inbound messages found"
+    if inbound[0] != target:
+        return False, "tapback skipped: target not newest inbound"
+    if already_sent:
+        return False, "tapback skipped: same reaction already performed on target"
+    wanted = TAPBACK_ASSOCIATED_TYPE.get(reaction_name)
+    if prior_own_reaction_types and wanted is not None and prior_own_reaction_types[0] == wanted:
+        # Re-sending the same tapback toggles it OFF ("Removed a like").
+        return False, "tapback skipped: same reaction already performed on target"
+    return True, "ok"
+
+
 class Manager:
     """Main manager that orchestrates everything."""
 
@@ -2041,6 +2188,9 @@ class Manager:
         self.messages = MessagesReader(contacts_manager=self.contacts)
         self.registry = SessionRegistry(SESSION_REGISTRY_FILE)
         self._resource_registry = None  # Set in run() via async with
+        # (chat_id, target_guid, reaction_name) -> ts of tapbacks we performed;
+        # guards against re-sending (which toggles the reaction off).
+        self._tapbacks_sent: Dict[tuple, float] = {}
 
         # Initialize event bus
         from bus.bus import Bus
@@ -2141,6 +2291,11 @@ class Manager:
         # backoff so we nudge once, then escalate-via-the-session — never spam.
         self._stuck_check_running = False
         self._last_stuck_nudge_at: Dict[str, float] = {}  # session_name -> monotonic-ish time.time()
+        # Consecutive nudges fired for a session without it becoming active in
+        # between. Capped by STUCK_NUDGE_MAX_CONSECUTIVE: if N nudges haven't
+        # moved the session, an N+1th won't either — it just spams the user.
+        # Reset whenever the session goes active (see _run_stuck_session_check).
+        self._stuck_nudge_count: Dict[str, int] = {}
 
         # Message consumer: asyncio.Event for near-zero-latency notification
         self._consumer_notify = asyncio.Event()
@@ -2266,7 +2421,10 @@ class Manager:
                 commit_interval_s=5,
             ),
         ]
-        return ConsumerRunner(self._bus, configs)
+        # exclusive=True: this daemon is the sole owner of these groups. Purge
+        # members left behind by a previous daemon process (or a crashed
+        # runner) on join so they cannot hold partitions.
+        return ConsumerRunner(self._bus, configs, exclusive=True)
 
     def _start_consumer_thread(self):
         """Start ConsumerRunner in a background thread with auto-restart.
@@ -2513,48 +2671,56 @@ class Manager:
             log.error(f"IMESSAGE_UI | tapback.scpt not found at {tapback_script}")
             return False
 
-        # GUID verification: Cmd+T reacts to the most recent incoming message.
-        # If a new message arrived between queueing and execution, the tapback
-        # would land on the wrong message. Query chat.db to verify the target
-        # GUID is among recent messages. We check the last 10 messages (not just
-        # the latest) to handle group chats where messages arrive rapidly and
-        # our own replies interleave with incoming messages.
-        if guid:
+        # Target guard: Cmd+T reacts to the NEWEST INCOMING message, not to a
+        # GUID. Skip unless the target is exactly that message (outbound rows
+        # and reaction rows don't count), and skip if the same reaction is
+        # already on it (re-sending toggles it off). Fail closed on errors.
+        target_stripped = _strip_tapback_guid(guid)
+        sent_key = (chat_id, target_stripped, reaction_name)
+        try:
+            conn = sqlite3.connect(f"file:{MESSAGES_DB}?mode=ro", uri=True)
             try:
-                conn = sqlite3.connect(f"file:{MESSAGES_DB}?mode=ro", uri=True)
                 conn.execute("PRAGMA busy_timeout=2000")
                 rows = conn.execute(
                     """
-                    SELECT m.guid FROM message m
+                    SELECT m.guid, m.is_from_me, COALESCE(m.associated_message_type, 0)
+                    FROM message m
                     JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
                     JOIN chat c ON c.ROWID = cmj.chat_id
-                    WHERE c.chat_identifier = ?
-                    ORDER BY m.date DESC LIMIT 10
+                    WHERE c.chat_identifier = ? AND COALESCE(m.item_type, 0) = 0
+                    ORDER BY m.date DESC LIMIT 50
                     """,
                     (chat_id,),
                 ).fetchall()
+                prior = [
+                    r[0] for r in conn.execute(
+                        """
+                        SELECT m.associated_message_type FROM message m
+                        JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+                        JOIN chat c ON c.ROWID = cmj.chat_id
+                        WHERE c.chat_identifier = ?
+                          AND m.is_from_me = 1
+                          AND m.associated_message_type BETWEEN 2000 AND 3999
+                          AND (m.associated_message_guid = ? OR m.associated_message_guid LIKE ?)
+                        ORDER BY m.date DESC LIMIT 5
+                        """,
+                        (chat_id, target_stripped, f"%/{target_stripped}"),
+                    ).fetchall()
+                ]
+            finally:
                 conn.close()
-                # Normalize GUIDs for comparison: chat.db stores raw UUIDs,
-                # but the prompt injects p:0/UUID format. Strip the prefix.
-                def _strip_guid_prefix(g: str) -> str:
-                    import re
-                    return re.sub(r'^[ps]:\d+/', '', g)
-                target_stripped = _strip_guid_prefix(guid)
-                recent_guids = [_strip_guid_prefix(r[0]) for r in rows]
-                if recent_guids and target_stripped not in recent_guids:
-                    log.warning(
-                        f"IMESSAGE_UI | tapback GUID not found in recent messages for {chat_id}: "
-                        f"target={guid}, skipping to avoid wrong-message reaction"
-                    )
-                    return False
-                # Warn if target is not the most recent (Cmd+T will react to latest)
-                if recent_guids and target_stripped != recent_guids[0]:
-                    log.warning(
-                        f"IMESSAGE_UI | tapback target is not the most recent message "
-                        f"(target={guid}, latest={rows[0][0]}). Cmd+T may react to wrong message."
-                    )
-            except Exception as e:
-                log.warning(f"IMESSAGE_UI | GUID verification failed ({e}), proceeding anyway")
+        except Exception as e:
+            log.warning(f"IMESSAGE_UI | tapback skipped: chat.db verification failed ({e}) for {chat_id}")
+            return False
+
+        ok, reason = decide_tapback(
+            guid, reaction_name, rows,
+            prior_own_reaction_types=prior,
+            already_sent=sent_key in getattr(self, "_tapbacks_sent", {}),
+        )
+        if not ok:
+            log.warning(f"IMESSAGE_UI | {reason} (chat={chat_id}, target={guid}, reaction={reaction_name})")
+            return False
 
         if not self._navigate_to_chat(chat_id):
             return False
@@ -2565,6 +2731,12 @@ class Manager:
         )
 
         if result.returncode == 0 and "TAPBACK" in result.stdout:
+            if not hasattr(self, "_tapbacks_sent"):
+                self._tapbacks_sent = {}
+            self._tapbacks_sent[sent_key] = time.time()
+            if len(self._tapbacks_sent) > 500:
+                cutoff = time.time() - 3600
+                self._tapbacks_sent = {k: v for k, v in self._tapbacks_sent.items() if v >= cutoff}
             log.info(f"IMESSAGE_UI | tapback {reaction_name} sent successfully for {chat_id}")
             return True
         else:
@@ -3455,6 +3627,9 @@ class Manager:
             "requested_by": requested_by,
             "title": title,
             "notify": notify,
+            # notify defaults to True; only an explicit true means the task is
+            # expected to send its own message (checked on completion).
+            "notify_explicit": payload.get("notify") is True,
             "investigation": is_investigation,
             "notify_session": payload.get("notify_session") if is_investigation else None,
             # Keep the originating event's trace_id so the completion path can
@@ -3648,7 +3823,31 @@ class Manager:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             await asyncio.wait_for(proc.wait(), timeout=10)
-            log.warning("IMESSAGE_TICKLE_ESCALATED | launchctl kickstart imagent OK")
+            # 2026-09-21: this used to log "OK" unconditionally without ever
+            # looking at returncode. It has NEVER worked on this machine:
+            # `launchctl kickstart -k gui/501/com.apple.imagent` returns
+            # **150: "Operation not permitted while System Integrity Protection
+            # is engaged"**. SIP is on by default, so this escalation is a
+            # guaranteed no-op on any normally-configured Mac. It ran 549 times
+            # and reported success 549 times while imagent sat at 52 days
+            # uptime, which is why nobody noticed the inbound-detection stalls.
+            # Real mitigation is disabling App Nap on Messages:
+            #     defaults write com.apple.Messages NSAppSleepDisabled -bool YES
+            # (applied 2026-09-21). Keep the kickstart attempt — it is harmless
+            # and would work if SIP were ever disabled — but tell the truth.
+            if proc.returncode == 0:
+                log.warning("IMESSAGE_TICKLE_ESCALATED | launchctl kickstart imagent OK")
+            elif proc.returncode == 150:
+                log.warning(
+                    "IMESSAGE_TICKLE_ESCALATED | kickstart imagent BLOCKED BY SIP "
+                    "(rc=150) — this escalation cannot work while SIP is engaged; "
+                    "relying on the App Nap defaults + foreground tickle instead"
+                )
+            else:
+                log.warning(
+                    f"IMESSAGE_TICKLE_ESCALATED | kickstart imagent FAILED "
+                    f"rc={proc.returncode}"
+                )
         except asyncio.TimeoutError:
             log.warning("IMESSAGE_TICKLE_ESCALATED | launchctl kickstart imagent timed out")
         except Exception as e:
@@ -3670,6 +3869,143 @@ class Manager:
             log.warning("IMESSAGE_TICKLE_ESCALATED | open -a Messages timed out")
         except Exception as e:
             log.warning(f"IMESSAGE_TICKLE_ESCALATED | open failed: {e}")
+
+    def _chatdb_last_in_out(self) -> tuple[float | None, float | None]:
+        """(last inbound, last outbound) message times from chat.db, unix seconds.
+
+        Runs on the chat.db reader thread — call via run_in_executor.
+        """
+        row = self._chat_reader.connection.execute(
+            "SELECT MAX(CASE WHEN is_from_me=0 THEN date END), "
+            "       MAX(CASE WHEN is_from_me=1 THEN date END) FROM message"
+        ).fetchone()
+
+        def _unix(apple_ns):
+            return apple_ns / 1e9 + 978307200 if apple_ns else None
+
+        return _unix(row[0]), _unix(row[1])
+
+    @staticmethod
+    def _hid_idle_seconds() -> float | None:
+        """Seconds since the last keyboard/mouse input (incl. Remote Desktop)."""
+        try:
+            out = subprocess.run(
+                ["ioreg", "-c", "IOHIDSystem", "-d", "4"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout
+        except Exception:
+            return None
+        m = re.search(r'"HIDIdleTime" = (\d+)', out)
+        return int(m.group(1)) / 1e9 if m else None
+
+    async def _aps_bounce_if_stalled(self) -> None:
+        """Cycle Wi-Fi when inbound iMessages are probably stuck at Apple.
+
+        ROOT CAUSE (POSTMORTEMS 2026-09-08, re-confirmed 2026-10-01/02): the
+        Wi-Fi/NAT path silently drops apsd's idle socket to push.apple.com:5223.
+        apsd stays blind until it next *sends* something, and Apple queues
+        inbound iMessages meanwhile. 2026-10-02: the socket sat 18 min with zero
+        sends; the first send got RST in 22ms, apsd reconnected, and the queued
+        texts hit chat.db 0.8s later. Nothing user-level makes apsd send:
+        `caffeinate -u`, `open -a Messages` (the escalated tickle) and
+        foregrounding apps all produced zero apsd traffic. Cycling Wi-Fi does
+        (~4s; measured in bin/aps-watchdog, which this replaces — it never fired
+        because launchd bash can't read chat.db).
+
+        A bounce drops the network for a few seconds, so it only fires when it's
+        both likely to help and nearly free:
+          - a conversation was live recently (any traffic in the last 30 min)
+          - the newest message is OURS and inbound has been quiet >6 min, i.e.
+            the agent is waiting on a human reply that may be stuck upstream
+          - no SDK session is mid-turn (a bounce would kill its API stream)
+          - nobody has touched the Mac for >5 min (don't cut a Remote Desktop
+            session out from under the owner)
+          - at most once per 8 min
+        """
+        from assistant import config
+        cfg = "imessage.aps_bounce"
+        if not config.get(f"{cfg}.enabled", True):
+            return
+        active_window = config.get(f"{cfg}.active_window_s", 1800)
+        quiet_inbound = config.get(f"{cfg}.quiet_inbound_s", 360)
+        cooldown = config.get(f"{cfg}.cooldown_s", 480)
+        min_hid_idle = config.get(f"{cfg}.min_hid_idle_s", 300)
+        iface = config.get(f"{cfg}.interface", "en1")
+
+        now = time.time()
+        if now - self._last_aps_bounce < cooldown:
+            return
+        loop = asyncio.get_running_loop()
+        try:
+            last_in, last_out = await loop.run_in_executor(
+                self._chat_reader._executor, self._chatdb_last_in_out
+            )
+        except Exception as e:
+            log.debug(f"APS_BOUNCE | chat.db read failed: {e}")
+            return
+        if last_in is None or last_out is None:
+            return
+        since_any = now - max(last_in, last_out)
+        since_in = now - last_in
+        if not (since_any < active_window and last_out > last_in and since_in > quiet_inbound):
+            return
+        busy = [n for n, s in self.sessions.sessions.items() if s.is_busy]
+        if busy:
+            log.debug(f"APS_BOUNCE | skip — session(s) mid-turn: {busy}")
+            return
+        hid_idle = await asyncio.to_thread(self._hid_idle_seconds)
+        if hid_idle is None or hid_idle < min_hid_idle:
+            log.debug(f"APS_BOUNCE | skip — Mac in use (hid_idle={hid_idle})")
+            return
+
+        self._last_aps_bounce = now
+        log.warning(
+            f"APS_BOUNCE | cycling {iface} | inbound quiet {since_in:.0f}s, "
+            f"last outbound {now - last_out:.0f}s ago, hid_idle={hid_idle:.0f}s"
+        )
+        t0 = time.monotonic()
+        errors = []
+        for state in ("off", "on"):
+            proc = await asyncio.create_subprocess_exec(
+                "networksetup", "-setairportpower", iface, state,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                _, err = await asyncio.wait_for(proc.communicate(), timeout=15)
+            except asyncio.TimeoutError:
+                proc.kill()
+                err = b"timed out"
+            if proc.returncode:
+                errors.append(f"{state}: rc={proc.returncode} {err.decode().strip()}")
+        back_after = None
+        for _ in range(30):
+            ping = await asyncio.create_subprocess_exec(
+                "ping", "-c1", "-t2", "1.1.1.1",
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            if await ping.wait() == 0:
+                back_after = round(time.monotonic() - t0, 1)
+                break
+            await asyncio.sleep(1)
+        if errors or back_after is None:
+            log.error(f"APS_BOUNCE | FAILED | errors={errors} network_back={back_after}")
+        else:
+            log.warning(f"APS_BOUNCE | network back after {back_after}s")
+        try:
+            produce_event(
+                self._producer, "system", "imessage.aps_bounce",
+                {
+                    "interface": iface,
+                    "inbound_quiet_seconds": round(since_in, 1),
+                    "since_last_outbound_seconds": round(now - last_out, 1),
+                    "hid_idle_seconds": round(hid_idle, 1),
+                    "network_back_seconds": back_after,
+                    "errors": errors,
+                },
+                source="daemon",
+            )
+        except Exception as e:
+            log.debug(f"APS_BOUNCE | bus produce failed: {e}")
 
     async def _periodic_wal_checkpoint(self):
         """Run WAL checkpoint on a separate timer, outside the poll cycle.
@@ -3700,9 +4036,49 @@ class Manager:
         1. Timed-out tasks → force-kill and produce task.timeout
         2. Completed tasks (session died) → produce task.completed and clean up
         """
-        from assistant.bus_helpers import task_completed_payload, task_timeout_payload
+        from assistant.bus_helpers import (
+            task_completed_payload, task_failed_payload, task_timeout_payload,
+        )
 
         HARD_MAX_LIFETIME = 14400  # 4 hours absolute max
+
+        async def _finish(task_id: str, info: dict, session: Any,
+                          elapsed: float, ended_by: str) -> None:
+            """Emit task.completed or task.failed, then clean up the task."""
+            reason = _ephemeral_task_failure_reason(session, info)
+            if reason:
+                log.warning(f"TASK_FAILED | task_id={task_id} | ended_by={ended_by} | "
+                            f"elapsed={elapsed:.0f}s | reason={reason}")
+                produce_event(self._producer, "tasks", "task.failed",
+                    task_failed_payload(task_id, info["title"],
+                        info["requested_by"], reason,
+                        ended_by=ended_by, duration_seconds=round(elapsed, 1)),
+                    key=info["requested_by"], source="task-runner")
+            else:
+                produce_event(self._producer, "tasks", "task.completed",
+                    task_completed_payload(task_id, info["title"],
+                        info["requested_by"], elapsed),
+                    key=info["requested_by"], source="task-runner")
+
+            await self._handle_investigation_completed(
+                task_id, info, session, "completed"
+            )
+
+            # Clean up — record trace_id to prevent restart loops
+            # (see _completed_task_traces / COMPLETED_COOLDOWN).
+            _tr = info.get("trace_id")
+            if _tr:
+                self._completed_task_traces[_tr] = time.time()
+            await self.sessions.kill_ephemeral_session(task_id)
+            self._ephemeral_tasks.pop(task_id, None)
+
+            if info["notify"]:
+                msg = (f"❌ Task failed: {info['title']} ({reason})" if reason
+                       else f"✅ Task completed: {info['title']}")
+                _fire_and_forget(
+                    self._notify_task_event(info["requested_by"], msg),
+                    name=f"task-notify-{ended_by}-{task_id}",
+                )
 
         while not self._shutdown_flag:
             try:
@@ -3736,74 +4112,29 @@ class Manager:
                     if session is None or not session.is_alive():
                         log.info(f"TASK_COMPLETED | task_id={task_id} | "
                                  f"elapsed={elapsed:.0f}s | session_gone")
-
-                        produce_event(self._producer, "tasks", "task.completed",
-                            task_completed_payload(task_id, info["title"],
-                                info["requested_by"], elapsed),
-                            key=info["requested_by"], source="task-runner")
-
-                        await self._handle_investigation_completed(
-                            task_id, info, session, "completed"
-                        )
-
-                        # Clean up — record trace_id to prevent restart loops
-                        # (see _completed_task_traces / COMPLETED_COOLDOWN).
-                        _tr = info.get("trace_id")
-                        if _tr:
-                            self._completed_task_traces[_tr] = time.time()
-                        await self.sessions.kill_ephemeral_session(task_id)
-                        self._ephemeral_tasks.pop(task_id, None)
-
-                        if info["notify"]:
-                            _fire_and_forget(
-                                self._notify_task_event(
-                                    info["requested_by"],
-                                    f"✅ Task completed: {info['title']}"
-                                ),
-                                name=f"task-notify-done-{task_id}",
-                            )
+                        await _finish(task_id, info, session, elapsed, "session_gone")
                         continue
 
                     # Check if ephemeral task is idle after completing its work.
-                    # Only clean up if the session is truly idle — not busy with
-                    # pending queries (e.g. subagent tool calls that don't update
-                    # last_activity). Use a generous threshold since agent tasks
-                    # often have gaps between tool calls.
+                    # Only clean up if the session is truly idle — no queued
+                    # queries, no turn in progress (incl. CLI-initiated wake-ups
+                    # after a background subagent finishes) and no background
+                    # tasks awaiting their task_notification. last_activity is
+                    # bumped on every SDK message, not just ResultMessage.
                     EPHEMERAL_IDLE_SECS = 120
                     if session is not None and hasattr(session, 'last_activity'):
                         idle_secs = (datetime.now() - session.last_activity).total_seconds()
                         is_busy = getattr(session, 'is_busy', False)
                         has_pending = getattr(session, '_pending_queries', 0) > 0
+                        has_inflight = getattr(session, 'has_inflight_work', False) is True
                         if (idle_secs >= EPHEMERAL_IDLE_SECS
                                 and elapsed > EPHEMERAL_IDLE_SECS
                                 and not is_busy
-                                and not has_pending):
+                                and not has_pending
+                                and not has_inflight):
                             log.info(f"TASK_IDLE_CLEANUP | task_id={task_id} | "
                                      f"idle={idle_secs:.0f}s | elapsed={elapsed:.0f}s")
-
-                            produce_event(self._producer, "tasks", "task.completed",
-                                task_completed_payload(task_id, info["title"],
-                                    info["requested_by"], elapsed),
-                                key=info["requested_by"], source="task-runner")
-
-                            await self._handle_investigation_completed(
-                                task_id, info, session, "completed"
-                            )
-
-                            _tr = info.get("trace_id")
-                            if _tr:
-                                self._completed_task_traces[_tr] = time.time()
-                            await self.sessions.kill_ephemeral_session(task_id)
-                            self._ephemeral_tasks.pop(task_id, None)
-
-                            if info["notify"]:
-                                _fire_and_forget(
-                                    self._notify_task_event(
-                                        info["requested_by"],
-                                        f"✅ Task completed: {info['title']}"
-                                    ),
-                                    name=f"task-notify-idle-{task_id}",
-                                )
+                            await _finish(task_id, info, session, elapsed, "idle_cleanup")
                             continue
 
                     # Check timeout (configured or hard max) — only for ALIVE sessions
@@ -4083,12 +4414,20 @@ class Manager:
         # Ensure dispatch-app web build exists and kick off background rebuild on every restart.
         # If dist is missing: blocking build first (prevent broken placeholder).
         # Always: fire a background rebuild so the served app stays fresh after restarts.
+        # Prefer the project's own expo binary — bare `npx expo` can run a
+        # different expo major from a stale ~/.npm/_npx cache, which made the
+        # export fail (expo-router unresolvable) on every restart (2026-09-18).
+        _expo_bin = DISPATCH_APP_DIR / "node_modules" / ".bin" / "expo"
+        _expo_cmd = [str(_expo_bin)] if _expo_bin.is_file() else ["npx", "expo"]
         _web_index = DISPATCH_APP_DIR / "dist" / "index.html"
         if not _web_index.is_file():
+            # Blocking child-process setup ahead — refresh the graceful marker
+            # so the watchdog doesn't SIGKILL a slow startup (2026-09-18).
+            _refresh_graceful_restart_marker()
             log.info("Dispatch app web build missing — running blocking expo export")
             try:
                 subprocess.run(
-                    ["npx", "expo", "export", "--platform", "web"],
+                    _expo_cmd + ["export", "--platform", "web"],
                     cwd=str(DISPATCH_APP_DIR),
                     capture_output=True,
                     timeout=120,
@@ -4099,6 +4438,21 @@ class Manager:
                     log.warning("Dispatch app web build ran but index.html still missing")
             except Exception as e:
                 log.warning(f"Dispatch app web build failed: {e}")
+            if not _web_index.is_file():
+                # A broken web build must never gate messaging: write a
+                # placeholder so future restarts skip this blocking branch;
+                # the background rebuild below replaces it with a real build.
+                try:
+                    _web_index.parent.mkdir(parents=True, exist_ok=True)
+                    _web_index.write_text(
+                        '<!doctype html><html><head><meta charset="utf-8">'
+                        "<title>Dispatch</title></head><body>"
+                        "<p>Dispatch app build pending — background rebuild "
+                        "in progress.</p></body></html>\n"
+                    )
+                    log.warning("Dispatch app web build unavailable — wrote placeholder dist/index.html")
+                except OSError as e:
+                    log.warning(f"Failed to write placeholder index.html: {e}")
 
         # Background rebuild — always run on restart so the build stays current.
         # Non-blocking: daemon starts immediately, fresh dist lands ~60s later.
@@ -4106,7 +4460,7 @@ class Manager:
         try:
             with open(_expo_log, "a") as _expo_fh:
                 subprocess.Popen(
-                    ["npx", "expo", "export", "--platform", "web"],
+                    _expo_cmd + ["export", "--platform", "web"],
                     cwd=str(DISPATCH_APP_DIR),
                     stdout=_expo_fh,
                     stderr=_expo_fh,
@@ -4269,9 +4623,28 @@ class Manager:
                     continue
                 idle_s = (_dt.now() - last_activity).total_seconds()
                 if idle_s < idle_threshold_s:
-                    # Active recently — clear any stale nudge cooldown so the next
-                    # quiet-with-commitment period gets a fresh nudge.
-                    self._last_stuck_nudge_at.pop(session_name, None)
+                    # Active recently. Clear the nudge cooldown + cap ONLY if the
+                    # session made real progress since the last nudge: a send, or
+                    # a non-nudge inject (new inbound, reminder, admin). Handling
+                    # the nudge itself refreshes last_activity — resetting on that
+                    # alone reset the cap every time, so it never tripped
+                    # (2026-10-18: 5+ nudges in a row, each logged "1/3").
+                    last_nudge = self._last_stuck_nudge_at.get(session_name)
+                    if last_nudge is None:
+                        # No nudge on record — nothing to protect; drop any count.
+                        self._stuck_nudge_count.pop(session_name, None)
+                    else:
+                        nudge_dt = _dt.fromtimestamp(last_nudge)
+                        progressed = any(
+                            isinstance(ts, _dt) and ts > nudge_dt
+                            for ts in (
+                                getattr(session, "last_send_at", None),
+                                getattr(session, "last_non_nudge_inject_at", None),
+                            )
+                        )
+                        if progressed:
+                            self._last_stuck_nudge_at.pop(session_name, None)
+                            self._stuck_nudge_count.pop(session_name, None)
                     continue
 
                 # ── Outstanding-commitment gate ──
@@ -4289,11 +4662,48 @@ class Manager:
                         detection = "marker"
                         committed_text = str(commitment.get("text", ""))[:280]
 
+                # The heuristic INTENTIONALLY runs when the marker check comes back
+                # empty. Do not "fix" this into firing only when the marker is
+                # unreadable — that was tried on 2026-08-19 and it guts the backstop.
+                #
+                # The reasoning that motivates the change is that a fallback should
+                # never override an authoritative negative. That rule is right in
+                # general, but the premise fails here: the marker is SELF-REPORTED by
+                # the session. Its absence is authoritative about the session's
+                # bookkeeping, not about whether a commitment exists. A session that
+                # idle-abandons a task is precisely the session that forgot to call
+                # `commitment set` — so "no marker" is the *expected* state of the
+                # failure this watchdog exists to catch (see the 2026-05-11 incident
+                # in CLAUDE.md §3.6, where a session parked for ~1h after asking a
+                # human). Gating on unreadable-only would have made that incident
+                # undetectable again.
+                #
+                # The real cost is a false positive on a session that correctly
+                # cleared its marker but still phrases things like a promise. That is
+                # the cheaper error: a spurious nudge is one wasted turn, a missed
+                # nudge is an abandoned task nobody notices.
                 if detection is None:
                     snippet = looks_like_commitment(getattr(session, "last_assistant_text", None))
                     if snippet:
                         detection = "heuristic"
                         committed_text = snippet[:280]
+
+                # Unanswered-inbound detection: a real correspondent message
+                # (SMS/GROUP envelope) arrived and no send script has run since.
+                # Phrase-independent — catches the turn that ends "waiting on"
+                # some background run without replying (2026-09-23: 82 min of
+                # silence on a package question; the commitment phrase list
+                # covers "waiting on you", the session said "waiting on it").
+                # A deliberate no-reply (e.g. contact said "ok") costs one
+                # spurious nudge, capped by STUCK_NUDGE_MAX_CONSECUTIVE —
+                # the documented cheaper error.
+                if detection is None:
+                    sms_at = getattr(session, "last_sms_inject_at", None)
+                    send_at = getattr(session, "last_send_at", None)
+                    if isinstance(sms_at, _dt) and (not isinstance(send_at, _dt) or send_at < sms_at):
+                        detection = "unanswered"
+                        last_text = getattr(session, "last_assistant_text", None)
+                        committed_text = (last_text or "")[:280] or None
 
                 if detection is None:
                     continue  # Normally-idle session with no commitment — leave it.
@@ -4303,16 +4713,34 @@ class Manager:
                 if last_nudge is not None and (now_wall - last_nudge) < backoff_s:
                     continue
 
+                # ── Repeat cap ──
+                # The backoff alone only spaces nudges out; it never stops them.
+                # On 2026-08-26 that produced ~6 nudges across two days on a
+                # session that was never actually blocked. If N nudges haven't
+                # unstuck it, the session is either fine or stuck on something a
+                # nudge can't fix — either way the user pays for every extra one.
+                fired = self._stuck_nudge_count.get(session_name, 0)
+                if fired >= STUCK_NUDGE_MAX_CONSECUTIVE:
+                    continue
+
                 idle_minutes = idle_s / 60.0
                 contact_name = getattr(session, "contact_name", "the user") or "the user"
 
                 # Build the nudge message injected into the session's queue.
                 ts_display = _dt.now().strftime("%Y-%m-%d %I:%M %p")
                 what = f' (you said: "{committed_text}")' if committed_text else ""
+                if detection == "unanswered":
+                    situation = (
+                        f"{contact_name} sent a message and you have not sent ANY reply since"
+                        f"{what}. If you were waiting on a background run, nothing re-invokes "
+                        f"you when it finishes — waiting silently is abandoning the question. "
+                        f"Reply now with what you know, even partially."
+                    )
+                else:
+                    situation = f"You've been idle for ~{idle_minutes:.0f} min with an open commitment to {contact_name}{what}."
                 nudge = (
                     f"---SYSTEM NUDGE [{ts_display}]---\n"
-                    f"You've been idle for ~{idle_minutes:.0f} min with an open commitment to "
-                    f"{contact_name}{what}.\n\n"
+                    f"{situation}\n\n"
                     "Do NOT just wait. Right now:\n"
                     "1. Re-check whether the blocker has cleared (re-run the documented recovery / retry the blocked step once).\n"
                     "2. If it cleared, continue the task and update the user.\n"
@@ -4332,9 +4760,11 @@ class Manager:
                     continue
 
                 self._last_stuck_nudge_at[session_name] = now_wall
+                self._stuck_nudge_count[session_name] = fired + 1
                 log.warning(
                     f"STUCK_CHECK | nudged {session_name} | idle={idle_minutes:.1f}min | "
-                    f"detection={detection} | committed={committed_text!r}"
+                    f"detection={detection} | committed={committed_text!r} | "
+                    f"nudge {fired + 1}/{STUCK_NUDGE_MAX_CONSECUTIVE}"
                 )
                 produce_session_event(
                     self._producer, getattr(session, "chat_id", chat_id), "session.stuck_nudge",
@@ -4392,7 +4822,10 @@ class Manager:
         self._close_log_fh('_metro_log_fh')
         self._metro_log_fh = open(metro_log_path, "a")
 
-        # Ensure node_modules are in sync before starting metro
+        # Ensure node_modules are in sync before starting metro.
+        # Blocking child-process setup (up to 120s) — refresh the graceful
+        # marker so the watchdog doesn't SIGKILL a slow startup (2026-09-18).
+        _refresh_graceful_restart_marker()
         try:
             log.info("Running bun install to sync node_modules...")
             install_result = subprocess.run(
@@ -4566,9 +4999,10 @@ class Manager:
         if self.discord_listener is not None and self.discord_listener.is_alive():
             log.debug("Discord listener already running")
             return
-        discord_channels = app_config.get("discord.channel_ids", [])
-        if not discord_channels:
-            log.info("Discord not configured — skipping (set discord.channel_ids in config)")
+        discord_channels = app_config.get("discord.channel_ids", []) or []
+        discord_guilds = app_config.get("discord.guild_ids", []) or []
+        if not discord_channels and not discord_guilds:
+            log.info("Discord not configured — skipping (set discord.channel_ids or discord.guild_ids in config)")
             return
 
         # Token resolution: keychain first (matches send-discord CLI), then config
@@ -4599,6 +5033,8 @@ class Manager:
                 self.discord_queue, discord_channels, discord_token,
                 bot_role_ids=bot_role_ids,
                 bot_names=bot_names,
+                guild_ids=discord_guilds,
+                respond_all_guild_ids=app_config.get("discord.respond_all_guild_ids", []) or [],
             )
             self.discord_listener.start()
             log.info(f"Started Discord listener for channels: {discord_channels} (roles={bot_role_ids}, names={bot_names})")
@@ -5316,7 +5752,14 @@ You have 15 minutes. Work efficiently.
                 # Ignore group messages from non-blessed contacts if no existing session
                 log.info(f"Ignoring group message from non-blessed sender {sender_name or phone} (no existing session and no blessed participants)")
         elif not contact:
-            # Unknown sender for individual (non-group) message - ignore
+            # Unknown sender for individual (non-group) message. Exception: a
+            # stranger replying to a message one of our sessions sent them on
+            # the owner's behalf (48h third-party watch) is delivered to that
+            # session as UNTRUSTED text — no session is created for them.
+            if await self._maybe_route_third_party_reply(
+                phone, text, attachments, audio_transcription, source,
+            ):
+                return
             log.info(f"Unknown sender {phone}, ignoring (not in any Claude tier group)")
             source = msg.get("source", "imessage")
             produce_event(self._producer, "messages", "message.ignored", {
@@ -5343,6 +5786,78 @@ You have 15 minutes. Work efficiently.
         else:
             # Contact exists but has unknown/unrecognized tier
             log.warning(f"Contact {sender_name} has unexpected tier '{sender_tier}', ignoring")
+
+    async def _maybe_route_third_party_reply(
+        self,
+        phone: str,
+        text: str | None,
+        attachments: list | None,
+        audio_transcription: str | None,
+        source: str,
+    ) -> bool:
+        """Deliver an unknown sender's message to the session that texted them.
+
+        Returns True if the message was routed (caller must NOT also ignore it),
+        False if there is no active watch / routing failed (caller ignores as
+        before). Never creates a session for the stranger; the text is wrapped
+        as untrusted third-party data and control markers are defanged.
+        """
+        from assistant.third_party_watch import lookup_watch, build_third_party_reply
+
+        try:
+            entry = lookup_watch(phone)
+        except Exception as e:
+            log.warning(f"THIRD_PARTY_WATCH | lookup failed for {phone}: {e}")
+            return False
+        if not entry:
+            return False
+
+        origin_chat_id = entry.get("origin_chat_id")
+        if not origin_chat_id:
+            return False
+        normalized = normalize_chat_id(origin_chat_id)
+        reg = self.registry.get(normalized) or {}
+        contact_name = reg.get("contact_name") or entry.get("origin_contact") or "Unknown"
+        tier = reg.get("tier") or entry.get("origin_tier") or "admin"
+        origin_source = reg.get("source") or entry.get("origin_source") or "imessage"
+        is_group_origin = (reg.get("type") == "group") or is_group_chat_id(normalized)
+
+        from assistant import config
+        owner_name = config.get("owner.name", "the owner")
+        body = format_message_body(text, attachments, audio_transcription, trusted=False)
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("America/New_York"))
+        wrapped = build_third_party_reply(
+            phone, body, owner_name, entry,
+            timestamp=now.strftime("%a %b %d, %Y %-I:%M%p %Z"),
+        )
+
+        try:
+            session = self.sessions.sessions.get(normalized)
+            if not session or not session.is_alive():
+                if is_group_origin:
+                    session = await self.sessions.create_group_session(
+                        normalized, display_name=reg.get("display_name"), source=origin_source,
+                    )
+                else:
+                    session = await self.sessions.create_session(
+                        contact_name, normalized, tier, source=origin_source,
+                    )
+                await self.sessions._inject_system_prompt_if_needed(session)
+            await session.inject(wrapped)
+        except Exception as e:
+            log.error(f"THIRD_PARTY_WATCH | failed to route reply from {phone} "
+                      f"to {normalized}: {e}")
+            return False
+
+        log.info(f"THIRD_PARTY_WATCH | routed reply from unknown {phone} "
+                 f"-> {normalized} (untrusted)")
+        produce_event(self._producer, "messages", "message.third_party_routed", {
+            "phone": phone, "origin_chat_id": normalized,
+            "origin_session": entry.get("origin_session"),
+            "watch_expires_at": entry.get("expires_at"),
+        }, key=f"{source}/{phone}", source=source)
+        return True
 
     async def process_reaction(self, reaction: dict):
         """Process a single incoming reaction.
@@ -5587,6 +6102,10 @@ You have 15 minutes. Work efficiently.
 
     async def run(self):
         """Main async loop."""
+        # Cover slow startups: the watchdog SIGKILLed the daemon mid-startup
+        # on 2026-09-18 when blocking child-process setup (expo export +
+        # install) delayed the IPC status socket past its 60s check.
+        _refresh_graceful_restart_marker()
         log.info("=" * 60)
         log.info("Claude Assistant Manager starting (SDK backend)...")
         log.info(f"Polling interval: {POLL_INTERVAL}s")
@@ -5616,7 +6135,14 @@ You have 15 minutes. Work efficiently.
         # Bus and producer have their own connections — register for tracking + clean shutdown
         resource_registry.register('bus', self._bus, self._bus.close)
         resource_registry.register('producer', self._producer, self._producer.close)
-        resource_registry.register('consumer_runner', self._consumer_runner, self._consumer_runner.stop)
+        # Late-bind: the consumer thread REPLACES self._consumer_runner on every
+        # crash-rebuild (and dependency-health recovery does too). Binding the
+        # original object's .stop here meant shutdown stopped a long-dead runner
+        # while the live one's members never left their groups — the next
+        # daemon's consumers then got 0 partitions until the stale heartbeats
+        # aged out (~5 min of idle consumers after every restart).
+        resource_registry.register('consumer_runner', self._consumer_runner,
+                                   lambda: self._consumer_runner.stop())
 
         # Note: dispatch_api and metro log file handles + subprocesses are now
         # managed by ChildSupervisor instances. They are registered in the
@@ -5893,8 +6419,26 @@ You have 15 minutes. Work efficiently.
         last_inbound_activity_ts = _now_init
         last_escalated_tickle_ts = 0.0  # never fired yet
         STALE_CHATDB_THRESHOLD = 300      # 5 min without a new rowid
-        MESSAGES_IDLE_THRESHOLD = 3600    # 1 hr with no inbound
+        # 2026-09-21: was 3600 (1 hr). Measured inbound-detection lag on this
+        # box: median 0.2s but p90 431s, max 1244s, and on quiet days 92-98% of
+        # the user's worst reply times were PURELY this deferral. Deferrals were
+        # observed after idles far shorter than an hour (a >6h gap averaged 433s
+        # lag, but short gaps still stalled ~34s), so a 1-hour gate missed most
+        # of them -- 14 of 23 high-lag messages had no tickle at all during
+        # their stall. Note the escalation's step 1 (launchctl kickstart imagent)
+        # is a guaranteed no-op under SIP (rc=150); step 2 (`open -a Messages`)
+        # is the part that actually works, so it needs to fire when it matters.
+        # Still AND-ed with chatdb_stale > 300s and debounced 900s, so this only
+        # fires during a genuine stall and at most once per 15 min.
+        MESSAGES_IDLE_THRESHOLD = 600     # 10 min with no inbound
         ESCALATED_TICKLE_DEBOUNCE = 900   # don't re-escalate for 15 min
+
+        # Wi-Fi bounce when inbound is probably stuck at Apple (dead apsd socket).
+        # Self-gated (see _aps_bounce_if_stalled); this only paces the check.
+        self._last_aps_bounce = 0.0
+        last_aps_bounce_check = 0.0
+        aps_bounce_task: asyncio.Task | None = None
+        APS_BOUNCE_CHECK_INTERVAL = 60
 
         # Nightly consolidation is now handled by cron reminders firing
         # task.requested events. See scripts/setup-nightly-tasks.py.
@@ -6098,6 +6642,13 @@ You have 15 minutes. Work efficiently.
                         name="imessage-tickle-escalated",
                     )
                     last_escalated_tickle_ts = _now_tick
+
+                if (_now_tick - last_aps_bounce_check > APS_BOUNCE_CHECK_INTERVAL
+                        and (aps_bounce_task is None or aps_bounce_task.done())):
+                    last_aps_bounce_check = _now_tick
+                    aps_bounce_task = asyncio.create_task(
+                        self._aps_bounce_if_stalled(), name="aps-bounce-check",
+                    )
 
                 # Fast health check (Tier 1: regex-based fatal error detection)
                 if time.time() - last_fast_health > FAST_HEALTH_INTERVAL:

@@ -256,7 +256,7 @@ ReminderPoller (every 5s) → checks next_fire times
 # Legacy mode (contact + target): inject into a chat session
 claude-assistant remind add "Check the deploy" --contact "+1..." --in 10m
 claude-assistant remind add "Morning check-in" --contact "+1..." --cron "0 9 * * *"
-claude-assistant remind add "Background task" --contact "+1..." --in 1h --target bg
+claude-assistant remind add "Background task" --contact "+1..." --in 1h --target spawn
 
 # Event mode (--event): fire any bus event on schedule (no --contact needed)
 claude-assistant remind add "Nightly task" --cron "0 2 * * *" \
@@ -315,6 +315,42 @@ claude-assistant attach <session>  # Tail a session's log file
 claude-assistant install    # Install LaunchAgent (auto-start on boot)
 claude-assistant uninstall  # Remove LaunchAgent
 ```
+
+### ⚠️ Reloading daemon code after an edit (2026-09-21)
+
+`manager.py`, `sdk_session.py` and `sdk_backend.py` run **inside the daemon
+process**. `claude-assistant restart-sessions` does NOT reload them — it only
+restarts the SDK child sessions, so the daemon keeps running the old code while
+looking like the restart worked. This cost hours once: PID 93435 stayed up 12h
+with stale code after an apparently-successful "restart".
+
+**The daemon PID must actually change.** Stopping the daemon also kills the
+session issuing the command, so detach it:
+
+```bash
+nohup claude-assistant restart &
+```
+
+**The daemon must be launched by launchd** (`claude-assistant restart` does a
+`launchctl kickstart`; `start` now does too when the LaunchAgent is installed).
+macOS attributes permissions to the *responsible* app, so a daemon spawned
+directly from a Terminal/SDK session inherits Terminal's grants — Accessibility
+is DENIED for Terminal here — instead of the venv python's own Accessibility +
+Full Disk Access. On 2026-10-03 a `stop; start` restart left the daemon
+Terminal-attributed for two days: chrome-heal's AX rung and the auth-dialog
+monitor both silently lost Accessibility and every chrome_control blip texted
+the owner. Check: `launchctl list | grep claude-assistant` must show the
+daemon's PID, not `-`.
+
+**Always verify** the loaded code is newer than your edit:
+
+```bash
+stat -f "%Sm" assistant/manager.py     # edit time
+ps -o lstart= -p <new-daemon-pid>      # must be LATER than the edit
+```
+
+Config (`config.local.yaml`) is also cached — `assistant/config.py` sets a
+`_loaded` flag on first read, so config changes need the same restart.
 
 The manager daemon:
 1. Polls Messages.app chat.db every 100ms
@@ -425,9 +461,20 @@ replaces the old standalone `_run_chrome_control_check`),
 daemon with `--receive-mode on-connection`; replaces the old 5-min ad-hoc
 check), `bus_consumers` (300s; probe ConsumerRunner thread + DEAD registry
 members, recover = rebuild + restart the consumer thread), `disk` (300s; probe
-APFS-aware usage, recover = clean known temp dirs, else escalate), `fd_leak`
+APFS-aware usage, recover = clean known temp dirs, else escalate),
+`imessage_app_nap` (3600s; probe `bin/setup-macos-defaults --check`, recover =
+run the same script to re-write the two App Nap `defaults` keys and WARN that
+Messages.app must relaunch — host state that a reinstall or macOS update wipes,
+which defers inbound `chat.db` writes; POSTMORTEMS.md 2026-09-07), `fd_leak`
 (300s; probe untracked FD growth via ResourceRegistry, no auto-recovery →
-escalate). **Not migrated:** `sdk_sessions` — `health.py`'s fast-regex + deep-Haiku
+escalate), `screen_lock` (60s; probe `bin/screen-lock status` —
+the macOS lock screen (display sleep → "require password after N seconds")
+blinds chrome-control, Messages.app and AX automation; recover = type the
+login password from Keychain (`mac-login-password`) into loginwindow, and with
+`screen_lock.harden: true` in config also turn the re-arming settings off;
+escalate with the exact `security add-generic-password` one-liner when the
+password is not stored, or with the Accessibility/Input Monitoring ask when
+typing it fails). **Not migrated:** `sdk_sessions` — `health.py`'s fast-regex + deep-Haiku
 verdict logic is load-bearing and stays as the daemon's own periodic check (its
 recovery/escalation routing through the framework is deferred).
 
@@ -603,6 +650,22 @@ scripts/chaos-test.sh --yes-i-mean-it  # + DESTRUCTIVE tests (quit Chrome, kill 
 scripts/chaos-test.sh --live -k native_host   # pass a pytest -k filter through
 ```
 The script prints a loud warning and requires an interactive `chaos` confirmation (and `--yes-i-mean-it` for the destructive set). **Only run the live/destructive set after `claude-assistant restart` + `chrome reload-extension`, when no chat session is mid-task, and with someone watching it** — otherwise the new Phase-1/2 loops aren't live in the running daemon and the live tests will (correctly) time out, and a destructive run can leave the extension needing a manual reload at `chrome://extensions/`.
+
+### Do not use `timeout` in commands
+
+GNU coreutils' `timeout` is **not installed on this Mac**. It doesn't just fail
+loudly: inside a pipeline or a captured subshell, `timeout 180 uv run pytest ...`
+surfaces as **empty output with exit code 0**, which reads as "ran fine, found
+nothing." It bit twice on 2026-09-10 — a `-k outage` pytest run that looked like
+"no tests matched" when nothing ran, and a subagent whose first two verification
+passes were silently zeroed the same way.
+
+- Don't use `timeout` in Bash commands on this machine.
+- Need a real timeout? Use the Bash tool's own `timeout` parameter
+  (milliseconds) — that's the correct mechanism here. `gtimeout`
+  (`brew install coreutils`) only after verifying it exists.
+- **Empty output + exit 0 is not evidence of absence.** Check that the command
+  exists and actually ran before reading empty output as a finding.
 
 ### Linting Hook
 

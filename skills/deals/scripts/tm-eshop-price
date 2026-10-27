@@ -1,0 +1,28 @@
+#!/bin/bash
+# Precise price + stock from a Thrustmaster eShop (Magento) product page.
+# Usage: tm-eshop-price <full-eshop-url> [more-urls...]
+UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/128.0 Safari/537.36"
+for url in "$@"; do
+  curl -sL -A "$UA" "$url" -o /tmp/.tmshop.html
+  python3 - "$url" <<'PY'
+import re,sys,html
+url=sys.argv[1]; h=open('/tmp/.tmshop.html').read()
+name=re.search(r'<h1[^>]*class="[^"]*page-title[^"]*"[^>]*>(.*?)</h1>', h, re.S) or re.search(r'<h1[^>]*>(.*?)</h1>', h, re.S)
+n=html.unescape(re.sub(r'<[^>]+>','',name.group(1))).strip() if name else '?'
+# main price box lives in product-info-price / product-info-main, before related products
+main=re.search(r'<div class="product-info-price">.*?<div class="product-add-form">', h, re.S)
+seg=main.group(0) if main else ''
+form=re.search(r'<div class="product-add-form">.*?</form>', h, re.S)
+formseg=form.group(0) if form else ''
+final=re.findall(r"data-price-amount=\"([0-9.]+)\" data-price-type=\"finalPrice\"", seg)
+old=re.findall(r'data-price-amount="([0-9.]+)" data-price-type="oldPrice"', seg)
+avail=re.findall(r'"availability"\s*:\s*"[^"]*?/?([A-Za-z]+)"', h)
+mainblk=re.search(r'<div class="product-info-main">.*?</form>', h, re.S)
+mb=mainblk.group(0) if mainblk else h
+st=re.search(r'class="stock (available|unavailable)"', mb)
+stock='IN STOCK' if (st and st.group(1)=='available') else ('OUT OF STOCK' if st else ('IN STOCK' if re.search(r'id="product-addtocart-button"', mb) else '?'))
+sku=re.search(r'data-product-sku="([^"]+)"', h) or re.search(r'itemprop="sku"[^>]*>([^<]+)<', h)
+print(f'{n[:46]:46s} | final=${final[0] if final else "?"}' + (f' | was=${old[0]}' if old else '') + f' | {stock} | sku:{sku.group(1).strip() if sku else "?"}')
+print(f'    {url}')
+PY
+done

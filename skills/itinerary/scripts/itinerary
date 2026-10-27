@@ -1,0 +1,1549 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pyyaml>=6.0"]
+# ///
+"""itinerary — plan a trip day-by-day, sanity-check it, and export a real .ics.
+
+Why this exists: this machine has no working Google Calendar path (no gws CLI /
+credentials, the claude.ai Calendar MCP needs interactive OAuth, and Calendar.app
+AppleScript automation times out with -1712). A standards-compliant .ics file that
+gets texted to the user is the one path that actually works: tapping it imports
+into Apple Calendar or Google Calendar.
+
+Subcommands:
+  validate   structural check of a plan file (exit 1 on structural errors)
+  show       readable day-by-day agenda
+  check      trip-ruining-mistake detector (overlaps, impossible transit,
+             closed days, booking deadlines, free days / big gaps)
+  ics        emit RFC 5545 iCalendar
+  event      one-off .ics invite for a single event (local time + VTIMEZONE)
+  init       print a starter plan template
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+import yaml
+
+PRODID = "-//dispatch//itinerary skill//EN"
+
+WEEKDAYS = [
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+]
+
+# ---------------------------------------------------------------------------
+# errors / findings
+# ---------------------------------------------------------------------------
+
+
+class PlanError(Exception):
+    """Fatal problem loading a plan file."""
+
+
+@dataclass
+class Finding:
+    level: str  # "error" | "warn" | "info"
+    code: str
+    message: str
+    date: str | None = None
+    item: str | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "level": self.level,
+            "code": self.code,
+            "message": self.message,
+            "date": self.date,
+            "item": self.item,
+        }
+
+
+LEVEL_MARK = {"error": "✗", "warn": "!", "info": "·"}
+LEVEL_RANK = {"error": 0, "warn": 1, "info": 2}
+
+
+# ---------------------------------------------------------------------------
+# model
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Item:
+    title: str
+    date: dt.date
+    start: dt.time | None = None
+    end: dt.time | None = None
+    all_day: bool = False
+    crosses_midnight: bool = False
+    location: str | None = None
+    url: str | None = None
+    notes: str | None = None
+    cost: str | None = None
+    transit_min: int = 0
+    booking_deadline: dt.date | None = None
+    closed_days: list[str] = field(default_factory=list)
+    closed_dates: list[dt.date] = field(default_factory=list)
+    kind: str | None = None          # arrival | departure | lodging | None
+    nights: int = 0                  # for kind: lodging
+    index: int = 0
+
+    # -- derived -----------------------------------------------------------
+    def start_dt(self, tz: ZoneInfo) -> dt.datetime:
+        if self.all_day or self.start is None:
+            return dt.datetime.combine(self.date, dt.time(0, 0), tzinfo=tz)
+        return dt.datetime.combine(self.date, self.start, tzinfo=tz)
+
+    def end_dt(self, tz: ZoneInfo) -> dt.datetime:
+        if self.all_day or self.end is None:
+            return dt.datetime.combine(
+                self.date + dt.timedelta(days=1), dt.time(0, 0), tzinfo=tz
+            )
+        end_date = self.date + dt.timedelta(days=1) if self.crosses_midnight else self.date
+        return dt.datetime.combine(end_date, self.end, tzinfo=tz)
+
+    def timespan(self) -> str:
+        if self.all_day:
+            return "all day"
+        s = self.start.strftime("%H:%M") if self.start else "??:??"
+        e = self.end.strftime("%H:%M") if self.end else "??:??"
+        suffix = " (+1d)" if self.crosses_midnight else ""
+        return f"{s}-{e}{suffix}"
+
+
+@dataclass
+class Day:
+    date: dt.date
+    label: str | None = None
+    notes: str | None = None
+    items: list[Item] = field(default_factory=list)
+
+
+@dataclass
+class Plan:
+    title: str
+    tz_name: str
+    tz: ZoneInfo
+    days: list[Day]
+    source: Path
+
+    @property
+    def dates(self) -> list[dt.date]:
+        return [d.date for d in self.days]
+
+
+# ---------------------------------------------------------------------------
+# parsing helpers
+# ---------------------------------------------------------------------------
+
+
+def _parse_time(value, where: str) -> dt.time:
+    """Accept '16:00', '16:00:00', datetime.time, or a YAML 1.1 sexagesimal int.
+
+    PyYAML parses an unquoted 16:00 as the integer 960 (sexagesimal). Rather than
+    silently producing a wrong schedule we recover the intended time and tell the
+    author to quote it.
+    """
+    if isinstance(value, dt.time):
+        return value
+    if isinstance(value, dt.datetime):
+        return value.time()
+    if isinstance(value, int):
+        if 0 <= value < 24 * 60:
+            return dt.time(value // 60, value % 60)
+        raise PlanError(f"{where}: cannot interpret time {value!r} (quote it: \"16:00\")")
+    if isinstance(value, str):
+        text = value.strip()
+        for fmt in ("%H:%M", "%H:%M:%S", "%I:%M %p", "%I:%M%p"):
+            try:
+                return dt.datetime.strptime(text.upper() if "%p" in fmt.lower() else text, fmt).time()
+            except ValueError:
+                continue
+        raise PlanError(f"{where}: bad time {value!r} (want \"HH:MM\")")
+    raise PlanError(f"{where}: bad time {value!r} (want \"HH:MM\")")
+
+
+def _parse_date(value, where: str) -> dt.date:
+    if isinstance(value, dt.datetime):
+        return value.date()
+    if isinstance(value, dt.date):
+        return value
+    if isinstance(value, str):
+        try:
+            return dt.date.fromisoformat(value.strip())
+        except ValueError as exc:
+            raise PlanError(f"{where}: bad date {value!r} (want YYYY-MM-DD)") from exc
+    raise PlanError(f"{where}: bad date {value!r} (want YYYY-MM-DD)")
+
+
+def _norm_weekday(value, where: str) -> str:
+    text = str(value).strip().lower().rstrip("s")
+    for name in WEEKDAYS:
+        if name.startswith(text) and len(text) >= 3:
+            return name
+    raise PlanError(f"{where}: unknown weekday {value!r}")
+
+
+def _as_list(value) -> list:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
+
+
+def _str_or_none(value) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+# ---------------------------------------------------------------------------
+# loading
+# ---------------------------------------------------------------------------
+
+KNOWN_ITEM_KEYS = {
+    "title",
+    "start",
+    "end",
+    "duration_min",
+    "all_day",
+    "location",
+    "url",
+    "notes",
+    "cost",
+    "transit_min",
+    "booking_deadline",
+    "closed_days",
+    "closed_dates",
+    "kind",
+    "nights",
+}
+
+
+def load_plan(path: Path) -> tuple[Plan, list[Finding]]:
+    if not path.exists():
+        raise PlanError(f"no such plan file: {path}")
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        raise PlanError(f"{path.name}: invalid YAML: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise PlanError(f"{path.name}: top level must be a mapping")
+
+    findings: list[Finding] = []
+
+    title = _str_or_none(raw.get("title")) or path.stem
+    tz_name = _str_or_none(raw.get("timezone"))
+    if not tz_name:
+        raise PlanError(f"{path.name}: missing required 'timezone' (e.g. Asia/Tokyo)")
+    try:
+        tz = ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise PlanError(f"{path.name}: unknown timezone {tz_name!r}") from exc
+
+    default_transit = int(raw.get("default_transit_min") or 0)
+
+    raw_days = raw.get("days")
+    if not isinstance(raw_days, list) or not raw_days:
+        raise PlanError(f"{path.name}: 'days' must be a non-empty list")
+
+    days: list[Day] = []
+    seen_dates: dict[dt.date, int] = {}
+    for di, raw_day in enumerate(raw_days):
+        where = f"days[{di}]"
+        if not isinstance(raw_day, dict):
+            raise PlanError(f"{where}: must be a mapping")
+        if "date" not in raw_day:
+            raise PlanError(f"{where}: missing 'date'")
+        date = _parse_date(raw_day["date"], where)
+        if date in seen_dates:
+            findings.append(
+                Finding(
+                    "error",
+                    "duplicate-day",
+                    f"date {date.isoformat()} appears twice (days[{seen_dates[date]}] and {where})",
+                    date=date.isoformat(),
+                )
+            )
+        seen_dates[date] = di
+
+        day = Day(
+            date=date,
+            label=_str_or_none(raw_day.get("label")),
+            notes=_str_or_none(raw_day.get("notes")),
+        )
+
+        for ii, raw_item in enumerate(_as_list(raw_day.get("items"))):
+            iwhere = f"{where}.items[{ii}]"
+            if not isinstance(raw_item, dict):
+                raise PlanError(f"{iwhere}: must be a mapping")
+            unknown = set(raw_item) - KNOWN_ITEM_KEYS
+            for key in sorted(unknown):
+                findings.append(
+                    Finding(
+                        "warn",
+                        "unknown-field",
+                        f"unknown field {key!r} — ignored",
+                        date=date.isoformat(),
+                        item=_str_or_none(raw_item.get("title")) or iwhere,
+                    )
+                )
+            item_title = _str_or_none(raw_item.get("title"))
+            if not item_title:
+                raise PlanError(f"{iwhere}: missing 'title'")
+
+            all_day = bool(raw_item.get("all_day"))
+            start = end = None
+            crosses = False
+            if not all_day:
+                if raw_item.get("start") is None:
+                    raise PlanError(
+                        f"{iwhere} ({item_title}): missing 'start' (or set all_day: true)"
+                    )
+                start = _parse_time(raw_item["start"], f"{iwhere}.start")
+                if raw_item.get("end") is not None:
+                    end = _parse_time(raw_item["end"], f"{iwhere}.end")
+                elif raw_item.get("duration_min") is not None:
+                    minutes = int(raw_item["duration_min"])
+                    if minutes <= 0:
+                        raise PlanError(f"{iwhere}: duration_min must be positive")
+                    base = dt.datetime.combine(date, start) + dt.timedelta(minutes=minutes)
+                    end = base.time()
+                    crosses = base.date() != date
+                else:
+                    findings.append(
+                        Finding(
+                            "warn",
+                            "missing-end",
+                            "no 'end' or 'duration_min' — assuming 60 minutes",
+                            date=date.isoformat(),
+                            item=item_title,
+                        )
+                    )
+                    base = dt.datetime.combine(date, start) + dt.timedelta(minutes=60)
+                    end = base.time()
+                    crosses = base.date() != date
+                if end is not None and not crosses:
+                    if end == start:
+                        findings.append(
+                            Finding(
+                                "error",
+                                "zero-length",
+                                f"start and end are both {start.strftime('%H:%M')}",
+                                date=date.isoformat(),
+                                item=item_title,
+                            )
+                        )
+                    elif end < start:
+                        crosses = True
+                        findings.append(
+                            Finding(
+                                "info",
+                                "crosses-midnight",
+                                f"{start.strftime('%H:%M')}-{end.strftime('%H:%M')} treated as ending the next day",
+                                date=date.isoformat(),
+                                item=item_title,
+                            )
+                        )
+
+            transit = raw_item.get("transit_min")
+            transit_min = default_transit if transit is None else int(transit)
+            if transit_min < 0:
+                raise PlanError(f"{iwhere}: transit_min must be >= 0")
+
+            deadline = (
+                _parse_date(raw_item["booking_deadline"], f"{iwhere}.booking_deadline")
+                if raw_item.get("booking_deadline") is not None
+                else None
+            )
+            closed_days = [
+                _norm_weekday(v, f"{iwhere}.closed_days")
+                for v in _as_list(raw_item.get("closed_days"))
+            ]
+            closed_dates = [
+                _parse_date(v, f"{iwhere}.closed_dates")
+                for v in _as_list(raw_item.get("closed_dates"))
+            ]
+
+            kind = _str_or_none(raw_item.get("kind"))
+            if kind is not None:
+                kind = kind.strip().lower()
+                if kind not in ("arrival", "departure", "lodging"):
+                    raise PlanError(
+                        f"{iwhere}.kind: {kind!r} must be arrival, departure or lodging"
+                    )
+            nights = raw_item.get("nights")
+            nights = 0 if nights is None else int(nights)
+            if nights < 0:
+                raise PlanError(f"{iwhere}.nights must be >= 0")
+            if kind == "lodging" and nights == 0:
+                findings.append(
+                    Finding(
+                        "warn",
+                        "lodging-no-nights",
+                        "kind: lodging without 'nights:' — cannot check coverage",
+                        date=date.isoformat(),
+                        item=item_title,
+                    )
+                )
+
+            day.items.append(
+                Item(
+                    title=item_title,
+                    date=date,
+                    start=start,
+                    end=end,
+                    all_day=all_day,
+                    crosses_midnight=crosses,
+                    location=_str_or_none(raw_item.get("location")),
+                    url=_str_or_none(raw_item.get("url")),
+                    notes=_str_or_none(raw_item.get("notes")),
+                    cost=_str_or_none(raw_item.get("cost")),
+                    transit_min=transit_min,
+                    booking_deadline=deadline,
+                    closed_days=closed_days,
+                    closed_dates=closed_dates,
+                    kind=kind,
+                    nights=nights,
+                    index=ii,
+                )
+            )
+        days.append(day)
+
+    days.sort(key=lambda d: d.date)
+    return Plan(title=title, tz_name=tz_name, tz=tz, days=days, source=path), findings
+
+
+def timed_items(day: Day) -> list[Item]:
+    """Timed items sorted by start time (all-day items are excluded)."""
+    return sorted(
+        [i for i in day.items if not i.all_day and i.start is not None],
+        key=lambda i: (i.start, i.end or i.start),
+    )
+
+
+# ---------------------------------------------------------------------------
+# checks
+# ---------------------------------------------------------------------------
+
+
+def run_checks(plan: Plan, today: dt.date, gap_min: int) -> list[Finding]:
+    findings: list[Finding] = []
+    tz = plan.tz
+
+    for day in plan.days:
+        iso = day.date.isoformat()
+        weekday = WEEKDAYS[day.date.weekday()]
+
+        # --- closed days / dates ------------------------------------------
+        for item in day.items:
+            if weekday in item.closed_days:
+                findings.append(
+                    Finding(
+                        "error",
+                        "closed-day",
+                        f"scheduled on a {weekday.capitalize()} but closed {weekday}s",
+                        date=iso,
+                        item=item.title,
+                    )
+                )
+            if day.date in item.closed_dates:
+                findings.append(
+                    Finding(
+                        "error",
+                        "closed-date",
+                        f"closed on {iso} (listed in closed_dates)",
+                        date=iso,
+                        item=item.title,
+                    )
+                )
+
+        # --- booking deadlines --------------------------------------------
+        for item in day.items:
+            if item.booking_deadline is None:
+                continue
+            delta = (item.booking_deadline - today).days
+            if delta < 0:
+                findings.append(
+                    Finding(
+                        "error",
+                        "deadline-passed",
+                        f"booking deadline {item.booking_deadline.isoformat()} passed {abs(delta)}d ago",
+                        date=iso,
+                        item=item.title,
+                    )
+                )
+            elif delta <= 2:
+                findings.append(
+                    Finding(
+                        "warn",
+                        "deadline-soon",
+                        f"booking deadline {item.booking_deadline.isoformat()} is in {delta}d — book now",
+                        date=iso,
+                        item=item.title,
+                    )
+                )
+            if item.booking_deadline > day.date:
+                findings.append(
+                    Finding(
+                        "warn",
+                        "deadline-after-event",
+                        f"booking deadline {item.booking_deadline.isoformat()} is after the event date {iso}",
+                        date=iso,
+                        item=item.title,
+                    )
+                )
+
+        ordered = timed_items(day)
+
+        # --- input ordering ------------------------------------------------
+        if [i.index for i in ordered] != sorted(i.index for i in ordered):
+            findings.append(
+                Finding(
+                    "info",
+                    "out-of-order",
+                    "items are not listed in chronological order in the plan file",
+                    date=iso,
+                )
+            )
+
+        # --- overlaps + impossible transit ---------------------------------
+        for prev, cur in zip(ordered, ordered[1:]):
+            prev_end = prev.end_dt(tz)
+            cur_start = cur.start_dt(tz)
+            if cur_start < prev_end:
+                overlap = int((prev_end - cur_start).total_seconds() // 60)
+                findings.append(
+                    Finding(
+                        "error",
+                        "overlap",
+                        f"overlaps {prev.title!r} ({prev.timespan()}) by {overlap} min",
+                        date=iso,
+                        item=cur.title,
+                    )
+                )
+                continue  # transit failure is implied; don't double-report
+            if cur.transit_min:
+                need = prev_end + dt.timedelta(minutes=cur.transit_min)
+                if cur_start < need:
+                    short = int((need - cur_start).total_seconds() // 60)
+                    findings.append(
+                        Finding(
+                            "error",
+                            "impossible-transit",
+                            (
+                                f"needs {cur.transit_min} min transit after {prev.title!r} "
+                                f"(ends {prev.end.strftime('%H:%M') if prev.end else '??:??'}) "
+                                f"but starts {cur.start.strftime('%H:%M')} — {short} min short"
+                            ),
+                            date=iso,
+                            item=cur.title,
+                        )
+                    )
+
+        # --- empty days and big gaps ---------------------------------------
+        if not day.items:
+            findings.append(
+                Finding("info", "free-day", f"{weekday.capitalize()} has nothing planned", date=iso)
+            )
+        elif not ordered:
+            pass
+        else:
+            for prev, cur in zip(ordered, ordered[1:]):
+                gap = int((cur.start_dt(tz) - prev.end_dt(tz)).total_seconds() // 60)
+                if gap >= gap_min:
+                    findings.append(
+                        Finding(
+                            "info",
+                            "big-gap",
+                            (
+                                f"{gap // 60}h{gap % 60:02d}m open between {prev.title!r} "
+                                f"and {cur.title!r}"
+                            ),
+                            date=iso,
+                        )
+                    )
+
+    # --- dates inside the span with no day entry at all ---------------------
+    # A single missing date is probably an oversight; a run of them is probably
+    # two separate legs of the trip, so it gets one summary note instead of N.
+    if plan.days:
+        have = {d.date for d in plan.days}
+        runs: list[list[dt.date]] = []
+        cur = plan.days[0].date
+        last = plan.days[-1].date
+        while cur <= last:
+            if cur not in have:
+                if runs and runs[-1][-1] + dt.timedelta(days=1) == cur:
+                    runs[-1].append(cur)
+                else:
+                    runs.append([cur])
+            cur += dt.timedelta(days=1)
+        for run in runs:
+            if len(run) == 1:
+                findings.append(
+                    Finding(
+                        "info",
+                        "unscheduled-date",
+                        f"{WEEKDAYS[run[0].weekday()].capitalize()} {run[0].isoformat()} is inside the trip but has no day entry",
+                        date=run[0].isoformat(),
+                    )
+                )
+            else:
+                findings.append(
+                    Finding(
+                        "info",
+                        "leg-gap",
+                        (
+                            f"{len(run)} consecutive days with no day entry "
+                            f"({run[0].isoformat()} → {run[-1].isoformat()}) — "
+                            "assuming separate trip legs"
+                        ),
+                        date=run[0].isoformat(),
+                    )
+                )
+
+    findings.sort(key=lambda f: (f.date or "", LEVEL_RANK[f.level], f.code))
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# ics
+# ---------------------------------------------------------------------------
+
+
+
+def check_trip_shape(plan: Plan) -> list[Finding]:
+    """Checks that need the whole trip, not one day.
+
+    Added 2026-08-30. Each of these corresponds to a real failure on the Tokyo
+    trip: an event scheduled on a day the traveller was still over the Pacific,
+    and two nights with no hotel that nobody noticed until the week of.
+    """
+    out: list[Finding] = []
+    items = [i for d in plan.days for i in d.items]
+
+    arrivals = [i for i in items if i.kind == "arrival"]
+    departures = [i for i in items if i.kind == "departure"]
+    if arrivals:
+        first = min(a.date for a in arrivals)
+        for i in items:
+            if i.kind in ("arrival", "departure"):
+                continue
+            if i.date < first:
+                out.append(Finding(
+                    "error", "before-arrival",
+                    f"scheduled {(first - i.date).days}d before you land ({first})",
+                    date=i.date.isoformat(), item=i.title))
+    if departures:
+        last = max(d.date for d in departures)
+        for i in items:
+            if i.kind in ("arrival", "departure"):
+                continue
+            if i.date > last:
+                out.append(Finding(
+                    "error", "after-departure",
+                    f"scheduled {(i.date - last).days}d after you fly out ({last})",
+                    date=i.date.isoformat(), item=i.title))
+
+    lodging = [i for i in items if i.kind == "lodging" and i.nights > 0]
+    if lodging and arrivals and departures:
+        covered: set[dt.date] = set()
+        for stay in lodging:
+            for n in range(stay.nights):
+                covered.add(stay.date + dt.timedelta(days=n))
+        first = min(a.date for a in arrivals)
+        last = max(d.date for d in departures)
+        night = first
+        while night < last:
+            if night not in covered:
+                out.append(Finding(
+                    "error", "uncovered-night",
+                    "no lodging booked for this night",
+                    date=night.isoformat(), item="(accommodation)"))
+            night += dt.timedelta(days=1)
+    elif not lodging and (arrivals or departures):
+        out.append(Finding(
+            "info", "no-lodging",
+            "no items marked 'kind: lodging' — nightly coverage not checked",
+            date=(arrivals or departures)[0].date.isoformat(), item="(accommodation)"))
+    return out
+
+
+def ics_escape(text: str) -> str:
+    """Escape an RFC 5545 TEXT value."""
+    return (
+        text.replace("\\", "\\\\")
+        .replace(";", "\\;")
+        .replace(",", "\\,")
+        .replace("\r\n", "\\n")
+        .replace("\r", "\\n")
+        .replace("\n", "\\n")
+    )
+
+
+def fold(line: str) -> list[str]:
+    """Fold a content line at 75 octets (RFC 5545 3.1), never splitting a char."""
+    if len(line.encode("utf-8")) <= 75:
+        return [line]
+    out: list[str] = []
+    buf = ""
+    buf_bytes = 0
+    limit = 75  # first line: 75 octets
+    for ch in line:
+        size = len(ch.encode("utf-8"))
+        if buf_bytes + size > limit:
+            out.append(buf)
+            buf = ""
+            buf_bytes = 0
+            limit = 74  # continuation lines carry a leading space -> 75 total
+        buf += ch
+        buf_bytes += size
+    if buf:
+        out.append(buf)
+    return [out[0]] + [" " + chunk for chunk in out[1:]]
+
+
+def utc_stamp(moment: dt.datetime) -> str:
+    return moment.astimezone(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def event_uid(plan: Plan, item: Item) -> str:
+    key = "|".join(
+        [
+            plan.title,
+            plan.tz_name,
+            item.date.isoformat(),
+            "allday" if item.all_day else (item.start.strftime("%H:%M") if item.start else ""),
+            item.title,
+        ]
+    )
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()
+    return f"{digest}@itinerary.dispatch.local"
+
+
+def build_ics(plan: Plan, dtstamp: dt.datetime, reminder_min: int | None = None) -> str:
+    lines: list[str] = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        f"PRODID:{PRODID}",
+        "CALSCALE:GREGORIAN",
+        f"X-WR-CALNAME:{ics_escape(plan.title)}",
+        f"X-WR-TIMEZONE:{plan.tz_name}",
+    ]
+    stamp = utc_stamp(dtstamp)
+
+    for day in plan.days:
+        for item in day.items:
+            lines.append("BEGIN:VEVENT")
+            lines.append(f"UID:{event_uid(plan, item)}")
+            lines.append(f"DTSTAMP:{stamp}")
+            if item.all_day:
+                # DATE values are timezone-less; DTEND is exclusive.
+                lines.append(f"DTSTART;VALUE=DATE:{item.date.strftime('%Y%m%d')}")
+                lines.append(
+                    "DTEND;VALUE=DATE:"
+                    + (item.date + dt.timedelta(days=1)).strftime("%Y%m%d")
+                )
+            else:
+                # Emit UTC so the file is correct for a reader in any timezone.
+                lines.append(f"DTSTART:{utc_stamp(item.start_dt(plan.tz))}")
+                lines.append(f"DTEND:{utc_stamp(item.end_dt(plan.tz))}")
+            lines.append(f"SUMMARY:{ics_escape(item.title)}")
+            if item.location:
+                lines.append(f"LOCATION:{ics_escape(item.location)}")
+            desc_parts: list[str] = []
+            if item.notes:
+                desc_parts.append(item.notes)
+            if item.cost:
+                desc_parts.append(f"Cost: {item.cost}")
+            if item.transit_min:
+                desc_parts.append(f"Transit from previous stop: ~{item.transit_min} min")
+            if item.booking_deadline:
+                desc_parts.append(f"Book by: {item.booking_deadline.isoformat()}")
+            if item.url:
+                desc_parts.append(item.url)
+                # URL is a URI value, not TEXT: it is NOT backslash-escaped.
+                lines.append(f"URL:{item.url}")
+            if desc_parts:
+                description = "\n".join(desc_parts)
+                lines.append(f"DESCRIPTION:{ics_escape(description)}")
+            if reminder_min is not None and not item.all_day:
+                lines.append("BEGIN:VALARM")
+                lines.append("ACTION:DISPLAY")
+                lines.append(f"DESCRIPTION:{ics_escape(item.title)}")
+                lines.append(f"TRIGGER:-PT{int(reminder_min)}M")
+                lines.append("END:VALARM")
+            lines.append("END:VEVENT")
+
+    lines.append("END:VCALENDAR")
+
+    folded: list[str] = []
+    for line in lines:
+        folded.extend(fold(line))
+    return "\r\n".join(folded) + "\r\n"
+
+
+# ---------------------------------------------------------------------------
+# single-event invite (`itinerary event`)
+# ---------------------------------------------------------------------------
+
+
+def parse_span(text: str, what: str) -> dt.timedelta:
+    """'1h45', '1h45m', '2h', '90m', '90' (minutes) -> timedelta."""
+    import re
+
+    s = str(text).strip().lower().replace(" ", "")
+    m = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m?)?", s)
+    if not s or not m or (m.group(1) is None and m.group(2) is None):
+        raise PlanError(f"bad {what} {text!r} (want e.g. 1h45, 2h, 90m)")
+    span = dt.timedelta(hours=int(m.group(1) or 0), minutes=int(m.group(2) or 0))
+    if span <= dt.timedelta(0):
+        raise PlanError(f"{what} must be positive, got {text!r}")
+    return span
+
+
+def _ics_offset(delta: dt.timedelta) -> str:
+    total = int(delta.total_seconds())
+    sign = "-" if total < 0 else "+"
+    total = abs(total)
+    hh, rem = divmod(total, 3600)
+    mm, ss = divmod(rem, 60)
+    return f"{sign}{hh:02d}{mm:02d}" + (f"{ss:02d}" if ss else "")
+
+
+def vtimezone_lines(tz_name: str, tz: ZoneInfo, years: range) -> list[str]:
+    """Build a VTIMEZONE from zoneinfo: one STANDARD/DAYLIGHT block per real
+    transition in `years` (explicit DTSTARTs, no RRULE guessing). Zones with no
+    transitions (e.g. Asia/Tokyo) get a single fixed STANDARD block."""
+    utc = dt.timezone.utc
+
+    def off(t: dt.datetime) -> dt.timedelta:
+        return t.astimezone(tz).utcoffset()
+
+    transitions: list[dt.datetime] = []  # UTC instants where the offset changes
+    t = dt.datetime(years.start, 1, 1, tzinfo=utc)
+    stop = dt.datetime(years.stop, 1, 1, tzinfo=utc)
+    step = dt.timedelta(hours=6)
+    while t < stop:
+        nxt = t + step
+        if off(t) != off(nxt):
+            lo, hi = t, nxt  # binary search to the minute
+            while hi - lo > dt.timedelta(minutes=1):
+                mid = lo + (hi - lo) / 2
+                mid = mid.replace(second=0, microsecond=0)
+                if mid <= lo:
+                    mid = lo + dt.timedelta(minutes=1)
+                if off(mid) == off(lo):
+                    lo = mid
+                else:
+                    hi = mid
+            transitions.append(hi)
+        t = nxt
+
+    lines = ["BEGIN:VTIMEZONE", f"TZID:{tz_name}"]
+    if not transitions:
+        ref = dt.datetime(years.start, 1, 1, tzinfo=utc).astimezone(tz)
+        o = _ics_offset(ref.utcoffset())
+        lines += [
+            "BEGIN:STANDARD",
+            "DTSTART:19700101T000000",
+            f"TZOFFSETFROM:{o}",
+            f"TZOFFSETTO:{o}",
+            f"TZNAME:{ref.tzname()}",
+            "END:STANDARD",
+        ]
+    for instant in transitions:
+        before = instant - dt.timedelta(minutes=1)
+        after = instant.astimezone(tz)
+        kind = "DAYLIGHT" if after.dst() else "STANDARD"
+        # DTSTART is the local wall time of the transition in the OLD offset.
+        local_start = (instant + off(before)).replace(tzinfo=None)
+        lines += [
+            f"BEGIN:{kind}",
+            f"DTSTART:{local_start.strftime('%Y%m%dT%H%M%S')}",
+            f"TZOFFSETFROM:{_ics_offset(off(before))}",
+            f"TZOFFSETTO:{_ics_offset(after.utcoffset())}",
+            f"TZNAME:{after.tzname()}",
+            f"END:{kind}",
+        ]
+    lines.append("END:VTIMEZONE")
+    return lines
+
+
+def build_event_ics(
+    title: str,
+    tz_name: str,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    day: dt.date,
+    dtstamp: dt.datetime,
+    location: str | None = None,
+    notes: str | None = None,
+    url: str | None = None,
+    alarm: dt.timedelta | None = None,
+) -> str:
+    """One VEVENT. Timed events use local time with TZID plus a matching
+    VTIMEZONE (so calendars show the venue's wall-clock time); start=None means
+    an all-day event on `day`."""
+    lines: list[str] = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        f"PRODID:{PRODID}",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+    ]
+    if start is not None:
+        lines += vtimezone_lines(tz_name, start.tzinfo, range(start.year - 1, end.year + 2))
+    key = "|".join([title, tz_name, day.isoformat(), start.strftime("%H:%M") if start else "allday"])
+    lines += [
+        "BEGIN:VEVENT",
+        f"UID:{hashlib.sha1(key.encode('utf-8')).hexdigest()}@itinerary.dispatch.local",
+        f"DTSTAMP:{utc_stamp(dtstamp)}",
+    ]
+    if start is None:
+        lines.append(f"DTSTART;VALUE=DATE:{day.strftime('%Y%m%d')}")
+        lines.append(f"DTEND;VALUE=DATE:{(day + dt.timedelta(days=1)).strftime('%Y%m%d')}")
+    else:
+        lines.append(f"DTSTART;TZID={tz_name}:{start.strftime('%Y%m%dT%H%M%S')}")
+        lines.append(f"DTEND;TZID={tz_name}:{end.strftime('%Y%m%dT%H%M%S')}")
+    lines.append(f"SUMMARY:{ics_escape(title)}")
+    if location:
+        lines.append(f"LOCATION:{ics_escape(location)}")
+    desc = [p for p in (notes, url) if p]
+    if desc:
+        lines.append(f"DESCRIPTION:{ics_escape(chr(10).join(desc))}")
+    if url:
+        lines.append(f"URL:{url}")
+    if alarm is not None:
+        mins = int(alarm.total_seconds() // 60)
+        trig = f"-PT{mins // 60}H{mins % 60}M" if mins % 60 else f"-PT{mins // 60}H"
+        if mins < 60:
+            trig = f"-PT{mins}M"
+        lines += [
+            "BEGIN:VALARM",
+            "ACTION:DISPLAY",
+            f"DESCRIPTION:{ics_escape(title)}",
+            f"TRIGGER:{trig}",
+            "END:VALARM",
+        ]
+    lines += ["END:VEVENT", "END:VCALENDAR"]
+    folded: list[str] = []
+    for line in lines:
+        folded.extend(fold(line))
+    return "\r\n".join(folded) + "\r\n"
+
+
+# ---------------------------------------------------------------------------
+# rendering
+# ---------------------------------------------------------------------------
+
+
+def render_show(plan: Plan, tz_note: bool = True) -> str:
+    out: list[str] = []
+    span = f"{plan.days[0].date.isoformat()} → {plan.days[-1].date.isoformat()}"
+    out.append(f"{plan.title}  ({span}, {plan.tz_name})")
+    out.append("=" * max(40, len(out[0])))
+    for day in plan.days:
+        header = f"{day.date.strftime('%a %Y-%m-%d')}"
+        if day.label:
+            header += f" — {day.label}"
+        out.append("")
+        out.append(header)
+        out.append("-" * len(header))
+        if day.notes:
+            out.append(f"  ({day.notes})")
+        if not day.items:
+            out.append("  (free day — nothing planned)")
+            continue
+        ordered = sorted(
+            day.items,
+            key=lambda i: (0 if i.all_day else 1, i.start or dt.time(0, 0)),
+        )
+        for item in ordered:
+            out.append(f"  {item.timespan():>16}  {item.title}")
+            if item.location:
+                out.append(f"  {'':>16}  @ {item.location}")
+            bits = []
+            if item.transit_min:
+                bits.append(f"~{item.transit_min} min transit to get here")
+            if item.cost:
+                bits.append(item.cost)
+            if item.booking_deadline:
+                bits.append(f"book by {item.booking_deadline.isoformat()}")
+            if item.closed_days:
+                bits.append("closed " + ", ".join(d.capitalize() for d in item.closed_days))
+            if item.closed_dates:
+                bits.append(
+                    "closed on " + ", ".join(d.isoformat() for d in item.closed_dates)
+                )
+            if bits:
+                out.append(f"  {'':>16}  [{'; '.join(bits)}]")
+            if item.notes:
+                out.append(f"  {'':>16}  {item.notes}")
+            if item.url:
+                out.append(f"  {'':>16}  {item.url}")
+    if tz_note:
+        out.append("")
+        out.append(f"All times local to {plan.tz_name}.")
+    return "\n".join(out)
+
+
+def render_findings(findings: list[Finding]) -> str:
+    if not findings:
+        return "No findings."
+    out: list[str] = []
+    current_date = object()
+    for f in findings:
+        if f.date != current_date:
+            current_date = f.date
+            out.append("")
+            out.append(f.date or "(plan)")
+        label = f" {f.item}:" if f.item else ""
+        out.append(f"  {LEVEL_MARK[f.level]} [{f.code}]{label} {f.message}")
+    return "\n".join(out).lstrip("\n")
+
+
+def summarize(findings: list[Finding]) -> str:
+    counts = {lvl: sum(1 for f in findings if f.level == lvl) for lvl in LEVEL_MARK}
+    return (
+        f"{counts['error']} error(s), {counts['warn']} warning(s), {counts['info']} note(s)"
+    )
+
+
+TEMPLATE = """\
+title: My Trip
+timezone: Asia/Tokyo
+default_transit_min: 0        # optional fallback for items without transit_min
+
+days:
+  - date: 2026-08-27
+    label: Arrival             # optional
+    items:
+      - start: "16:00"         # ALWAYS quote times: unquoted 16:00 is a YAML int
+        end: "17:30"           # or use: duration_min: 90
+        title: Example stop
+        location: "Street address, City"
+        url: "https://example.com"
+        notes: "free, no reservation"
+        cost: "¥1,600"         # optional
+        transit_min: 10        # travel time needed to GET here from the previous item
+        booking_deadline: 2026-08-25   # optional
+        closed_days: [monday]          # optional
+        closed_dates: [2026-09-07]     # optional
+      - title: Hotel check-in
+        all_day: true          # all-day items need no start/end
+
+  - date: 2026-08-28
+    items: []                  # an empty day is reported as a free day
+"""
+
+
+# ---------------------------------------------------------------------------
+# cli
+# ---------------------------------------------------------------------------
+
+
+def _load_or_die(path_str: str) -> tuple[Plan, list[Finding]]:
+    try:
+        return load_plan(Path(path_str).expanduser())
+    except PlanError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(2)
+
+
+def cmd_validate(args) -> int:
+    plan, findings = _load_or_die(args.plan)
+    structural = [f for f in findings if f.level == "error"]
+    print(
+        f"{plan.source.name}: {plan.title} — {len(plan.days)} day(s), "
+        f"{sum(len(d.items) for d in plan.days)} item(s), tz={plan.tz_name}"
+    )
+    if findings:
+        print(render_findings(findings))
+    print(summarize(findings))
+    if structural:
+        return 1
+    print("OK — plan parses cleanly.")
+    return 0
+
+
+def cmd_show(args) -> int:
+    plan, findings = _load_or_die(args.plan)
+    if any(f.level == "error" for f in findings):
+        print(render_findings(findings), file=sys.stderr)
+        return 1
+    print(render_show(plan))
+    return 0
+
+
+def cmd_check(args) -> int:
+    plan, load_findings = _load_or_die(args.plan)
+    today = dt.date.fromisoformat(args.today) if args.today else dt.date.today()
+    findings = load_findings + run_checks(plan, today, args.gap_min) + check_trip_shape(plan)
+    findings.sort(key=lambda f: (f.date or "", LEVEL_RANK[f.level], f.code))
+
+    blocking = [f for f in findings if f.level in ("error", "warn")]
+    if args.strict:
+        blocking = findings
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "plan": str(plan.source),
+                    "title": plan.title,
+                    "today": today.isoformat(),
+                    "ok": not blocking,
+                    "counts": {
+                        lvl: sum(1 for f in findings if f.level == lvl) for lvl in LEVEL_MARK
+                    },
+                    "findings": [f.to_dict() for f in findings],
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+        return 1 if blocking else 0
+
+    print(f"check {plan.source.name} — {plan.title} (today = {today.isoformat()})")
+    print(render_findings(findings))
+    print()
+    print(summarize(findings))
+    if blocking:
+        print("FAILED — fix the items above.")
+        return 1
+    print("PASS — no conflicts found.")
+    return 0
+
+
+def cmd_ics(args) -> int:
+    plan, findings = _load_or_die(args.plan)
+    if any(f.level == "error" for f in findings):
+        print(render_findings(findings), file=sys.stderr)
+        print("error: plan has structural errors; refusing to export", file=sys.stderr)
+        return 2
+    stamp = (
+        dt.datetime.fromisoformat(args.dtstamp)
+        if args.dtstamp
+        else dt.datetime.now(dt.timezone.utc)
+    )
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=dt.timezone.utc)
+    text = build_ics(plan, stamp, args.reminder_min)
+    if args.out in (None, "-"):
+        sys.stdout.write(text)
+    else:
+        out = Path(args.out).expanduser()
+        out.write_bytes(text.encode("utf-8"))
+        events = sum(len(d.items) for d in plan.days)
+        print(f"wrote {out} — {events} event(s), {len(text.encode('utf-8'))} bytes")
+    return 0
+
+
+def cmd_event(args) -> int:
+    try:
+        tz = ZoneInfo(args.tz)
+    except (ZoneInfoNotFoundError, ValueError):
+        print(f"error: unknown timezone {args.tz!r} (want an IANA name like America/Los_Angeles)", file=sys.stderr)
+        return 2
+    try:
+        day = _parse_date(args.date, "--date")
+        start = end = None
+        if args.start:
+            start = dt.datetime.combine(day, _parse_time(args.start, "--start"), tzinfo=tz)
+            if args.end and args.duration:
+                raise PlanError("give --end or --duration, not both")
+            if args.end:
+                end = dt.datetime.combine(day, _parse_time(args.end, "--end"), tzinfo=tz)
+                if end <= start:
+                    end += dt.timedelta(days=1)
+                    print("note: --end is before --start, so the event ends the next day", file=sys.stderr)
+            else:
+                end = start + parse_span(args.duration or "1h", "--duration")
+        elif args.end or args.duration:
+            raise PlanError("--end/--duration need --start (omit all three for an all-day event)")
+        alarm = parse_span(args.alarm, "--alarm") if args.alarm else None
+    except PlanError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    stamp = dt.datetime.fromisoformat(args.dtstamp) if args.dtstamp else dt.datetime.now(dt.timezone.utc)
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=dt.timezone.utc)
+    text = build_event_ics(args.title, args.tz, start, end, day, stamp,
+                           location=args.location, notes=args.notes, url=args.url, alarm=alarm)
+    if args.out in (None, "-"):
+        sys.stdout.write(text)
+    else:
+        out = Path(args.out).expanduser()
+        out.write_bytes(text.encode("utf-8"))
+        when = "all day" if start is None else f"{start:%H:%M}-{end:%H:%M} {args.tz}"
+        print(f"wrote {out} — {args.title}, {day.isoformat()} {when}, {len(text.encode('utf-8'))} bytes")
+    return 0
+
+
+def cmd_init(args) -> int:
+    if args.out in (None, "-"):
+        sys.stdout.write(TEMPLATE)
+    else:
+        out = Path(args.out).expanduser()
+        if out.exists() and not args.force:
+            print(f"error: {out} exists (use --force)", file=sys.stderr)
+            return 2
+        out.write_text(TEMPLATE, encoding="utf-8")
+        print(f"wrote {out}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# import: adopt an existing .ics as a plan file
+#
+# Added 2026-08-30. The gap this closes: the skill assumed you start from a YAML
+# plan. On the Tokyo trip the calendar already existed as a hand-written .ics,
+# there was no way in, so the whole trip was maintained by hand-editing raw
+# iCalendar with a Python one-liner -- and it drifted (bare LF line endings,
+# lines over 75 octets, an event silently kept at the wrong date). If a plan
+# already exists in .ics form, import it and get the checks for free.
+# ---------------------------------------------------------------------------
+
+
+def ics_unfold(text: str) -> list[str]:
+    """RFC 5545 line unfolding: a leading space/tab continues the previous line."""
+    raw = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    out: list[str] = []
+    for line in raw:
+        if line[:1] in (" ", "\t") and out:
+            out[-1] += line[1:]
+        else:
+            out.append(line)
+    return out
+
+
+def ics_unescape(text: str) -> str:
+    res, i = [], 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text):
+            nxt = text[i + 1]
+            res.append({"n": "\n", "N": "\n"}.get(nxt, nxt))
+            i += 2
+        else:
+            res.append(ch)
+            i += 1
+    return "".join(res)
+
+
+def _ics_dt(value: str, params: dict, tz: dt.tzinfo):
+    """Return (date, time|None). time is None for all-day (VALUE=DATE)."""
+    v = value.strip()
+    if params.get("VALUE", "").upper() == "DATE" or (len(v) == 8 and "T" not in v):
+        return dt.date(int(v[0:4]), int(v[4:6]), int(v[6:8])), None
+    naive = dt.datetime(int(v[0:4]), int(v[4:6]), int(v[6:8]),
+                        int(v[9:11]), int(v[11:13]), int(v[13:15] or 0))
+    if v.endswith("Z"):
+        moment = naive.replace(tzinfo=dt.timezone.utc).astimezone(tz)
+    elif "TZID" in params:
+        try:
+            moment = naive.replace(tzinfo=ZoneInfo(params["TZID"])).astimezone(tz)
+        except Exception:
+            moment = naive.replace(tzinfo=tz)
+    else:
+        moment = naive.replace(tzinfo=tz)
+    return moment.date(), moment.time()
+
+
+def parse_ics(text: str, tz: dt.tzinfo) -> tuple[list[dict], str | None]:
+    """Parse VEVENTs into dicts already converted into `tz`. Returns (events, calname)."""
+    events: list[dict] = []
+    calname = None
+    cur: dict | None = None
+    for line in ics_unfold(text):
+        if not line.strip():
+            continue
+        if line == "BEGIN:VEVENT":
+            cur = {}
+            continue
+        if line == "END:VEVENT":
+            if cur is not None:
+                events.append(cur)
+            cur = None
+            continue
+        if ":" not in line:
+            continue
+        head, value = line.split(":", 1)
+        parts = head.split(";")
+        name = parts[0].upper()
+        params = {}
+        for chunk in parts[1:]:
+            if "=" in chunk:
+                k, v = chunk.split("=", 1)
+                params[k.upper()] = v.strip('"')
+        if cur is None:
+            if name == "X-WR-CALNAME":
+                calname = ics_unescape(value)
+            continue
+        if name in ("SUMMARY", "LOCATION", "DESCRIPTION", "URL", "UID"):
+            cur[name.lower()] = ics_unescape(value)
+        elif name in ("DTSTART", "DTEND"):
+            cur[name.lower()] = _ics_dt(value, params, tz)
+    return events, calname
+
+
+def ics_to_plan(text: str, tzname: str, title: str | None = None) -> dict:
+    tz = ZoneInfo(tzname)
+    events, calname = parse_ics(text, tz)
+    by_day: dict[dt.date, list[dict]] = {}
+    for ev in events:
+        if "dtstart" not in ev:
+            continue
+        sdate, stime = ev["dtstart"]
+        edate, etime = ev.get("dtend", (None, None))
+        item: dict = {"title": ev.get("summary") or "(untitled)"}
+        if stime is None:
+            item["all_day"] = True
+        else:
+            item["start"] = stime.strftime("%H:%M")
+            if etime is not None:
+                item["end"] = etime.strftime("%H:%M")
+        for src, dst in (("location", "location"), ("url", "url"), ("description", "notes")):
+            if ev.get(src):
+                item[dst] = ev[src]
+        by_day.setdefault(sdate, []).append(item)
+
+    days = []
+    for date in sorted(by_day):
+        items = sorted(by_day[date], key=lambda i: i.get("start", "00:00"))
+        days.append({"date": date.isoformat(), "items": items})
+    return {
+        "title": title or calname or "Imported trip",
+        "timezone": tzname,
+        "days": days,
+    }
+
+
+def cmd_import(args) -> int:
+    src = Path(args.ics).expanduser()
+    if not src.exists():
+        print(f"error: {src} not found", file=sys.stderr)
+        return 2
+    try:
+        ZoneInfo(args.timezone)
+    except Exception:
+        print(f"error: unknown timezone {args.timezone!r}", file=sys.stderr)
+        return 2
+    plan = ics_to_plan(src.read_text(encoding="utf-8"), args.timezone, args.title)
+    blob = yaml.safe_dump(plan, allow_unicode=True, sort_keys=False, width=100)
+    n_items = sum(len(d["items"]) for d in plan["days"])
+    if args.out in (None, "-"):
+        sys.stdout.write(blob)
+    else:
+        out = Path(args.out).expanduser()
+        if out.exists() and not args.force:
+            print(f"error: {out} exists (use --force)", file=sys.stderr)
+            return 2
+        out.write_text(blob, encoding="utf-8")
+        print(f"wrote {out} — {len(plan['days'])} day(s), {n_items} item(s)")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# options: the candidate ledger
+#
+# A trip is mostly *rejected* ideas. Without somewhere to put them you re-research
+# the same venue twice and re-suggest things already ruled out. On the Tokyo trip
+# a permanently-closed bar was suggested after it had been established as closed,
+# and a shop was recommended twice after being rejected on price.
+# ---------------------------------------------------------------------------
+
+OPTION_STATUSES = ("candidate", "planned", "booked", "dead")
+
+
+def load_options(path: Path) -> list[dict]:
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if isinstance(data, list):
+        return data
+    return data.get("options") or data.get("candidates") or []
+
+
+def check_options(opts: list[dict], today: dt.date) -> list[Finding]:
+    out: list[Finding] = []
+    seen: dict[str, int] = {}
+    for idx, o in enumerate(opts):
+        where = o.get("title") or f"options[{idx}]"
+        status = (o.get("status") or "candidate").lower()
+        if status not in OPTION_STATUSES:
+            out.append(Finding("error", "bad-status", where,
+                               f"status {status!r} not one of {', '.join(OPTION_STATUSES)}"))
+        key = (o.get("title") or "").strip().lower()
+        if key and key in seen:
+            out.append(Finding("warn", "duplicate-option", where,
+                               f"same title as options[{seen[key]}] — merge them"))
+        elif key:
+            seen[key] = idx
+        if status in ("planned", "booked") and not o.get("verified"):
+            out.append(Finding("warn", "unverified", where,
+                               "promoted to " + status + " but has no `verified:` date — "
+                               "hours/closure were never confirmed"))
+        v = o.get("verified")
+        if v:
+            try:
+                vd = _parse_date(v, where)
+                age = (today - vd).days
+                if age > 14:
+                    out.append(Finding("warn", "stale", where,
+                                       f"last verified {age}d ago — re-check hours before sending"))
+            except PlanError:
+                out.append(Finding("error", "bad-verified", where, f"unparseable verified: {v!r}"))
+        if status == "dead" and not o.get("kill_reason"):
+            out.append(Finding("info", "no-kill-reason", where,
+                               "marked dead with no reason — it will get re-suggested"))
+        if status != "dead" and not o.get("source"):
+            out.append(Finding("info", "no-source", where,
+                               "no `source:` URL — the claim cannot be re-checked"))
+    return out
+
+
+def cmd_options(args) -> int:
+    path = Path(args.file).expanduser()
+    if not path.exists():
+        print(f"error: {path} not found", file=sys.stderr)
+        return 2
+    try:
+        opts = load_options(path)
+    except Exception as exc:
+        print(f"error: cannot load {path}: {exc}", file=sys.stderr)
+        return 2
+
+    today = _parse_date(args.today, "--today") if args.today else dt.date.today()
+
+    if args.check:
+        findings = check_options(opts, today)
+        if not findings:
+            print(f"{path.name}: {len(opts)} option(s) — clean.")
+            return 0
+        print(render_findings(findings))
+        print()
+        print(summarize(findings))
+        return 1 if any(f.level in ("error", "warn") for f in findings) else 0
+
+    wanted = args.status
+    groups: dict[str, list[dict]] = {s: [] for s in OPTION_STATUSES}
+    for o in opts:
+        groups.setdefault((o.get("status") or "candidate").lower(), []).append(o)
+    for status in OPTION_STATUSES:
+        rows = groups.get(status) or []
+        if wanted and status != wanted:
+            continue
+        if not rows:
+            continue
+        print(f"{status.upper()}  ({len(rows)})")
+        for o in rows:
+            line = f"  - {o.get('title', '(untitled)')}"
+            if o.get("date"):
+                line += f"  [{o['date']}]"
+            if o.get("cost"):
+                line += f"  {o['cost']}"
+            print(line)
+            for field in ("location", "hours", "kill_reason", "verified"):
+                if o.get(field):
+                    print(f"      {field}: {o[field]}")
+        print()
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="itinerary",
+        description="Plan a trip day-by-day, sanity-check it, and export a real .ics.",
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("validate", help="structural check of a plan file")
+    p.add_argument("plan")
+    p.set_defaults(func=cmd_validate)
+
+    p = sub.add_parser("show", help="print a readable day-by-day agenda")
+    p.add_argument("plan")
+    p.set_defaults(func=cmd_show)
+
+    p = sub.add_parser("check", help="find overlaps, impossible transit, closures, deadlines")
+    p.add_argument("plan")
+    p.add_argument("--today", help="override today's date (YYYY-MM-DD) for deadline checks")
+    p.add_argument(
+        "--gap-min",
+        type=int,
+        default=240,
+        help="report open gaps at least this many minutes (default 240)",
+    )
+    p.add_argument("--strict", action="store_true", help="also fail on info-level notes")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.set_defaults(func=cmd_check)
+
+    p = sub.add_parser("ics", help="emit an RFC 5545 .ics file")
+    p.add_argument("plan")
+    p.add_argument("--out", help="output path (default: stdout)")
+    p.add_argument(
+        "--reminder-min",
+        type=int,
+        help="add a DISPLAY alarm this many minutes before each timed event",
+    )
+    p.add_argument("--dtstamp", help="fixed DTSTAMP (ISO 8601 UTC) for reproducible output")
+    p.set_defaults(func=cmd_ics)
+
+    p = sub.add_parser("event", help="one-off .ics invite for a single event (no plan file)")
+    p.add_argument("--title", required=True)
+    p.add_argument("--date", required=True, help="YYYY-MM-DD")
+    p.add_argument("--start", help="HH:MM local time (omit for an all-day event)")
+    p.add_argument("--end", help="HH:MM local end time")
+    p.add_argument("--duration", help="e.g. 1h45, 2h, 90m (default 1h if no --end)")
+    p.add_argument("--tz", default="America/Los_Angeles", help="IANA timezone of the venue (default America/Los_Angeles)")
+    p.add_argument("--location")
+    p.add_argument("--notes")
+    p.add_argument("--url")
+    p.add_argument("--alarm", help="reminder before start, e.g. 2h, 30m")
+    p.add_argument("--dtstamp", help="fixed DTSTAMP (ISO 8601 UTC) for reproducible output")
+    p.add_argument("--out", help="output path (default: stdout)")
+    p.set_defaults(func=cmd_event)
+
+    p = sub.add_parser("init", help="print a starter plan template")
+    p.add_argument("--out", help="write template to this path (default: stdout)")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(func=cmd_init)
+
+    p = sub.add_parser("import", help="convert an existing .ics into a plan file")
+    p.add_argument("ics")
+    p.add_argument("--timezone", default="Asia/Tokyo", help="IANA tz to render times in")
+    p.add_argument("--title", help="plan title (default: X-WR-CALNAME or 'Imported trip')")
+    p.add_argument("--out", help="output path (default: stdout)")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(func=cmd_import)
+
+    p = sub.add_parser("options", help="list or check the candidate ledger")
+    p.add_argument("file")
+    p.add_argument("--status", choices=list(OPTION_STATUSES), help="only show this status")
+    p.add_argument("--check", action="store_true", help="report stale/unverified/duplicate options")
+    p.add_argument("--today", help="pretend today is this date (YYYY-MM-DD)")
+    p.set_defaults(func=cmd_options)
+
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

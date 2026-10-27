@@ -1,0 +1,121 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pillow", "requests"]
+# ///
+"""contact-sheet: download listing photos from `mpwatch ... --json` output and tile them into labeled grids.
+
+  contact-sheet listings.json -o /tmp/sheet.png [--cols 5] [--per-sheet 20] [--imgdir /tmp/ct-imgs]
+
+Each tile is labeled "<index> <price> <title>" (index = position in the JSON list), so you can Read the PNG
+and refer back to listings by number. Craigslist listings (empty `image`) get their first
+images.craigslist.org ..._600x450.jpg photo scraped from the listing page. Photos are saved as
+<imgdir>/<index>.jpg for reuse in visual cards. Multiple sheets are written as sheet-1.png, sheet-2.png, ...
+"""
+import argparse
+import io
+import json
+import re
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import requests
+from PIL import Image, ImageDraw, ImageFont
+
+UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124 Safari/537.36"}
+TILE = 300
+LABEL_H = 54
+
+
+def cl_image(url: str) -> str:
+    html = requests.get(url, headers=UA, timeout=20).text
+    m = re.search(r"https://images\.craigslist\.org/[^\"' ]+?_600x450\.jpg", html)
+    return m.group(0) if m else ""
+
+
+def fetch(idx_item, imgdir: Path):
+    idx, item = idx_item
+    out = imgdir / f"{idx}.jpg"
+    try:
+        if not out.exists():
+            url = item.get("image") or (cl_image(item["url"]) if item.get("source") == "cl" else "")
+            if not url:
+                return idx, None
+            r = requests.get(url, headers=UA, timeout=20)
+            r.raise_for_status()
+            Image.open(io.BytesIO(r.content)).convert("RGB").save(out, "JPEG", quality=90)
+        return idx, out
+    except Exception as e:  # noqa: BLE001
+        print(f"[{idx}] image failed: {e}", file=sys.stderr)
+        return idx, None
+
+
+def font(size):
+    for p in ("/System/Library/Fonts/Helvetica.ttc", "/System/Library/Fonts/SFNS.ttf"):
+        try:
+            return ImageFont.truetype(p, size)
+        except OSError:
+            pass
+    return ImageFont.load_default()
+
+
+def wrap(draw, text, f, width):
+    lines, cur = [], ""
+    for w in text.split():
+        t = (cur + " " + w).strip()
+        if draw.textlength(t, font=f) <= width:
+            cur = t
+        else:
+            lines.append(cur)
+            cur = w
+    lines.append(cur)
+    return lines
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("json_file")
+    ap.add_argument("-o", "--out", default="/tmp/contact-sheet.png")
+    ap.add_argument("--cols", type=int, default=5)
+    ap.add_argument("--per-sheet", type=int, default=20)
+    ap.add_argument("--imgdir", default="/tmp/contact-sheet-imgs")
+    a = ap.parse_args()
+
+    items = json.load(open(a.json_file))
+    if isinstance(items, dict):
+        items = items.get("listings", [])
+    imgdir = Path(a.imgdir)
+    imgdir.mkdir(parents=True, exist_ok=True)
+    with ThreadPoolExecutor(8) as ex:
+        paths = dict(ex.map(lambda x: fetch(x, imgdir), enumerate(items)))
+
+    f_big, f_small = font(20), font(14)
+    out = Path(a.out)
+    chunks = [list(range(i, min(i + a.per_sheet, len(items)))) for i in range(0, len(items), a.per_sheet)]
+    for n, chunk in enumerate(chunks, 1):
+        rows = (len(chunk) + a.cols - 1) // a.cols
+        sheet = Image.new("RGB", (a.cols * TILE, rows * (TILE + LABEL_H)), "white")
+        d = ImageDraw.Draw(sheet)
+        for k, idx in enumerate(chunk):
+            x, y = (k % a.cols) * TILE, (k // a.cols) * (TILE + LABEL_H)
+            p = paths.get(idx)
+            if p:
+                im = Image.open(p)
+                im.thumbnail((TILE - 6, TILE - 6))
+                sheet.paste(im, (x + (TILE - im.width) // 2, y + (TILE - im.height) // 2))
+            else:
+                d.text((x + 10, y + TILE // 2), "no image", fill="gray", font=f_small)
+            it = items[idx]
+            d.rectangle([x, y, x + 44, y + 28], fill="black")
+            d.text((x + 6, y + 3), str(idx), fill="white", font=f_big)
+            label = f"{it.get('price', '')} · {it.get('source', '')} · {it.get('title', '')} · {it.get('location', '')}"
+            for j, line in enumerate(wrap(d, label, f_small, TILE - 8)[:3]):
+                d.text((x + 4, y + TILE + 2 + j * 17), line, fill="black", font=f_small)
+        path = out if len(chunks) == 1 else out.with_name(f"{out.stem}-{n}{out.suffix}")
+        sheet.save(path)
+        print(path)
+
+
+if __name__ == "__main__":
+    main()

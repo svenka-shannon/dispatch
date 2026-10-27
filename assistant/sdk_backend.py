@@ -82,6 +82,22 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif"}
 
 GEMINI_CLI = Path.home() / ".claude" / "skills" / "gemini" / "scripts" / "gemini"
 
+# Fatal labels where resuming can never help: the oversized context comes back
+# with the resume, so the restart must drop it (clean=True).
+CONTEXT_SIZE_ERRORS = {"prompt_too_long", "context_too_long", "content_too_large", "buffer_overflow"}
+
+# Fast-heal repeat-fatal ladder: if the same fatal label recurs for a session
+# within this window, the previous (resume) restart didn't fix it — escalate
+# to a clean restart and notify the admin.
+REPEAT_FATAL_WINDOW_S = 1800
+
+# Early stall abort: a session whose current turn has streamed this many
+# api_retry SystemMessages (with the latest one recent) is stuck in the SDK's
+# retry loop and will fail in ~6 min anyway — abort and restart it now instead
+# of leaving the contact in silence. Healthy turns see 0-2 transient retries.
+API_RETRY_STALL_THRESHOLD = 4
+API_RETRY_STALL_RECENT_S = 120
+
 
 async def analyze_image_with_gemini(image_path: str, message_context: str | None = None) -> Optional[str]:
     """Analyze an image using Gemini Vision.
@@ -204,6 +220,20 @@ Briefly describe what you see in this image, keeping the sender's context in min
 lifecycle_log = logging.getLogger("lifecycle")
 
 
+
+def resume_conversation_exists(resume_id: str, projects_root: Path | None = None) -> bool:
+    """True if Claude Code still has a transcript for this session id (any project dir).
+
+    2026-10-12: the cherry-eric group's registry pointed at a May session whose transcript had been
+    deleted; every inbound message then failed with "No conversation found with session ID" and was
+    DLQ'd. The group went silent for hours.
+    """
+    root = projects_root or (Path.home() / ".claude" / "projects")
+    try:
+        return any(root.glob(f"*/{resume_id}.jsonl"))
+    except Exception:
+        return True  # never block a resume on a filesystem hiccup
+
 class SessionRegistry:
     """Persistent registry mapping chat_id to session metadata.
 
@@ -321,6 +351,20 @@ class SDKBackend:
     Replaces the tmux-based SessionManager entirely.
     """
 
+
+    def _validated_resume_id(self, session_name: str, chat_id: str, resume_id: str | None) -> str | None:
+        """Drop a stored resume id whose transcript no longer exists (start fresh instead of crash-looping)."""
+        if not resume_id or resume_conversation_exists(resume_id):
+            return resume_id
+        lifecycle_log.warning(
+            f"CREATE | {session_name} | RESUME_MISSING | resume_id={resume_id} | starting fresh"
+        )
+        try:
+            self.registry.update_session_id(chat_id, session_id=None)
+            self.registry.flush()
+        except Exception as e:
+            log.warning(f"RESUME_MISSING clear failed | {chat_id} | {e}")
+        return None
     def __init__(
         self,
         registry: SessionRegistry,
@@ -342,6 +386,8 @@ class SDKBackend:
         self._last_fast_check: Dict[str, datetime] = {}  # chat_id -> last scan timestamp
         self._recently_healed: Dict[str, datetime] = {}  # chat_id -> heal timestamp
         self._last_auth_error_notification: Optional[datetime] = None  # debounce auth error SMS
+        self._repeat_fatals: Dict[str, tuple[str, datetime]] = {}  # chat_id -> (fatal_label, ts) from last fast-heal
+        self._last_heal_escalation_notification: Optional[datetime] = None  # debounce escalation SMS
 
         # Circuit breaker: track restart timestamps per session to prevent crash loops
         self._restart_timestamps: Dict[str, list] = {}  # chat_id -> list of restart datetimes
@@ -472,10 +518,33 @@ class SDKBackend:
                 # Replay undelivered messages from bus WAL
                 await self._replay_undelivered(chat_id, stored_session_id)
 
-                # Nudge session to continue any in-progress work
+                # Nudge session to continue any in-progress work.
+                # COMPOSES with the outage briefing rather than replacing it:
+                # the briefing supplies the facts (how long, what fired), the
+                # nudge supplies the instruction (continue or stay silent).
+                # daemon_downtime_window() returns (None, None) for restarts
+                # shorter than MIN_OUTAGE_SECONDS, so a fast `restart-sessions`
+                # produces exactly the old message with no prefix.
                 session = self.sessions.get(chat_id)
                 if session:
+                    prefix = ""
+                    try:
+                        from assistant import outage as _outage
+                        down_since, back_up_at = _outage.daemon_downtime_window()
+                        if down_since:
+                            briefing = _outage.render_briefing(
+                                chat_id=chat_id,
+                                session_name=session_name,
+                                started_at=down_since,
+                                ended_at=back_up_at,
+                                cause="daemon restart",
+                            )
+                            if briefing:
+                                prefix = briefing + "\n\n"
+                    except Exception as e:
+                        log.warning(f"STARTUP | outage briefing failed for {session_name}: {e}")
                     await session.inject(
+                        prefix +
                         "[SYSTEM] Session resumed after daemon restart. "
                         "If you were in the middle of a task, continue where you left off. "
                         "If you were idle/waiting for user input, ignore this message and wait silently."
@@ -722,6 +791,7 @@ class SDKBackend:
         # kill_session() saves the session_id to the registry before stopping,
         # so we can resume the previous conversation instead of starting blank.
         stored_resume_id = existing_entry.get("session_id") if existing_entry else None
+        stored_resume_id = self._validated_resume_id(session_name, chat_id, stored_resume_id)
         if stored_resume_id:
             lifecycle_log.info(
                 f"CREATE | {session_name} | RESUME_FROM_REGISTRY | "
@@ -822,9 +892,14 @@ class SDKBackend:
         source: str = "imessage",
         message_timestamp: datetime | None = None,
         message_guid: str | None = None,
+        trusted: bool = False,
     ) -> bool:
         """Inject a message into an existing session.
         Creates session on-demand if missing (lazy creation).
+
+        ``trusted=True`` marks daemon-generated control text (e.g. an ADMIN
+        OVERRIDE) whose delimiters must survive intact. Correspondent text must
+        always leave this False.
         """
         import time
         inject_start = time.perf_counter()
@@ -832,7 +907,7 @@ class SDKBackend:
             raise ValueError(f"chat_id cannot be empty for contact {contact_name}")
 
         # Format message body
-        msg_body = format_message_body(text, attachments, audio_transcription)
+        msg_body = format_message_body(text, attachments, audio_transcription, trusted=trusted)
 
         # Prefix chat_id for registry storage (e.g. signal:+1234567890)
         # But don't add prefix if chat_id already has it
@@ -1295,6 +1370,7 @@ Gemini analyzed the attached image:
         # Resume from stored session_id if available (e.g., after idle timeout kill).
         existing_entry = self.registry.get(chat_id)
         stored_resume_id = existing_entry.get("session_id") if existing_entry else None
+        stored_resume_id = self._validated_resume_id(session_name, chat_id, stored_resume_id)
         if stored_resume_id:
             lifecycle_log.info(
                 f"CREATE | {session_name} | RESUME_FROM_REGISTRY | "
@@ -1350,8 +1426,14 @@ Gemini analyzed the attached image:
         source: str = "imessage",
         message_timestamp: datetime | None = None,
         message_guid: str | None = None,
+        trusted: bool = False,
     ) -> bool:
-        """Inject a message into a group session."""
+        """Inject a message into a group session.
+
+        ``trusted=True`` marks daemon-generated control text (e.g. an ADMIN
+        OVERRIDE) whose delimiters must survive intact. Correspondent text must
+        always leave this False.
+        """
         if not chat_id:
             raise ValueError("chat_id cannot be empty for group message")
 
@@ -1364,7 +1446,7 @@ Gemini analyzed the attached image:
             chat_id = f"{backend.registry_prefix}{chat_id}"
         chat_id = normalize_chat_id(chat_id)
 
-        msg_body = format_message_body(text, attachments, audio_transcription)
+        msg_body = format_message_body(text, attachments, audio_transcription, trusted=trusted)
 
         # Lock only for session creation check; inject happens outside lock
         async with self._lock:
@@ -1930,6 +2012,43 @@ Respond via: ~/.claude/skills/sms-assistant/scripts/send-sms "{admin_phone}" "[M
         except Exception as e:
             log.error(f"AUTH_ERROR_NOTIFY | Failed to send SMS: {e}")
 
+    def _send_heal_escalation_notification(self, session_name: str, fatal_label: str):
+        """Send SMS to admin when the repeat-fatal ladder escalates to a clean restart.
+
+        Uses subprocess directly (not a Claude session) — the failing session
+        demonstrably can't complete API turns, but send-sms goes through
+        Messages.app and keeps working (2026-09-18: three failed turns in a
+        row produced zero admin notification while send-sms was healthy).
+        """
+        from assistant import config
+
+        try:
+            admin_phone = config.require("owner.phone")
+            send_sms = HOME / ".claude/skills/sms-assistant/scripts/send-sms"
+            message = (
+                f"[HEAL] {session_name} hit repeated {fatal_label}; resume restart "
+                f"didn't fix it, escalated to clean restart (context dropped, "
+                f"history re-read on start). If this is connection_dropped, "
+                f"check the network — large uploads may be failing."
+            )
+
+            result = subprocess.run(
+                [str(send_sms), admin_phone, message],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode == 0:
+                lifecycle_log.info(f"HEAL_ESCALATION_NOTIFY | Sent SMS to admin: {message}")
+                produce_event(self._producer, "messages", "message.sent", {
+                    "chat_id": admin_phone, "text": message,
+                    "is_group": False, "success": True, "context": "heal_escalation",
+                }, key=f"imessage/{admin_phone}", source="daemon")
+            else:
+                log.warning(f"HEAL_ESCALATION_NOTIFY | SMS failed: {result.stderr}")
+        except Exception as e:
+            log.error(f"HEAL_ESCALATION_NOTIFY | Failed to send SMS: {e}")
+
     async def health_check_all(self, ctx: CheckContext | None = None) -> Dict[str, bool]:
         """Check all sessions. Auto-restarts unhealthy ones."""
         ctx = ctx or CheckContext()
@@ -1988,7 +2107,6 @@ Respond via: ~/.claude/skills/sms-assistant/scripts/send-sms "{admin_phone}" "[M
                 # Check transcript for context-size errors before deciding clean flag
                 since = self._last_fast_check.get(chat_id, session.created_at)
                 dead_entries = get_transcript_entries_since(session.cwd, session.session_id, since)
-                CONTEXT_SIZE_ERRORS = {"prompt_too_long", "context_too_long", "content_too_large", "buffer_overflow"}
                 dead_fatal = check_fatal_regex(dead_entries) if dead_entries else None
                 needs_clean = dead_fatal in CONTEXT_SIZE_ERRORS if dead_fatal else False
 
@@ -2019,10 +2137,27 @@ Respond via: ~/.claude/skills/sms-assistant/scripts/send-sms "{admin_phone}" "[M
             entries = get_transcript_entries_since(session.cwd, session.session_id, since)
             self._last_fast_check[chat_id] = now
 
-            if not entries:
+            fatal_label = check_fatal_regex(entries) if entries else None
+
+            # Early stall abort: the SDK streams an api_retry SystemMessage per
+            # retry attempt while the transcript stays silent. A streak means
+            # the current turn is wedged (degraded uplink, dead route) and will
+            # surface as connection_dropped after ~6 min of contact-visible
+            # silence — treat it as that fatal now and let the ladder handle it.
+            stall_abort = False
+            if not fatal_label and session.api_retry_streak >= API_RETRY_STALL_THRESHOLD:
+                last_retry = session.last_api_retry_at
+                if last_retry and (now - last_retry).total_seconds() < API_RETRY_STALL_RECENT_S:
+                    fatal_label = "connection_dropped"
+                    stall_abort = True
+                    lifecycle_log.info(
+                        f"FAST_HEAL | {get_session_name(session.chat_id, session.source)} | "
+                        f"API_RETRY_STALL | streak={session.api_retry_streak} | aborting turn early"
+                    )
+
+            if not fatal_label:
                 continue
 
-            fatal_label = check_fatal_regex(entries)
             if fatal_label:
                 session_name = get_session_name(session.chat_id, session.source)
                 lifecycle_log.info(
@@ -2042,16 +2177,46 @@ Respond via: ~/.claude/skills/sms-assistant/scripts/send-sms "{admin_phone}" "[M
                         self._last_auth_error_notification = now
                         self._send_auth_error_notification()
 
+                # Repeat-fatal ladder: if the SAME fatal recurred within the
+                # window, the previous restart (with resume) didn't fix it —
+                # the failure is baked into the resumed context (e.g. a context
+                # too large for a degraded uplink; connection_dropped repeating
+                # forever on 2026-09-18). Escalate to clean restart and tell
+                # the admin, since from the outside this looks like silence.
+                prev = self._repeat_fatals.get(chat_id)
+                is_repeat = bool(
+                    prev and prev[0] == fatal_label
+                    and (now - prev[1]).total_seconds() < REPEAT_FATAL_WINDOW_S
+                )
+                self._repeat_fatals[chat_id] = (fatal_label, now)
+
                 # Use clean restart for context/prompt size errors — resuming
                 # the same session will never fix these, causing a restart loop.
-                CONTEXT_SIZE_ERRORS = {"prompt_too_long", "context_too_long", "content_too_large", "buffer_overflow"}
-                needs_clean = fatal_label in CONTEXT_SIZE_ERRORS
+                needs_clean = fatal_label in CONTEXT_SIZE_ERRORS or is_repeat
                 if needs_clean:
+                    reason = "context size error" if fatal_label in CONTEXT_SIZE_ERRORS else "repeated fatal after resume restart"
                     lifecycle_log.info(
-                        f"FAST_HEAL | {session_name} | {fatal_label} | Using clean=True (context size error)"
+                        f"FAST_HEAL | {session_name} | {fatal_label} | Using clean=True ({reason})"
                     )
+                if is_repeat:
+                    should_notify = True
+                    if self._last_heal_escalation_notification:
+                        elapsed = (now - self._last_heal_escalation_notification).total_seconds()
+                        if elapsed < 1800:  # 30 minutes
+                            should_notify = False
+                    if should_notify:
+                        self._last_heal_escalation_notification = now
+                        self._send_heal_escalation_notification(session_name, fatal_label)
 
-                self._recently_healed[chat_id] = now
+                # Stall aborts get a shorter heal shield: if the restarted
+                # session wedges again it re-signals via api_retry_streak in
+                # ~90s, and the 5-min shield would sit on it for another 3+
+                # min before the ladder's clean rung can fire. Backdating the
+                # shield keeps loop protection (~2 min) without that delay.
+                if stall_abort:
+                    self._recently_healed[chat_id] = now - timedelta(seconds=180)
+                else:
+                    self._recently_healed[chat_id] = now
 
                 async def _isolated_restart(cid: str, clean: bool = False):
                     try:

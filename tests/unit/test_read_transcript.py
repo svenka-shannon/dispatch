@@ -6,7 +6,12 @@ from pathlib import Path
 # Add skills path
 sys.path.insert(0, str(Path.home() / ".claude/skills/sms-assistant/scripts"))
 
-from read_transcript import extract_sms_from_prompt, session_to_contact_name
+from read_transcript import (
+    extract_sms_from_prompt,
+    find_transcripts,
+    project_dir_name,
+    session_to_contact_name,
+)
 
 
 class TestExtractSmsFromPrompt:
@@ -179,3 +184,36 @@ ACL: Test User is FAVORITE tier. Read ~/.claude/skills/sms-assistant/favorites-r
 """
         assert "ACL:" in text
         assert "FAVORITE tier" in text
+
+
+class TestProjectDirName:
+    """Session -> ~/.claude/projects dir mapping (Claude Code: every non-alnum -> '-')."""
+
+    def test_phone_session_underscore_becomes_dash(self):
+        assert (
+            project_dir_name("imessage/_15555550100", home="/Users/test")
+            == "-Users-test-transcripts-imessage--15555550100"
+        )
+
+    def test_group_hex_session(self):
+        assert (
+            project_dir_name("imessage/b3d258b9a4de447ca412eb335c82a077", home="/Users/test")
+            == "-Users-test-transcripts-imessage-b3d258b9a4de447ca412eb335c82a077"
+        )
+
+    def test_dots_plus_and_underscores_in_home(self):
+        assert (
+            project_dir_name("signal/+15555550100", home="/Users/first.last_x")
+            == "-Users-first-last-x-transcripts-signal--15555550100"
+        )
+
+    def test_find_transcripts_exact_match_excludes_spawn_dirs(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        projects = tmp_path / ".claude" / "projects"
+        main = projects / project_dir_name("imessage/_15555550100", home=tmp_path)
+        spawn = Path(str(main) + "-spawn-abcd1234")
+        for d in (main, spawn):
+            d.mkdir(parents=True)
+            (d / "x.jsonl").write_text("{}\n")
+        found = find_transcripts("imessage/_15555550100")
+        assert [f.parent for f in found] == [main]

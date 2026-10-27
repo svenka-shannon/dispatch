@@ -1,0 +1,26 @@
+#!/bin/bash
+# Best Buy search: title | current price | comp value | URL
+# Usage: bestbuy-search "query" [more queries...]
+WF="$HOME/.claude/skills/webfetch/scripts/webfetch"
+for q in "$@"; do
+  enc=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote_plus(sys.argv[1]))" "$q")
+  echo "##### $q"
+  "$WF" "https://www.bestbuy.com/site/searchpage.jsp?st=$enc" 2>/dev/null > /tmp/.bb.txt
+  python3 - <<'PY'
+import re
+lines=open('/tmp/.bb.txt').read().split('\n')
+seen=set()
+for i,l in enumerate(lines):
+    m=re.search(r'### \[(.+?)\]\((https://www\.bestbuy\.com/[^\s)]+)', l)
+    if not m: continue
+    title,url=m.group(1),m.group(2)
+    if url in seen: continue
+    seen.add(url)
+    blk='\n'.join(lines[i:i+22])
+    price=re.findall(r'^\s*\$([0-9,]+\.[0-9]{2})', blk, re.M)
+    comp=re.search(r'Comp\. Value:\s*\$([0-9,]+\.[0-9]{2})', blk)
+    save=re.search(r'Save \$([0-9,]+\.[0-9]{2})', blk)
+    sold=' SOLD OUT' if re.search(r'Sold Out|Out of Stock', blk, re.I) else ''
+    print(f'  {title[:76]:76s} | ${price[0] if price else "?":9s} | comp ${comp.group(1) if comp else "-":9s} |{save and " save $"+save.group(1) or ""}{sold} | {url.split("?")[0]}')
+PY
+done

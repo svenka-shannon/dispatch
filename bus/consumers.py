@@ -257,9 +257,20 @@ class ConsumerRunner:
     6. On failure: retry up to max_retries, then run error_action
     """
 
-    def __init__(self, bus: Bus, configs: list[ConsumerConfig]):
+    def __init__(self, bus: Bus, configs: list[ConsumerConfig], exclusive: bool = False):
+        """
+        Args:
+            exclusive: Join every group with ``exclusive=True`` — purge ALL other
+                members of the group on join. Use when this runner is the sole
+                owner of its groups (the daemon's runner): members left behind by
+                a previous daemon process (SIGKILL, crash-rebuilt runner never
+                stopped) otherwise keep fresh-looking heartbeats for up to
+                HEARTBEAT_TIMEOUT_MS and hold partitions, so the new member is
+                assigned 0 partitions and silently idles.
+        """
         self.bus = bus
         self.configs = configs
+        self.exclusive = exclusive
         self._consumers: dict[str, Any] = {}  # group -> Consumer
         self._batch_states: dict[str, _BatchState] = {}  # group -> batch state
         self._last_commit: dict[str, float] = {}  # group -> monotonic time of last commit
@@ -273,6 +284,7 @@ class ConsumerRunner:
             consumer = self.bus.consumer(
                 group_id=config.group,
                 topics=[config.topic],
+                exclusive=self.exclusive,
             )
             self._consumers[config.group] = consumer
             # Initialize last commit time so first commit respects the interval
@@ -335,12 +347,34 @@ class ConsumerRunner:
                     pass  # best-effort on shutdown
                 self._pending_commit.discard(config.group)
 
-        for consumer in self._consumers.values():
-            consumer.close()
+        # Close each consumer independently: one failing close() (e.g. a
+        # transient 'database is locked') must not leave the REST of the
+        # members registered in their groups, holding partitions.
+        for group, consumer in list(self._consumers.items()):
+            try:
+                consumer.close()
+            except Exception as e:
+                logger.warning("ConsumerRunner stop: close of group '%s' failed: %s", group, e)
         self._consumers.clear()
         self._batch_states.clear()
         self._pending_commit.clear()
         logger.info("ConsumerRunner stopped")
+
+    def members(self) -> dict[str, dict[str, Any]]:
+        """Snapshot of this runner's live group members (for health probes).
+
+        Returns {group: {"consumer_id": str, "topic": str, "assigned": int}}.
+        Safe to call from another thread (copies the dict first).
+        """
+        topic_by_group = {c.group: c.topic for c in self.configs}
+        out: dict[str, dict[str, Any]] = {}
+        for group, consumer in list(self._consumers.items()):
+            out[group] = {
+                "consumer_id": getattr(consumer, "consumer_id", None),
+                "topic": topic_by_group.get(group),
+                "assigned": len(getattr(consumer, "assigned_partitions", []) or []),
+            }
+        return out
 
     def _should_commit(self, config: ConsumerConfig) -> bool:
         """Check if this consumer should commit now based on commit_interval_s."""
@@ -374,6 +408,7 @@ class ConsumerRunner:
         self._consumers[config.group] = self.bus.consumer(
             group_id=config.group,
             topics=[config.topic],
+            exclusive=self.exclusive,
         )
         if config.batch and config.group in self._batch_states:
             # Batch mode commits at poll time, so accumulated records may

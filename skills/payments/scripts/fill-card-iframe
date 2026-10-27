@@ -1,0 +1,246 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# ///
+"""fill-card-iframe <tab_id> [--zip ZIP] [--at-number X,Y] [--at-exp X,Y] [--at-cvc X,Y]
+                    [--at-zip X,Y] [--coords shot|css] [--mode auto|debugger|os]
+                    [--verify-pattern P] [--no-verify]
+
+Types the Privacy card into a checkout's card fields. Number/exp/CVV are read from Keychain
+INSIDE this process: never in argv, never printed. Verification reads only the LENGTH of each
+field, never its value.
+
+Two modes of operation:
+
+  No --at-* coords (legacy): click the card-number field first (chrome click-at), then run this.
+    Types number -> MMYY -> CVC (-> ZIP if --zip) with chrome-control's debugger `iframe_type`,
+    relying on Stripe's auto-advance between fields. Works on a single combined Stripe card
+    element; on SPLIT forms (separate number/exp/cvc boxes) it often fills only the number,
+    so pass coords instead.
+
+  With --at-* coords (recommended for split forms; take them from a `chrome screenshot`):
+    each field is clicked and filled explicitly, in order number -> exp -> cvc -> zip.
+      --mode auto      (default) CDP click + iframe_type, verify length; if empty/unverifiable,
+                       redo the field with OS-level typing (`chrome os-type` path: Chrome must be
+                       frontmost, Cmd+A/Delete first, keystrokes via cliclick on stdin)
+      --mode debugger  CDP only
+      --mode os        OS-level typing only (what worked on OpenTable/Walmart 2026-10-18)
+    A field without coords is typed right after the previous one (auto-advance).
+
+  --zip ZIP            billing ZIP (not secret). e.g. --zip "$(identity owner.address | grep -oE '[0-9]{5}$')"
+  --coords shot|css    coordinate space of --at-* (default shot = screenshot pixels)
+  --verify-pattern P   iframe URL substring to check lengths in (default: Stripe frames, then page)
+
+Exit: 0 = all fields filled (or unverifiable, with a note); 2 = a field verified EMPTY;
+3 = Chrome not frontmost (OS typing refused). Afterwards: `chrome shot-purge --since 15m`.
+"""
+import argparse, importlib.machinery, importlib.util, json, signal, subprocess, sys, time
+from pathlib import Path
+
+FIELDS = ("number", "exp", "cvc", "zip")
+
+# Selectors per field, tried inside each candidate frame. Only `.value.length` is returned.
+SELECTORS = {
+    "number": ["input[name=cardnumber]", "input[autocomplete=cc-number]", "input[name=number]",
+               "input[name=cardNumber]", "input[data-elements-stable-field-name=cardNumber]"],
+    "exp": ["input[name=exp-date]", "input[autocomplete=cc-exp]", "input[name=expiry]",
+            "input[name=cardExpiry]", "input[data-elements-stable-field-name=cardExpiry]"],
+    "cvc": ["input[name=cvc]", "input[autocomplete=cc-csc]", "input[name=cvv]",
+            "input[name=cardCvc]", "input[data-elements-stable-field-name=cardCvc]"],
+    "zip": ["input[name=postal]", "input[autocomplete=postal-code]", "input[name=postalCode]",
+            "input[name=zip]", "input[data-elements-stable-field-name=postalCode]"],
+}
+# Stripe iframe URL fragments carry componentName=...; combined element is componentName=card.
+FRAME_PATTERNS = {
+    "number": ["componentName=cardNumber", "componentName=card&", "elements-inner-card",
+               "elements-inner-payment"],
+    "exp": ["componentName=cardExpiry", "componentName=card&", "elements-inner-card",
+            "elements-inner-payment"],
+    "cvc": ["componentName=cardCvc", "componentName=card&", "elements-inner-card",
+            "elements-inner-payment"],
+    "zip": ["componentName=postalCode", "componentName=card&", "elements-inner-card",
+            "elements-inner-payment"],
+}
+
+
+def kc(svc):
+    return subprocess.run(["security", "find-generic-password", "-a", "sven", "-s", svc, "-w"],
+                          capture_output=True, text=True, check=True).stdout.strip()
+
+
+def load_chrome():
+    src = Path.home() / ".claude/skills/chrome-control/scripts/chrome"
+    ld = importlib.machinery.SourceFileLoader("chromecli", str(src))
+    spec = importlib.util.spec_from_loader("chromecli", ld)
+    m = importlib.util.module_from_spec(spec)
+    argv, sys.argv = sys.argv, ["chrome"]
+    ld.exec_module(m)
+    sys.argv = argv
+    return m
+
+
+def len_js(kind):
+    sels = json.dumps(SELECTORS[kind])
+    return ("(() => { for (const s of " + sels + ") { const e = document.querySelector(s); "
+            "if (e) return e.value.length; } return -1; })()")
+
+
+def _frame_srcs(client, tab):
+    """src URLs of the page's iframes (cheap main-frame read), or None if unreadable."""
+    try:
+        r = client.send("debugger_eval", tabId=tab, timeout=30,
+                        code="return Array.from(document.querySelectorAll('iframe')).map(f => f.src || '');")
+        v = (r.get("result") or {}) if isinstance(r, dict) else {}
+        return v.get("result") if isinstance(v.get("result"), list) else None
+    except Exception:
+        return None
+
+
+def field_len(client, tab, kind, verify_pattern=None):
+    """Length of the field's value (never the value), or None if the field can't be found.
+
+    Only calls iframe_target_eval for patterns that match an iframe actually on the page:
+    with no match that call can block for its whole timeout.
+    """
+    patterns = [verify_pattern] if verify_pattern else FRAME_PATTERNS[kind]
+    srcs = _frame_srcs(client, tab)
+    for pat in patterns:
+        if srcs is not None and not any(pat in u for u in srcs):
+            continue
+        try:
+            r = client.send("iframe_target_eval", timeout=30, tabId=tab, urlPattern=pat,
+                            code=len_js(kind))
+        except Exception:
+            client.sock = None  # a timed-out socket may hold a stale reply; reconnect
+            continue
+        v = (r.get("result") or {}) if isinstance(r, dict) else {}
+        if isinstance(v, dict) and v.get("success") and isinstance(v.get("result"), int) \
+                and v["result"] >= 0:
+            return v["result"]
+    if not verify_pattern:  # plain page input (e.g. ZIP outside the card iframe)
+        try:
+            r = client.send("debugger_eval", tabId=tab, timeout=30,
+                            code="return " + len_js(kind) + ";")
+            v = (r.get("result") or {}) if isinstance(r, dict) else {}
+            if isinstance(v, dict) and isinstance(v.get("result"), int) and v["result"] >= 0:
+                return v["result"]
+        except Exception:
+            client.sock = None
+    return None
+
+
+def debugger_type(client, tab, text, fatal=True):
+    """iframe_type; returns an error string (or exits if fatal). Response echoes are discarded."""
+    try:
+        r = client.send("iframe_type", tabId=tab, text=text)
+    except Exception as e:
+        err = f"{type(e).__name__}"
+    else:
+        res = r.get("result", r) if isinstance(r, dict) else r
+        err = None
+        if isinstance(r, dict) and r.get("error"):
+            err = str(r.get("error"))[:120]
+        elif isinstance(res, dict) and res.get("typed") is False:
+            err = str(res.get("error"))[:120]
+    if err and fatal:
+        sys.exit("iframe_type failed: " + err)
+    return err
+
+
+def parse_xy(s):
+    try:
+        x, y = s.replace(" ", ",").split(",")
+        return float(x), float(y)
+    except ValueError:
+        sys.exit(f"bad coordinate '{s}' (want X,Y)")
+
+
+def main():
+    ap = argparse.ArgumentParser(usage=__doc__)
+    ap.add_argument("tab", type=int)
+    ap.add_argument("--zip")
+    for f in FIELDS:
+        ap.add_argument(f"--at-{f}")
+    ap.add_argument("--coords", choices=["shot", "css"], default="shot")
+    ap.add_argument("--mode", choices=["auto", "debugger", "os"], default="auto")
+    ap.add_argument("--verify-pattern")
+    ap.add_argument("--no-verify", action="store_true")
+    a = ap.parse_args()
+    if a.at_zip and not a.zip:
+        sys.exit("--at-zip needs --zip ZIP")
+    raw_at = {f: getattr(a, f"at_{f}") for f in FIELDS}
+    if any(raw_at.values()) and not raw_at["number"]:
+        sys.exit("with coords, --at-number is required (the first field must be clicked)")
+    coords = {f: parse_xy(v) for f, v in raw_at.items() if v}
+
+    m = load_chrome()
+    client = m.ChromeControl(m.find_profile_socket(None))
+    signal.alarm(180)  # never hang (the old version once hung 30 min after typing the card)
+
+    exp = kc("privacy-card-exp").replace("/", "").replace(" ", "")
+    if len(exp) == 6:            # MMYYYY -> MMYY
+        exp = exp[:2] + exp[4:]
+    values = {"number": kc("privacy-card-number").replace(" ", ""), "exp": exp,
+              "cvc": kc("privacy-card-cvv")}
+    if a.zip:
+        values["zip"] = a.zip.strip()
+    order = [f for f in FIELDS if f in values]
+    coords = {f: xy for f, xy in coords.items() if f in order}
+
+    status = {}
+    if not coords:
+        # Legacy: caller already clicked the number field; rely on auto-advance.
+        for f in order:
+            debugger_type(client, a.tab, values[f])
+            time.sleep(0.6)
+    else:
+        geom = None
+        for f in order:
+            at = coords.get(f)
+            if at is None:                 # no coords for this field: auto-advance from previous
+                debugger_type(client, a.tab, values[f])
+                time.sleep(0.6)
+                continue
+            if a.mode in ("auto", "debugger"):
+                if a.coords == "shot":
+                    geom = geom or m.tab_geometry(client, a.tab)
+                    cx, cy = m.shot_to_css(geom, *at)
+                else:
+                    cx, cy = int(at[0]), int(at[1])
+                client.send("click_at", tabId=a.tab, x=cx, y=cy)
+                time.sleep(0.4)
+                err = debugger_type(client, a.tab, values[f], fatal=(a.mode == "debugger"))
+                time.sleep(0.4)
+                n = None if (a.no_verify or err) else field_len(client, a.tab, f, a.verify_pattern)
+                if a.mode == "debugger" or (n is not None and n > 0):
+                    status[f] = n
+                    continue
+                print(f"{f}: debugger typing {'left it empty' if n == 0 else 'unverifiable'}; "
+                      "retrying with OS-level typing", file=sys.stderr)
+            try:
+                m.os_type(client, a.tab, values[f], at=at, space=a.coords, clear=True,
+                          secret=(f != "zip"))
+            except m.OsTypeError as e:
+                print(f"Error ({f}): {e}", file=sys.stderr)
+                sys.exit(e.exit_code)
+            time.sleep(0.3)
+
+    worst = 0
+    for f in order:
+        if a.no_verify:
+            print(f"{f}: typed (not verified)")
+            continue
+        n = status.get(f) if f in status else field_len(client, a.tab, f, a.verify_pattern)
+        if n is None:
+            print(f"{f}: typed, could not verify (field not found; check a screenshot)")
+        elif n == 0:
+            print(f"{f}: EMPTY")
+            worst = 2
+        else:
+            print(f"{f}: filled ({n} chars)")
+    print("card typed (values not shown). Delete card screenshots: chrome shot-purge --since 15m")
+    sys.exit(worst)
+
+
+if __name__ == "__main__":
+    main()

@@ -4,6 +4,11 @@ Auth Dialog Auto-Resolver — Full Implementation (Phases 1-4).
 Detects macOS auth dialogs (SecurityAgent), traces provenance to SDK sessions,
 classifies safety via deterministic rule engine, and auto-resolves safe ones.
 
+Also detects macOS permission (TCC) prompts that are NOT owned by SecurityAgent,
+e.g. '"python3.14" is requesting to bypass the system private window picker and
+directly access your screen and audio' (owner: UserNotificationCenter). These
+steal keyboard focus and are NEVER auto-approved — always escalated to admin.
+
 Phase 1: Detection + AX tree parsing + bus logging
 Phase 2: Provenance tracing via process tree
 Phase 3: Rule engine + config + SIGHUP reload
@@ -62,6 +67,7 @@ class DialogContext:
     buttons: list[str]
     detected_at: float  # time.monotonic()
     decision: Decision | None = None
+    owner: str = "SecurityAgent"  # process that owns the dialog window
 
 
 @dataclass
@@ -153,6 +159,67 @@ def parse_buttons(tree: str) -> list[str]:
     return re.findall(r"AXButton AXTitle='([^']+)'", tree)
 
 
+# ---------------------------------------------------------------------------
+# Permission (TCC) prompts owned by processes other than SecurityAgent
+# ---------------------------------------------------------------------------
+
+# Window owners that show permission/consent prompts. Seen 2026-10-19:
+# UserNotificationCenter showed the screen-recording "bypass the system private
+# window picker" prompt for python3.14 (Allow / Open System Settings).
+# universalAccessAuthWarn = "X would like to control this computer" (Accessibility),
+# CoreServicesUIAgent = Gatekeeper "downloaded from the Internet" prompts.
+PERMISSION_PROMPT_OWNERS = (
+    "UserNotificationCenter",
+    "universalAccessAuthWarn",
+    "CoreServicesUIAgent",
+)
+PERMISSION_PROMPT_TYPE = "permission_prompt"
+
+
+def axctl_tree_cmd(owner: str) -> str:
+    """axctl tree command with wrapping disabled (rich wraps long AXValues at 80 cols)."""
+    return f'COLUMNS=4000 {AXCTL} tree "{owner}"'
+
+
+def parse_permission_prompt(tree: str, owner: str) -> dict | None:
+    """Parse the first AXWindow of an `axctl tree <owner>` dump.
+
+    Returns {"owner", "requesting_app", "texts", "prompt_text", "buttons"} or None
+    if there is no window with text (ignores the app's AXMenuBar).
+    """
+    lines = tree.splitlines()
+    start = next((i for i, l in enumerate(lines) if l.lstrip().startswith("AXWindow")), None)
+    if start is None:
+        return None
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    section = [lines[start]]
+    for line in lines[start + 1:]:
+        stripped = line.lstrip()
+        # A sibling of the window (e.g. AXMenuBar) ends the section. Wrapped
+        # continuation lines start at column 0 but are not AX elements.
+        if stripped.startswith("AX") and len(line) - len(stripped) <= indent:
+            break
+        section.append(line)
+    body = "\n".join(section)
+    texts = [
+        re.sub(r"\s+", " ", t).strip()
+        for t in re.findall(r"AXStaticText AXValue='(.*?)'(?=\s*\n\s*AX|\s*$)", body, re.S)
+    ]
+    texts = [t for t in texts if t]
+    if not texts:
+        return None
+    buttons = re.findall(r"AXButton AXTitle='([^']+)'", body)
+    m = re.search(r"[“\"]([^”\"]+)[”\"]", texts[0])
+    requesting = m.group(1) if m else (texts[0].split(" ")[0] if texts else owner)
+    return {
+        "owner": owner,
+        "requesting_app": requesting or owner,
+        "texts": texts,
+        "prompt_text": " ".join(texts),
+        "buttons": buttons,
+    }
+
+
 def compute_dialog_id(app_name: str, action: str, dialog_type: str, buttons: list[str]) -> str:
     """Stable dialog identity — excludes transient AX properties.
     Single source of truth for gather_context() and verify_dialog_identity()."""
@@ -198,6 +265,10 @@ class AuthDialogConfig:
     resolution_max_seconds: int = 30
     queue_ttl_seconds: int = 30
     ax_tree_retention_days: int = 30
+    # Permission (TCC) prompts: which window owners to watch, and how long to wait
+    # before re-escalating the same prompt if it is still on screen.
+    permission_prompt_owners: list[str] = field(default_factory=lambda: list(PERMISSION_PROMPT_OWNERS))
+    permission_prompt_reescalate_seconds: int = 21600
 
     @classmethod
     def from_dict(cls, d: dict) -> AuthDialogConfig:
@@ -229,6 +300,8 @@ class AuthDialogConfig:
             resolution_max_seconds=d.get("resolution_max_seconds", 30),
             queue_ttl_seconds=d.get("queue_ttl_seconds", 30),
             ax_tree_retention_days=d.get("ax_tree_retention_days", 30),
+            permission_prompt_owners=list(d.get("permission_prompt_owners", PERMISSION_PROMPT_OWNERS)),
+            permission_prompt_reescalate_seconds=d.get("permission_prompt_reescalate_seconds", 21600),
         )
 
     def validate(self):
@@ -242,8 +315,14 @@ class AuthDialogConfig:
             raise ValueError("poll_interval_seconds must be >= 1")
         if self.queue_ttl_seconds < self.poll_interval_seconds:
             raise ValueError("queue_ttl_seconds must be >= poll_interval_seconds")
-        # Safety invariant: possible_password_auth must never be auto-approved
+        # Safety invariant: possible_password_auth and permission (TCC) prompts
+        # must never be auto-approved
         for rule in self.auto_approve:
+            if rule._dialog_type == PERMISSION_PROMPT_TYPE:
+                raise ValueError(
+                    f"auto_approve rule '{rule.name}' targets {PERMISSION_PROMPT_TYPE} — "
+                    f"permission prompts are escalation only"
+                )
             if rule._dialog_type == "possible_password_auth":
                 raise ValueError(
                     f"auto_approve rule '{rule.name}' targets possible_password_auth — "
@@ -634,6 +713,37 @@ class AuthDialogMonitor:
             if dialog:
                 await self.queue.check_and_enqueue(dialog)
 
+        # Permission (TCC) prompts owned by other processes (never auto-approved)
+        for owner in self.config.permission_prompt_owners:
+            if re.search(rf"^{re.escape(owner)} \(pid", result, re.M):
+                dialog = await self._gather_permission_prompt(owner)
+                if dialog:
+                    await self.queue.check_and_enqueue(dialog)
+
+    async def _gather_permission_prompt(self, owner: str) -> DialogContext | None:
+        """Gather context for a permission prompt window owned by `owner`."""
+        try:
+            tree = await self._run(axctl_tree_cmd(owner))
+        except (asyncio.TimeoutError, Exception) as e:
+            log.warning(f"Failed to get {owner} tree: {e}")
+            return None
+        info = parse_permission_prompt(tree or "", owner)
+        if not info:
+            return None
+        buttons = info["buttons"]
+        dialog_id = compute_dialog_id(
+            info["requesting_app"], info["prompt_text"], PERMISSION_PROMPT_TYPE, buttons)
+        return DialogContext(
+            ax_tree_snapshot=tree,
+            dialog_id=dialog_id,
+            app_name=info["requesting_app"],
+            action=info["prompt_text"],
+            dialog_type=PERMISSION_PROMPT_TYPE,
+            buttons=buttons,
+            detected_at=time.monotonic(),
+            owner=owner,
+        )
+
     async def _gather_context(self) -> DialogContext | None:
         """Gather AX tree context for SecurityAgent dialog."""
         try:
@@ -720,6 +830,11 @@ class AuthDialogMonitor:
 
     async def classify(self, dialog: DialogContext, provenance: TraceResult) -> Decision:
         """Deterministic rule engine. always_escalate checked first."""
+        # Permission (TCC) prompts are NEVER auto-approved, regardless of rules.
+        if dialog.dialog_type == PERMISSION_PROMPT_TYPE:
+            self._rule_hit_counters["escalate:permission_prompt"] += 1
+            return Decision(DecisionAction.ESCALATE, "permission_prompt: never auto-approved")
+
         # IMPORTANT: always_escalate first — safety > convenience
         for rule in self.config.always_escalate:
             if rule.matches(dialog):
@@ -765,7 +880,20 @@ class AuthDialogMonitor:
                 "dialog_type": dialog.dialog_type,
                 "buttons": dialog.buttons,
                 "detected_at_wall": time.time(),
+                "owner": dialog.owner,
             }
+            if dialog.dialog_type == PERMISSION_PROMPT_TYPE:
+                await self._escalate_fn(
+                    f"macOS PERMISSION PROMPT on screen (window owner: {dialog.owner}) — "
+                    f"requesting app: {dialog.app_name}. Prompt: \"{dialog.action}\" "
+                    f"Buttons: {', '.join(dialog.buttons) or 'none'}. It steals keyboard focus "
+                    f"until answered. Never auto-approved: ask the admin. 'approve' clicks Allow, "
+                    f"'deny' clicks Don't Allow/Deny if present; otherwise "
+                    f"`auth-dialog-approve press {dialog.dialog_id} \"<button>\"`. "
+                    f"Do NOT use 'always' (refused for permission prompts).",
+                    dialog_info=dialog_info,
+                )
+                return ResolutionResult(success=True, method="escalated", reason=decision.reason)
             await self._escalate_fn(
                 f"Auth dialog needs attention: {dialog.app_name} — {dialog.action} "
                 f"(reason: {decision.reason})",
@@ -1060,6 +1188,8 @@ class AuthDialogMonitor:
             # Suppress re-detection of this dialog for cooldown period
             # Prevents escalation spam for dialogs that stay on screen
             cooldown = self.config.rate_limit.cooldown_after_escalation_seconds
+            if dialog.dialog_type == PERMISSION_PROMPT_TYPE:
+                cooldown = self.config.permission_prompt_reescalate_seconds
             self.queue._suppress_until[f"overflow:{dialog.dialog_id}"] = (
                 time.monotonic() + cooldown
             )

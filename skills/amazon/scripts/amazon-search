@@ -3,6 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
+#     "scrapling[fetchers]>=0.4",
 #     "beautifulsoup4>=4.12",
 #     "click>=8.0",
 # ]
@@ -70,13 +71,22 @@ def parse_search_results(html: str) -> list[dict]:
 
         title_el = item.find("h2")
         title = title_el.get_text(strip=True) if title_el else None
-        if not title:
-            continue
 
         price = None
         price_el = item.select_one(".a-price .a-offscreen")
         if price_el:
             price = price_el.get_text(strip=True)
+
+        # 2026-09-20: do NOT drop a row just because the <h2> is empty.
+        # Amazon now renders many search tiles with a blank h2 (the title
+        # lives in an image alt / sponsored wrapper), so `if not title:
+        # continue` silently discarded most of the page -- amazon-search
+        # returned "No results found" for products that plainly exist.
+        # The ASIN + price are the useful part anyway; this skill already
+        # tells you to re-check the real title with amazon-verify, so a
+        # missing title is not a reason to throw the result away.
+        if not title and not price:
+            continue
 
         rating = None
         rating_el = item.find(attrs={"aria-label": re.compile(r"out of 5 stars")})
@@ -127,10 +137,27 @@ def main(query: str, category: str | None, max_results: int, json_output: bool):
 
     search_url = f"https://www.amazon.com/s?{urllib.parse.urlencode(params)}"
 
+    # 2026-09-20: plain httpx gets HTTP 503 "automated access" from Amazon --
+    # measured, every time, regardless of headers. That made this CLI report
+    # "No results found" for products that obviously exist. scrapling's Fetcher
+    # spoofs the TLS fingerprint and returns a real 200, so try it FIRST and
+    # keep httpx only as a fallback for when scrapling isn't installed.
+    html = ""
     try:
-        client = httpx.Client(headers=HEADERS, follow_redirects=True, timeout=15.0)
-        response = client.get(search_url)
-        html = response.text
+        from scrapling import Fetcher
+        page = Fetcher().get(search_url, stealthy_headers=True)
+        html = getattr(page, "html_content", "") or str(page)
+    except Exception as e:
+        print(f"[scrapling unavailable: {e}; falling back to httpx]", file=sys.stderr)
+
+    try:
+        if not html or len(html) < 1000:
+            client = httpx.Client(headers=HEADERS, follow_redirects=True, timeout=15.0)
+            response = client.get(search_url)
+            if response.status_code == 503:
+                print("[httpx got 503 'automated access' -- Amazon blocked the "
+                      "plain HTTP client]", file=sys.stderr)
+            html = response.text
     except Exception as e:
         print(f"Error fetching results: {e}", file=sys.stderr)
         print(f"\nFallback — open in Chrome:", file=sys.stderr)

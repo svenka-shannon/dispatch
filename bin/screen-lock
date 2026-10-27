@@ -1,0 +1,453 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#   "pyobjc-framework-Quartz",
+# ]
+# ///
+"""
+screen-lock — detect, undo and prevent the macOS lock screen on the Dispatch host.
+
+WHY THIS FILE EXISTS
+--------------------
+Dispatch drives Chrome, Messages.app and native apps through the GUI session.
+When the Mac locks (display sleeps after `pmset displaysleep` minutes, then
+"require password after N seconds" kicks in — `sysadminctl -screenLock status`),
+loginwindow takes the screen: chrome-control screenshots go black, Accessibility
+walks fail, `cliclick` hits the password field, and nothing tells anyone. This
+CLI is the single source of truth for that host state, and the daemon's
+`screen_lock` dependency-health check (assistant/dependency_checks.py) shells
+out to it every minute.
+
+Three concerns, one script:
+
+  status   Is the screen locked right now? (CGSessionCopyCurrentDictionary →
+           CGSSessionScreenIsLocked). Also reports the two settings that make it
+           lock in the first place and whether the login password is stored.
+  unlock   Wake the display and type the login password into the lock screen
+           via CGEvent keyboard events. Needs the password in Keychain (below)
+           and Accessibility/Input Monitoring trust for the calling python.
+  harden   Turn off "require password after sleep/screen saver" and the idle
+           screen saver so the lock never re-arms. Idempotent. `--check` only
+           verifies (exit 1 if anything is still armed).
+
+The login password is read at runtime from the login Keychain and never
+printed, logged or written anywhere:
+
+    security add-generic-password -a "$USER" -s mac-login-password -w -U
+
+(no -w value → `security` prompts for it, so it never lands in shell history.)
+
+Exit codes:
+    status : 0 unlocked, 2 locked
+    unlock : 0 unlocked afterwards, 1 still locked, 3 no password stored
+    harden : 0 hardened (or applied), 1 still armed, 3 no password stored
+
+Usage:
+    screen-lock status [--json]
+    screen-lock unlock [--json]
+    screen-lock harden [--check] [--json]
+    screen-lock lock              # lock the screen (testing the unlock path)
+"""
+from __future__ import annotations
+
+import argparse
+import getpass
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+KEYCHAIN_SERVICE = "mac-login-password"
+STORE_PASSWORD_HINT = (
+    f'security add-generic-password -a "$USER" -s {KEYCHAIN_SERVICE} -w -U'
+)
+
+# Virtual keycodes (US layout) — only used for keys that are layout-independent.
+KEY_RETURN = 36
+KEY_SHIFT = 56
+KEY_Q = 12
+
+OK, WARN, FAIL = "OK", "WARN", "FAIL"
+
+
+def _run(cmd: list[str], timeout: int = 15, env: dict | None = None) -> tuple[int, str, str]:
+    """Run argv, return (rc, stdout, stderr). rc=124 on timeout, 127 if missing."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return 124, "", "timed out"
+    except FileNotFoundError as e:
+        return 127, "", str(e)
+
+
+# ──────────────────────────────────────────────────────────────
+# Detection
+# ──────────────────────────────────────────────────────────────
+
+def is_locked() -> bool | None:
+    """True/False from the CoreGraphics session dictionary; None if unavailable.
+
+    `CGSSessionScreenIsLocked` is only present (=1) while loginwindow has the
+    screen. An absent key means unlocked. A None dictionary means the caller has
+    no GUI session at all (ssh without a console user) — report unknown rather
+    than guessing.
+    """
+    try:
+        import Quartz  # type: ignore
+        d = Quartz.CGSessionCopyCurrentDictionary()
+    except Exception:  # noqa: BLE001 — pyobjc missing or no WindowServer access
+        d = None
+    if d is None:
+        return _is_locked_ioreg()
+    return bool(d.get("CGSSessionScreenIsLocked", 0))
+
+
+def _is_locked_ioreg() -> bool | None:
+    """Fallback: the same key is mirrored into IORegistry's IOConsoleUsers."""
+    rc, out, _ = _run(["ioreg", "-n", "Root", "-d1", "-a"])
+    if rc != 0 or "IOConsoleUsers" not in out:
+        return None
+    m = re.search(r"<key>CGSSessionScreenIsLocked</key>\s*<(true|false|integer)>?(\d*)", out)
+    if not m:
+        return False
+    return m.group(1) == "true" or m.group(2) == "1"
+
+
+def screenlock_setting() -> str | None:
+    """'off', '300' (seconds), or None if sysadminctl could not tell us."""
+    rc, out, err = _run(["sysadminctl", "-screenLock", "status"])
+    text = f"{out}\n{err}"
+    if "screenLock is off" in text:
+        return "off"
+    m = re.search(r"screenLock delay is (\d+) seconds", text)
+    if m:
+        return m.group(1)
+    if "screenLock is immediate" in text:
+        return "0"
+    return None
+
+
+def screensaver_idle() -> int | None:
+    """Idle seconds before the screen saver starts (0 = never); None if unset."""
+    rc, out, _ = _run(["defaults", "-currentHost", "read", "com.apple.screensaver", "idleTime"])
+    if rc != 0:
+        return None
+    try:
+        return int(out)
+    except ValueError:
+        return None
+
+
+def display_sleep_minutes() -> int | None:
+    rc, out, _ = _run(["pmset", "-g"])
+    if rc != 0:
+        return None
+    m = re.search(r"^\s*displaysleep\s+(\d+)", out, re.M)
+    return int(m.group(1)) if m else None
+
+
+def password_stored() -> bool:
+    rc, _, _ = _run(["security", "find-generic-password", "-s", KEYCHAIN_SERVICE])
+    return rc == 0
+
+
+def _read_password() -> str | None:
+    rc, out, _ = _run(["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"])
+    if rc != 0 or not out:
+        return None
+    return out
+
+
+def status_payload() -> dict:
+    locked = is_locked()
+    setting = screenlock_setting()
+    idle = screensaver_idle()
+    return {
+        "locked": locked,
+        "screenlock_setting": setting,            # "off" | "<seconds>" | None
+        "screensaver_idle_s": idle,               # 0/None = never
+        "display_sleep_min": display_sleep_minutes(),
+        "password_stored": password_stored(),
+        # Both must hold for the lock to never re-arm on its own.
+        "hardened": setting == "off" and (idle in (0, None)),
+        "console_user": getpass.getuser(),
+    }
+
+
+# ──────────────────────────────────────────────────────────────
+# Unlock — type the password into loginwindow
+# ──────────────────────────────────────────────────────────────
+
+def _post_key(keycode: int, down: bool, flags: int = 0) -> None:
+    import Quartz  # type: ignore
+    ev = Quartz.CGEventCreateKeyboardEvent(None, keycode, down)
+    if flags:
+        Quartz.CGEventSetFlags(ev, flags)
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+
+
+def _tap_key(keycode: int, flags: int = 0) -> None:
+    _post_key(keycode, True, flags)
+    time.sleep(0.03)
+    _post_key(keycode, False, flags)
+    time.sleep(0.03)
+
+
+def _type_text(text: str) -> None:
+    """Type arbitrary text layout-independently via CGEventKeyboardSetUnicodeString."""
+    import Quartz  # type: ignore
+    for ch in text:
+        for down in (True, False):
+            ev = Quartz.CGEventCreateKeyboardEvent(None, 0, down)
+            Quartz.CGEventKeyboardSetUnicodeString(ev, len(ch), ch)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+            time.sleep(0.02)
+
+
+def _wake_display() -> None:
+    # `caffeinate -u` asserts user activity: turns the display on and brings the
+    # lock screen up, which is what makes the password field appear.
+    _run(["caffeinate", "-u", "-t", "2"], timeout=10)
+    time.sleep(1.0)
+
+
+def unlock(attempts: int = 2) -> dict:
+    """Wake the display and type the login password. Returns a status-ish payload."""
+    before = is_locked()
+    result: dict = {"locked_before": before, "attempts": 0, "method": None}
+    if before is False:
+        result.update(locked=False, detail="already unlocked")
+        return result
+    pw = _read_password()
+    if pw is None:
+        result.update(locked=before, detail=f"no login password in Keychain — store it with: {STORE_PASSWORD_HINT}",
+                      password_stored=False)
+        return result
+    result["password_stored"] = True
+
+    for attempt in range(1, attempts + 1):
+        result["attempts"] = attempt
+        _wake_display()
+        # A modifier tap dismisses the clock/screensaver overlay and focuses the
+        # password field without inserting a character.
+        _tap_key(KEY_SHIFT)
+        time.sleep(0.8)
+        # Never type the password unless loginwindow STILL owns the screen. If the
+        # wake alone cleared it (no password required), keystrokes would land in
+        # the frontmost app — e.g. a Messages compose field, then Return sends it.
+        if is_locked() is not True:
+            result.update(locked=False, detail=f"unlocked by waking the display (attempt {attempt}); nothing typed")
+            return result
+        if attempt == 1:
+            result["method"] = "cgevent"
+            _type_text(pw)
+            _tap_key(KEY_RETURN)
+        else:
+            # Second try via System Events — a different injection path in case
+            # the HID tap was ignored (Secure Input, stale focus).
+            result["method"] = "system-events"
+            _run(["osascript",
+                  "-e", 'tell application "System Events" to keystroke (system attribute "SL_PW")',
+                  "-e", 'tell application "System Events" to key code 36'],
+                 timeout=20, env={**os.environ, "SL_PW": pw})
+        # Give loginwindow time to validate and tear the lock screen down.
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline:
+            time.sleep(0.5)
+            if is_locked() is False:
+                result.update(locked=False, detail=f"unlocked via {result['method']} on attempt {attempt}")
+                return result
+    result.update(locked=True, detail=f"still locked after {attempts} attempts (last method {result['method']})")
+    return result
+
+
+def lock_screen() -> dict:
+    """Lock the screen (⌃⌘Q). Only for exercising the unlock path."""
+    import Quartz  # type: ignore
+    _tap_key(KEY_Q, Quartz.kCGEventFlagMaskControl | Quartz.kCGEventFlagMaskCommand)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        time.sleep(0.5)
+        if is_locked():
+            return {"locked": True, "detail": "locked"}
+    return {"locked": is_locked(), "detail": "lock keystroke sent but screen did not report locked"}
+
+
+# ──────────────────────────────────────────────────────────────
+# Harden — stop the lock from re-arming
+# ──────────────────────────────────────────────────────────────
+
+def _sysadminctl_screenlock_off(pw: str, timeout: float = 30) -> tuple[int, str, str]:
+    """`sysadminctl -screenLock off -password -`, answering its prompt over a pty.
+
+    2026-09-28: this used to pass `-password <pw>` in argv, which exposes the login
+    password to anyone running `ps` for as long as sysadminctl runs (and it has
+    hung before). sysadminctl's own usage: "Pass '-' instead of password ... to
+    request prompt. This preferred for security reasons."
+    """
+    import os, pty, select, time as _t
+    master, slave = pty.openpty()
+    try:
+        proc = subprocess.Popen(["sysadminctl", "-screenLock", "off", "-password", "-"],
+                                stdin=slave, stdout=slave, stderr=slave, close_fds=True,
+                                start_new_session=True)
+    finally:
+        os.close(slave)
+    buf, sent, deadline = b"", False, _t.time() + timeout
+    try:
+        while _t.time() < deadline:
+            r, _, _ = select.select([master], [], [], 0.5)
+            if r:
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+                if not sent and b"assword" in buf:
+                    os.write(master, pw.encode() + b"\n")
+                    sent = True
+            if proc.poll() is not None:
+                break
+        else:
+            proc.kill()
+            return 124, buf.decode(errors="replace"), "sysadminctl timed out"
+        rc = proc.wait(timeout=5)
+    finally:
+        os.close(master)
+    out = buf.decode(errors="replace").replace(pw, "***")
+    return rc, out, "" if rc == 0 else out
+
+
+def harden(check_only: bool) -> dict:
+    items: list[dict] = []
+    changed = 0
+    pw_stored = password_stored()
+
+    # 1. "Require password after sleep or screen saver begins" → off.
+    setting = screenlock_setting()
+    entry = {"name": "screenlock_require_password", "value": setting, "want": "off",
+             "why": "loginwindow takes the screen N seconds after display sleep / screen saver"}
+    if setting == "off":
+        entry["status"] = OK
+    elif check_only:
+        entry["status"] = FAIL
+    else:
+        pw = _read_password()
+        if pw is None:
+            entry["status"] = FAIL
+            entry["error"] = f"sysadminctl needs the login password; store it with: {STORE_PASSWORD_HINT}"
+        else:
+            rc, out, err = _sysadminctl_screenlock_off(pw)
+            setting = screenlock_setting()
+            entry["value"] = setting
+            if setting == "off":
+                entry["status"] = OK
+                changed += 1
+            else:
+                entry["status"] = FAIL
+                entry["error"] = (err or out or f"sysadminctl exited {rc}")
+    items.append(entry)
+
+    # 2. Idle screen saver → never (it is the other lock trigger).
+    idle = screensaver_idle()
+    entry = {"name": "screensaver_idle", "value": idle, "want": 0,
+             "why": "the screen saver is the other 'require password' trigger"}
+    if idle in (0, None):
+        entry["status"] = OK
+    elif check_only:
+        entry["status"] = FAIL
+    else:
+        rc, _, err = _run(["defaults", "-currentHost", "write", "com.apple.screensaver", "idleTime", "-int", "0"])
+        idle = screensaver_idle()
+        entry["value"] = idle
+        if idle in (0, None):
+            entry["status"] = OK
+            changed += 1
+        else:
+            entry["status"] = FAIL
+            entry["error"] = err or f"defaults write exited {rc}"
+    items.append(entry)
+
+    # 3. Display sleep — informational. Needs sudo, so it is never applied here;
+    #    with (1) off, a dark display no longer locks, it just looks off.
+    ds = display_sleep_minutes()
+    items.append({"name": "display_sleep_min", "value": ds, "want": 0, "status": OK if ds == 0 else WARN,
+                  "why": "optional: `sudo pmset -a displaysleep 0` keeps the display awake for screenshots"})
+
+    hardened = all(i["status"] == OK for i in items if i["name"] != "display_sleep_min")
+    return {
+        "hardened": hardened,
+        "changed": changed,
+        "password_stored": pw_stored,
+        "check_only": check_only,
+        "items": items,
+    }
+
+
+# ──────────────────────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────────────────────
+
+def _print(payload: dict, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(payload, indent=None))
+        return
+    for k, v in payload.items():
+        if k == "items":
+            for it in v:
+                mark = {OK: "✓", WARN: "△", FAIL: "✗"}[it["status"]]
+                line = f"  {mark} {it['name']}: {it['value']!r} (want {it['want']!r})"
+                if it.get("error"):
+                    line += f" — {it['error']}"
+                print(line)
+        else:
+            print(f"{k}: {v}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="screen-lock", description=__doc__.split("Usage:")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("status", "unlock", "lock"):
+        p = sub.add_parser(name)
+        p.add_argument("--json", action="store_true")
+    p = sub.add_parser("harden")
+    p.add_argument("--check", action="store_true", help="verify only; exit 1 if the lock is still armed")
+    p.add_argument("--json", action="store_true")
+    args = ap.parse_args(argv)
+
+    if args.cmd == "status":
+        payload = status_payload()
+        _print(payload, args.json)
+        return 2 if payload["locked"] else 0
+
+    if args.cmd == "unlock":
+        payload = unlock()
+        _print(payload, args.json)
+        if payload.get("password_stored") is False:
+            return 3
+        return 0 if payload.get("locked") is False else 1
+
+    if args.cmd == "lock":
+        payload = lock_screen()
+        _print(payload, args.json)
+        return 0 if payload["locked"] else 1
+
+    if args.cmd == "harden":
+        payload = harden(check_only=args.check)
+        _print(payload, args.json)
+        if not payload["hardened"] and not payload["password_stored"]:
+            return 3
+        return 0 if payload["hardened"] else 1
+
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

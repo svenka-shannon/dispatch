@@ -412,6 +412,8 @@ class TestManagerMessageBusEvents:
         import types
         mgr.process_message = types.MethodType(Manager.process_message, mgr)
         mgr.process_reaction = types.MethodType(Manager.process_reaction, mgr)
+        mgr._maybe_route_third_party_reply = types.MethodType(
+            Manager._maybe_route_third_party_reply, mgr)
 
         yield mgr, bus
 

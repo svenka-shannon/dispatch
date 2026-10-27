@@ -274,6 +274,48 @@ async def test_escalation_rate_limited_while_still_down():
     assert "STILL DOWN" in rec.calls[1][2]
 
 
+@pytest.mark.asyncio
+async def test_flapping_same_reason_not_resent_across_incidents():
+    """DOWN→ESCALATED→self-heals→DOWN again with the same ask: one SMS, not one per flap."""
+    rec = EscalationRecorder()
+    state = {"down": True, "n": 0}
+
+    def recover():
+        state["n"] += 1
+        return RecoverResult.fail(f"no Accessibility permission (attempt {state['n']}, rc=1)")
+
+    runner, clock, _slept = make_runner(escalate=rec)
+    runner.register(DependencyCheck(
+        name="dep",
+        probe=lambda: ProbeResult.down(state.get("why", "wedged")) if state["down"] else ProbeResult.ok("fine"),
+        recover=recover, interval_s=10, max_attempts=1, backoff_s=(0,),
+        reescalate_after_s=3600,
+    ))
+    for _ in range(3):
+        state["down"] = True
+        await runner.run_check("dep")
+        assert runner.state_of("dep") == DepState.ESCALATED
+        state["down"] = False
+        await runner.run_check("dep")
+        assert runner.state_of("dep") == DepState.HEALTHY
+        clock.advance(600)
+    assert len(rec.calls) == 1
+
+    # The same reason re-notifies once the window has passed.
+    clock.advance(3601)
+    state["down"] = True
+    await runner.run_check("dep")
+    assert len(rec.calls) == 2
+
+    # A *different* failure reason notifies immediately, inside the window.
+    state["down"] = False
+    await runner.run_check("dep")
+    state["why"] = "Chrome binary missing"
+    state["down"] = True
+    await runner.run_check("dep")
+    assert len(rec.calls) == 3
+
+
 # ──────────────────────────────────────────────────────────────
 # enabled_when gating
 # ──────────────────────────────────────────────────────────────
@@ -519,10 +561,23 @@ def test_make_sms_escalator_sends_specific_message():
     phone, msg = sent[0]
     assert phone == "+15555550100"
     assert "chrome_control" in msg
-    assert "ESCALATED" in msg
+    assert "is down and auto-fix failed" in msg
     assert "chrome://extensions/" in msg
-    assert "recover_rc=1" in msg
-    assert "disable_reason=needs a reload" in msg
+    assert "health-history --dep chrome_control" in msg
+    # Diagnostics stay in logs/bus, not the text.
+    assert "recover_rc" not in msg
+
+
+def test_sms_escalation_is_short_even_for_huge_detail():
+    sent: list[tuple[str, str]] = []
+    esc = make_sms_escalator(lambda phone, msg: sent.append((phone, msg)), "+15555550100")
+    detail = ("automated AX reload failed — chrome://extensions/ didn't render in Chrome's AX tree — "
+              "a modal dialog is probably blocking Chrome's window. Check the screen or restart Chrome. "
+              "(chrome-heal: FAILED: " + "x" * 2000 + ")")
+    esc("chrome_control", "ESCALATED", detail, {"recover_output": "y" * 2000})
+    msg = sent[0][1]
+    assert len(msg) < 300
+    assert "xxx" not in msg and "yyy" not in msg
 
 
 def test_make_sms_escalator_no_phone_is_log_only():
@@ -581,3 +636,61 @@ async def test_emits_health_dependency_events_on_transitions():
     # action_taken vocabulary.
     actions = {e["payload"]["action_taken"] for e in prod.events}
     assert actions <= {"probe", "recover", "escalate", "none"}
+
+
+# ──────────────────────────────────────────────────────────────
+# retry_while_escalated (2026-09-27: screen_lock sat locked 14h after one
+# transient unlock failure, because ESCALATED never tried recover() again)
+# ──────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_retry_while_escalated_recovers_after_transient_failure():
+    rec = EscalationRecorder()
+    runner, clock, _slept = make_runner(escalate=rec)
+    results = iter([False, True])  # first escalated retry fails, second succeeds
+    calls = {"n": 0}
+
+    def recover():
+        calls["n"] += 1
+        if calls["n"] <= 1:          # the normal incident's single attempt fails
+            return RecoverResult.fail("transient")
+        return RecoverResult.ok("unlocked") if next(results) else RecoverResult.fail("still")
+
+    runner.register(DependencyCheck(
+        name="dep", probe=lambda: ProbeResult.down("locked"), recover=recover,
+        interval_s=10, max_attempts=1, backoff_s=(0,),
+        reescalate_after_s=3600, retry_while_escalated_s=600,
+    ))
+    await runner.run_check("dep")
+    assert runner.state_of("dep") == DepState.ESCALATED and calls["n"] == 1
+
+    # within the retry interval: no new attempt
+    clock.advance(100)
+    await runner.run_check("dep")
+    assert calls["n"] == 1
+
+    clock.advance(600)                 # retry #1 fails → still escalated
+    await runner.run_check("dep")
+    assert calls["n"] == 2 and runner.state_of("dep") == DepState.ESCALATED
+
+    clock.advance(600)                 # retry #2 succeeds → healthy
+    await runner.run_check("dep")
+    assert calls["n"] == 3 and runner.state_of("dep") == DepState.HEALTHY
+
+
+@pytest.mark.asyncio
+async def test_no_retry_while_escalated_by_default():
+    runner, clock, _slept = make_runner(escalate=EscalationRecorder())
+    calls = {"n": 0}
+
+    def recover():
+        calls["n"] += 1
+        return RecoverResult.fail("nope")
+
+    runner.register(DependencyCheck(
+        name="dep", probe=lambda: ProbeResult.down("x"), recover=recover,
+        interval_s=10, max_attempts=1, backoff_s=(0,)))
+    await runner.run_check("dep")
+    clock.advance(10_000)
+    await runner.run_check("dep")
+    assert calls["n"] == 1, "default behaviour unchanged"

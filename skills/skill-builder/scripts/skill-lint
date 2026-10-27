@@ -1,0 +1,347 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = []
+# ///
+"""skill-lint - flag diary-style edits and personal data in SKILL.md files.
+
+Skills are git-tracked and upstreamed. Lessons must be folded into the
+relevant section as general rules, not appended as dated incident logs, and
+personal / one-off data belongs in memory or POSTMORTEMS.md, not in a skill.
+
+Rules:
+  dated-heading   markdown heading containing a date ("## Fix (2026-10-18)")
+  private-ip      RFC1918 IPv4 (10/8, 172.16/12, 192.168/16); 192.168.x.x OK
+  owner-name      owner's name (resolved at runtime: identity owner.name)
+  partner-name    partner's name (resolved at runtime: identity partner.name)
+  abs-user-path   /Users/<real-user>/... (use ~ instead)
+  phone           phone numbers / sanitized phone chat ids (555 numbers OK)
+  email           email addresses (example.com / placeholders OK)
+  order-number    order / confirmation numbers
+
+Usage:
+  skill-lint                      # all SKILL.md under ~/dispatch/skills
+  skill-lint --changed            # only lines added in SKILL.md files changed vs HEAD,
+                                  # minus hits recorded in ../lint-baseline.txt
+  skill-lint --write-baseline     # record all current hits as the accepted backlog
+  skill-lint --strict             # exit 1 if any hits
+  skill-lint --summary            # also print hit counts by rule (stderr)
+  skill-lint path/to/SKILL.md ... # specific files or directories
+
+Output: file:line:rule:snippet
+
+Suppress a deliberate, reviewed line by adding `skill-lint: ignore` on it
+(e.g. inside an HTML comment).
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import re
+import shutil
+import subprocess
+import sys
+from collections import Counter
+from pathlib import Path
+
+SCRIPT = Path(__file__).resolve()
+REPO = SCRIPT.parents[3]  # skills/skill-builder/scripts/skill-lint -> repo root
+SKILLS_DIR = REPO / "skills"
+IDENTITY = REPO / "bin" / "identity"
+# synced/ holds third-party skills mirrored from claude.ai, not authored here
+SKIP_DIRS = {".venv", "node_modules", "__pycache__", ".git", "synced"}
+IGNORE_MARKER = "skill-lint: ignore"
+# Fingerprints of hits that predate the linter (cleanup backlog). Stores hashes,
+# never the offending text, so the baseline itself leaks nothing.
+BASELINE = SCRIPT.parent.parent / "lint-baseline.txt"
+
+# ---------------------------------------------------------------- patterns
+
+HEADING = re.compile(r"^\s{0,3}#{1,6}\s")
+FENCE = re.compile(r"^\s*(```|~~~)")
+MONTHS = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?"
+DATE_IN_HEADING = re.compile(
+    rf"(?<!\d)(?:19|20)\d\d-\d\d(?:-\d\d)?(?!\d)"  # 2026-10 / 2026-10-18
+    rf"|\b{MONTHS}\s+\d{{1,2}}(?:st|nd|rd|th)?,?\s+(?:19|20)\d\d\b"  # Oct 18, 2026
+    rf"|\b\d{{1,2}}\s+{MONTHS}\s+(?:19|20)\d\d\b"  # 18 Oct 2026
+    rf"|(?<!\d)\d{{1,2}}/\d{{1,2}}/(?:19|20)?\d\d(?!\d)"  # 10/18/2026
+)
+
+OCTET = r"(?:25[0-5]|2[0-4]\d|1?\d?\d)"
+PRIVATE_IP = re.compile(
+    rf"(?<![\w.])(?:10\.{OCTET}|172\.(?:1[6-9]|2\d|3[01])|192\.168)\.{OCTET}\.{OCTET}"
+    rf"(?![\w]|\.\d)(?P<cidr>/\d{{1,2}})?"
+)
+
+USER_PATH = re.compile(r"/Users/([A-Za-z0-9._-]+)")
+USER_PLACEHOLDERS = {
+    "you", "me", "user", "username", "yourname", "your-name", "your_name", "name",
+    "shared", "example", "someone", "foo", "bar", "john", "jane", "home", "x", "xxx",
+}
+
+PHONE = re.compile(
+    r"(?<![\w+])(?:"
+    r"\+\d[\d\s().-]{8,}\d"  # +1 555 123 4567, +15551234567
+    r"|_1\d{10}"  # sanitized chat id (_15551234567)
+    r"|\(\d{3}\)\s?\d{3}[\s.-]\d{4}"  # (555) 123-4567
+    r"|\d{3}[.-]\d{3}[.-]\d{4}"  # 555-123-4567
+    r")(?![\w])"
+)
+
+PHONE_PLACEHOLDERS = {"1234567890", "2345678901", "0123456789", "9876543210"}
+
+EMAIL = re.compile(r"(?<![\w.+-])([A-Za-z0-9._%+-]+)@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,})\b")
+EMAIL_OK_DOMAINS = re.compile(
+    r"(?:^|\.)(?:example\.(?:com|org|net)|example|test|invalid|localhost|domain\.com"
+    r"|email\.com|company\.com|users\.noreply\.github\.com|anthropic\.com)$",
+    re.I,
+)
+EMAIL_OK_LOCALS = {
+    "you", "your", "your-email", "your_email", "youremail", "yourname", "user", "username",
+    "name", "email", "me", "foo", "someone", "somebody", "noreply", "no-reply", "git",
+    "test", "example", "admin", "first.last", "firstname.lastname", "john", "jane",
+    "alice", "bob", "a", "b", "account", "other", "new-user", "participant", "student", "team",
+    "notifications", "security", "support", "info", "help", "contact", "sales", "billing",
+}
+
+ORDER = re.compile(
+    r"\border\s*(?:#|no\.?|num(?:ber)?)\s*:?\s*[A-Z0-9-]*\d{6,}"
+    r"|\bconf(?:irmation)?\.?\s*(?:#|no\.?|num(?:ber)?|code)\s*:?\s*(?=[A-Z0-9-]*\d)[A-Z0-9-]{4,}"
+    r"|(?<![\w-])\d{3}-\d{7}-\d{7}(?![\w-])",  # Amazon order id
+    re.I,
+)
+
+NAME_PLACEHOLDERS = {"your name", "partner name", "owner name", "name", ""}
+
+
+# ---------------------------------------------------------------- helpers
+
+
+def identity(key: str) -> str:
+    """Resolve an identity value; empty string if unavailable."""
+    if not (REPO / "config.local.yaml").exists() or not IDENTITY.exists():
+        return ""
+    for cmd in ([str(IDENTITY), key], ["uv", "run", "--script", str(IDENTITY), key]):
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if out.returncode == 0:
+            val = out.stdout.strip()
+            return "" if val.lower() in NAME_PLACEHOLDERS else val
+    return ""
+
+
+def name_regex(full: str) -> re.Pattern | None:
+    """Match the full name or any name part (>=3 chars), case-sensitive, whole word."""
+    parts = [full] + [p for p in full.split() if len(p) >= 3]
+    parts = sorted({p for p in parts if p}, key=len, reverse=True)
+    if not parts:
+        return None
+    return re.compile(r"(?<![\w])(?:" + "|".join(re.escape(p) for p in parts) + r")(?![\w])")
+
+
+def git(*args: str) -> str | None:
+    if not shutil.which("git"):
+        return None
+    try:
+        out = subprocess.run(["git", "-C", str(REPO), *args], capture_output=True, text=True)
+    except OSError:
+        return None
+    return out.stdout if out.returncode == 0 else None
+
+
+def changed_files() -> dict[Path, set[int] | None] | None:
+    """SKILL.md files changed vs HEAD -> set of added line numbers (None = whole file)."""
+    if git("rev-parse", "--verify", "HEAD") is None:
+        return None
+    result: dict[Path, set[int] | None] = {}
+    diff = git("diff", "HEAD", "--no-color", "--no-ext-diff", "-U0", "--diff-filter=AMR", "--", "skills")
+    if diff is None:
+        return None
+    current: Path | None = None
+    for line in diff.splitlines():
+        if line.startswith("+++ "):
+            target = line[4:].strip()
+            current = REPO / target[2:] if target.startswith("b/") else None
+            if current is not None and current.name != "SKILL.md":
+                current = None
+            if current is not None:
+                result.setdefault(current, set())
+        elif line.startswith("@@") and current is not None:
+            m = re.search(r"\+(\d+)(?:,(\d+))?", line)
+            if m:
+                start, count = int(m.group(1)), int(m.group(2) or 1)
+                result[current].update(range(start, start + count))
+    untracked = git("ls-files", "--others", "--exclude-standard", "--", "skills")
+    for rel in (untracked or "").splitlines():
+        if rel.endswith("SKILL.md"):
+            result[REPO / rel] = None
+    return {p: v for p, v in result.items() if not SKIP_DIRS.intersection(p.parts)}
+
+
+def iter_skill_files(paths: list[Path]) -> list[Path]:
+    files: list[Path] = []
+    for p in paths:
+        p = p.expanduser()
+        if p.is_file():
+            files.append(p)
+        elif p.is_dir():
+            for f in sorted(p.rglob("SKILL.md")):
+                if not SKIP_DIRS.intersection(f.parts):
+                    files.append(f)
+    return files
+
+
+# ---------------------------------------------------------------- linting
+
+
+def lint_line(line: str, in_fence: bool, names: list[tuple[str, re.Pattern]]) -> list[str]:
+    rules: list[str] = []
+    if not in_fence and HEADING.match(line):
+        m = DATE_IN_HEADING.search(line)
+        # "API Costs (as of 2026-02)" is a freshness marker, not a diary entry
+        if m and not re.search(r"\bas of\s*$", line[: m.start()], re.I):
+            rules.append("dated-heading")
+    for m in PRIVATE_IP.finditer(line):
+        if m.group("cidr"):  # network ranges like 10.0.0.0/8 are documentation
+            continue
+        rules.append("private-ip")
+        break
+    for rule, rx in names:
+        if rx.search(line):
+            rules.append(rule)
+    for m in USER_PATH.finditer(line):
+        if m.group(1).lower() not in USER_PLACEHOLDERS:
+            rules.append("abs-user-path")
+            break
+    for m in PHONE.finditer(line):
+        digits = re.sub(r"\D", "", m.group(0))
+        national = digits[1:] if len(digits) == 11 and digits.startswith("1") else digits
+        if len(digits) < 10 or len(digits) > 15:
+            continue
+        if len(national) == 10 and "555" in (national[:3], national[3:6]):  # fictional 555 numbers
+            continue
+        if len(set(national)) <= 2 or national in PHONE_PLACEHOLDERS:
+            continue
+        rules.append("phone")
+        break
+    for m in EMAIL.finditer(line):
+        local, domain = m.group(1).lower(), m.group(2).lower()
+        if EMAIL_OK_DOMAINS.search(domain) or re.sub(r"\d+$", "", local) in EMAIL_OK_LOCALS:
+            continue
+        rules.append("email")
+        break
+    if ORDER.search(line) and not re.search(r"X{3,}|x{3,}|N{3,}|#{3,}", line):
+        rules.append("order-number")
+    return rules
+
+
+def lint_file(path: Path, only_lines: set[int] | None, names) -> list[tuple[Path, int, str, str]]:
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return []
+    hits = []
+    in_fence = False
+    for n, line in enumerate(text.splitlines(), 1):
+        if FENCE.match(line):
+            in_fence = not in_fence
+            continue
+        if only_lines is not None and n not in only_lines:
+            continue
+        if IGNORE_MARKER in line:
+            continue
+        for rule in lint_line(line, in_fence, names):
+            hits.append((path, n, rule, line.strip()))
+    return hits
+
+
+def display(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(REPO))
+    except ValueError:
+        return str(path)
+
+
+def fingerprint(path: Path, rule: str, snippet: str) -> str:
+    """Line-number independent, so moving a line doesn't resurrect it; editing it does."""
+    key = f"{display(path)}\0{rule}\0{' '.join(snippet.split())}"
+    return hashlib.sha256(key.encode()).hexdigest()[:20]
+
+
+def load_baseline(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    return {ln.split()[0] for ln in path.read_text().splitlines() if ln.strip() and not ln.startswith("#")}
+
+
+def write_baseline(path: Path, hits) -> None:
+    lines = sorted({f"{fingerprint(p, r, s)}  {display(p)}  {r}" for p, _, r, s in hits}, key=lambda l: l.split()[1:] + [l])
+    header = (
+        "# skill-lint baseline: pre-existing hits ignored by `skill-lint --changed`.\n"
+        "# Hashes only (no offending text). Delete a line once that hit is cleaned up;\n"
+        "# regenerate with: skill-lint --write-baseline\n"
+    )
+    path.write_text(header + "\n".join(lines) + "\n")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("paths", nargs="*", type=Path, help="SKILL.md files or dirs (default: repo skills/)")
+    ap.add_argument("--changed", action="store_true", help="only lines added in SKILL.md files changed vs git HEAD (untracked files: whole file)")
+    ap.add_argument("--strict", action="store_true", help="exit 1 if any hits")
+    ap.add_argument("--summary", action="store_true", help="print hit counts by rule to stderr")
+    ap.add_argument("--baseline", type=Path, default=BASELINE, help=f"baseline file (default: {display(BASELINE)}); applied only with --changed")
+    ap.add_argument("--no-baseline", action="store_true", help="don't suppress baselined hits")
+    ap.add_argument("--write-baseline", action="store_true", help="scan all files and record every current hit as baseline")
+    args = ap.parse_args()
+
+    names: list[tuple[str, re.Pattern]] = []
+    for rule, key in (("owner-name", "owner.name"), ("partner-name", "partner.name")):
+        rx = name_regex(identity(key))
+        if rx is not None:
+            names.append((rule, rx))
+
+    targets: dict[Path, set[int] | None]
+    if args.write_baseline:
+        files = iter_skill_files(args.paths or [SKILLS_DIR])
+        hits = [h for f in files for h in lint_file(f, None, names)]
+        write_baseline(args.baseline, hits)
+        print(f"skill-lint: wrote {len(hits)} baseline entries to {args.baseline}", file=sys.stderr)
+        return 0
+    if args.changed:
+        changed = changed_files()
+        if changed is None:
+            print("skill-lint: git unavailable or not a repo; nothing to check", file=sys.stderr)
+            return 0
+        targets = {p: lines for p, lines in changed.items() if p.exists()}
+        if args.paths:
+            wanted = {f.resolve() for f in iter_skill_files(args.paths)}
+            targets = {p: l for p, l in targets.items() if p.resolve() in wanted}
+    else:
+        targets = {f: None for f in iter_skill_files(args.paths or [SKILLS_DIR])}
+
+    hits = []
+    for path in sorted(targets):
+        hits.extend(lint_file(path, targets[path], names))
+    if args.changed and not args.no_baseline:
+        known = load_baseline(args.baseline)
+        hits = [h for h in hits if fingerprint(h[0], h[2], h[3]) not in known]
+
+    for path, n, rule, snippet in hits:
+        print(f"{display(path)}:{n}:{rule}:{snippet}")
+
+    if args.summary or not hits:
+        counts = Counter(rule for _, _, rule, _ in hits)
+        files = len({p for p, *_ in hits})
+        print(f"skill-lint: {len(hits)} hit(s) in {files} file(s) across {len(targets)} scanned", file=sys.stderr)
+        for rule, c in counts.most_common():
+            print(f"  {rule}: {c}", file=sys.stderr)
+
+    return 1 if (args.strict and hits) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

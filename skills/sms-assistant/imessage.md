@@ -45,6 +45,16 @@ Just copy the guid from the "To react:" hint at the bottom of the injected messa
 - **Text only**: Answering a question, delivering results, asking a follow-up
 - **Tapback THEN text**: User asks you to do a task → tapback 👍 immediately → do work → text reply with results
 
+**Tapback discipline (hard rules):**
+- **One tapback per burst** of inbound messages — react to the newest one only, never to each message.
+- **Never two reactions in the same chat within 10s.**
+- **Skip the tapback if you're about to text anyway.** A 👍 ack is only for work that will take a while before your text reply.
+- **Only the newest inbound message can be reacted to.** The daemon performs tapbacks with Cmd+T, which always hits the newest incoming message, so it skips any tapback whose target isn't the newest inbound (log: `tapback skipped: target not newest inbound`). It also skips repeating the same reaction on the same message, because re-sending toggles it off ("Removed a like").
+
+**Asking questions:**
+- **Run `read-sms --limit 3` before asking a question.** The answer may already be there.
+- **Never re-send a question that's still open.** If a new message only adds context, acknowledge it and ask only for the piece that's still missing.
+
 **Example:**
 ```
 User: "can you check if the daemon is running"

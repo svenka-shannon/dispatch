@@ -305,62 +305,38 @@ You are a message delivery latency analyst. Measure end-to-end message delivery 
 NOTE: bus.db has both hot tables (records: 7-day retention) and archive tables (records_archive: infinite retention).
 For recent data (last 24h), query records. For longer-term trends, use UNION ALL with records_archive.
 
-1. Find message.received -> message.sent pairs to measure response time:
+SCHEMA GOTCHAS (verified 2026-10-26):
+- `records` has NO `id` column (PK is topic,partition,offset; WITHOUT ROWID). Never use `r.id`.
+- Keys differ by type: message.received key = 'imessage/+1...', message.sent key = 'imessage:+1...'.
+  NEVER join on `key`. Join on json_extract(payload,'$.chat_id') (present on both).
+- message.received payload has `timestamp_ms` (user's original send time) → inbound staleness =
+  r.timestamp - json_extract(payload,'$.timestamp_ms'). Measure BOTH bus→reply and send→reply.
+- Count only replies with source='sdk_session' (daemon-sourced sends are system alerts).
+
+1. Find message.received -> first sdk_session message.sent (same chat_id, within 5 min):
    sqlite3 -header ~/dispatch/state/bus.db "
-     SELECT r1.key as chat_id,
-            datetime(r1.timestamp/1000,'unixepoch','localtime') as received_at,
-            datetime(r2.timestamp/1000,'unixepoch','localtime') as sent_at,
-            (r2.timestamp - r1.timestamp) / 1000.0 as response_seconds,
-            json_extract(r1.payload, '$.sender_name') as sender,
-            r1.source as backend
-     FROM records r1
-     LEFT JOIN records r2 ON r2.key = r1.key
-       AND r2.type = 'message.sent'
-       AND r2.timestamp > r1.timestamp
-       AND r2.timestamp < r1.timestamp + 300000
-       AND r2.id = (SELECT MIN(id) FROM records WHERE key = r1.key AND type = 'message.sent' AND timestamp > r1.timestamp)
-     WHERE r1.type = 'message.received'
-       AND r1.timestamp > (strftime('%s','now','-24 hours') * 1000)
-     ORDER BY response_seconds DESC
-     LIMIT 30
+     WITH rcv AS (
+       SELECT timestamp ts, json_extract(payload,'$.chat_id') cid, source backend,
+              json_extract(payload,'$.timestamp_ms') sent_ms
+       FROM records WHERE type='message.received'
+         AND timestamp > (strftime('%s','now','-24 hours') * 1000)),
+     snt AS (
+       SELECT timestamp ts, json_extract(payload,'$.chat_id') cid
+       FROM records WHERE type='message.sent' AND source='sdk_session'
+         AND timestamp > (strftime('%s','now','-25 hours') * 1000))
+     SELECT rcv.cid, rcv.backend,
+            datetime(rcv.ts/1000,'unixepoch','localtime') received_at,
+            ROUND((rcv.ts - rcv.sent_ms)/1000.0,1) inbound_staleness_s,
+            ROUND(((SELECT MIN(ts) FROM snt WHERE snt.cid=rcv.cid AND snt.ts>rcv.ts AND snt.ts<rcv.ts+300000) - rcv.ts)/1000.0,1) response_s
+     FROM rcv ORDER BY response_s DESC LIMIT 30
    "
 
-2. Find messages that were received but never got a response (within 5 minutes):
-   sqlite3 -header ~/dispatch/state/bus.db "
-     SELECT r1.key as chat_id,
-            datetime(r1.timestamp/1000,'unixepoch','localtime') as received_at,
-            json_extract(r1.payload, '$.sender_name') as sender,
-            substr(json_extract(r1.payload, '$.text'), 1, 100) as message_preview,
-            r1.source as backend
-     FROM records r1
-     WHERE r1.type = 'message.received'
-       AND r1.timestamp > (strftime('%s','now','-24 hours') * 1000)
-       AND NOT EXISTS (
-         SELECT 1 FROM records r2
-         WHERE r2.key = r1.key
-           AND r2.type = 'message.sent'
-           AND r2.timestamp > r1.timestamp
-           AND r2.timestamp < r1.timestamp + 300000
-       )
-     ORDER BY r1.timestamp DESC
-     LIMIT 20
-   "
+2. Received with no sdk_session reply within 5 min: run query 1 and filter `response_s IS NULL`
+   (wrap it as a subquery). Exclude reactions / group chatter not addressed to the assistant.
 
-3. Measure session creation to first response time (cold start latency):
-   sqlite3 -header ~/dispatch/state/bus.db "
-     SELECT r1.key as chat_id,
-            datetime(r1.timestamp/1000,'unixepoch','localtime') as session_created,
-            datetime(r2.timestamp/1000,'unixepoch','localtime') as first_response,
-            (r2.timestamp - r1.timestamp) / 1000.0 as seconds_to_first_response
-     FROM records r1
-     LEFT JOIN records r2 ON r2.key = r1.key
-       AND r2.type = 'message.sent'
-       AND r2.timestamp > r1.timestamp
-       AND r2.id = (SELECT MIN(id) FROM records WHERE key = r1.key AND type = 'message.sent' AND timestamp > r1.timestamp)
-     WHERE r1.type = 'session.created'
-       AND r1.timestamp > (strftime('%s','now','-24 hours') * 1000)
-     ORDER BY seconds_to_first_response DESC
-   "
+3. Cold start: session.created keys are session names (e.g. 'ephemeral-...', 'imessage/+1...');
+   match the first message.sent by chat_id = json_extract(session.created payload,'$.chat_id')
+   (skip ephemeral-* sessions — they are tasks, not chats).
 
 4. Check for session restart overhead (restarts add latency):
    sqlite3 -header ~/dispatch/state/bus.db "
@@ -374,22 +350,8 @@ For recent data (last 24h), query records. For longer-term trends, use UNION ALL
      ORDER BY restart_count DESC
    "
 
-5. Measure response time by backend (iMessage vs Signal):
-   sqlite3 -header ~/dispatch/state/bus.db "
-     SELECT r1.source as backend,
-            COUNT(*) as messages,
-            ROUND(AVG((r2.timestamp - r1.timestamp) / 1000.0), 1) as avg_response_sec,
-            ROUND(MAX((r2.timestamp - r1.timestamp) / 1000.0), 1) as max_response_sec
-     FROM records r1
-     JOIN records r2 ON r2.key = r1.key
-       AND r2.type = 'message.sent'
-       AND r2.timestamp > r1.timestamp
-       AND r2.timestamp < r1.timestamp + 300000
-       AND r2.id = (SELECT MIN(id) FROM records WHERE key = r1.key AND type = 'message.sent' AND timestamp > r1.timestamp)
-     WHERE r1.type = 'message.received'
-       AND r1.timestamp > (strftime('%s','now','-24 hours') * 1000)
-     GROUP BY r1.source
-   "
+5. Response time by backend: aggregate query 1 (AVG/MAX of response_s and inbound_staleness_s) GROUP BY backend.
+   Compare against the prior 6 days (change -24 hours to -7 days and exclude the last 24h) for a baseline.
 
 6. Note: Message delivery gaps (long quiet periods) are NOT latency issues — they are simply idle periods. Do NOT report quiet periods as bottlenecks. Only report actual slow response times (received -> sent pairs with high latency).
 

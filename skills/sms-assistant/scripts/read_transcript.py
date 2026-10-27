@@ -12,6 +12,7 @@ Usage:
 import json
 import argparse
 import os
+import re
 import subprocess
 from pathlib import Path
 from collections import deque
@@ -53,16 +54,26 @@ def lookup_tier(session_name):
     return None
 
 
+def project_dir_name(session_name, home=None):
+    """Map a session (e.g. "imessage/_15555550100") to its ~/.claude/projects dir name.
+
+    Claude Code derives the project dir from the session cwd
+    (~/transcripts/<session>) by replacing EVERY non-alphanumeric char with
+    '-' -- so '/', '_', '.', '+' all become '-'.
+    """
+    home = Path(home) if home else Path.home()
+    return re.sub(r"[^A-Za-z0-9]", "-", str(home / "transcripts" / session_name))
+
+
 def find_transcripts(session_name=None):
     """Find all transcripts, optionally filtered by session name."""
     base = Path.home() / ".claude/projects"
 
     if session_name:
-        # Look for transcript directories matching the session
-        username = Path.home().name
-        sanitized = session_name.replace("/", "-")
-        pattern = f"-Users-{username}-transcripts-{sanitized}"
-        dirs = [d for d in base.iterdir() if d.is_dir() and pattern in d.name]
+        # Exact match on the Claude Code project dir for this session's cwd
+        # (excludes sibling "-spawn-<id>" dirs).
+        target = project_dir_name(session_name)
+        dirs = [d for d in base.iterdir() if d.is_dir() and d.name == target]
     else:
         # Find all transcript directories
         dirs = [d for d in base.iterdir() if d.is_dir() and "transcripts" in d.name]

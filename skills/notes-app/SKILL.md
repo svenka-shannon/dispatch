@@ -7,6 +7,26 @@ description: Read, write, search, and manage Apple Notes via AppleScript/osascri
 
 Read, write, search, and manage Apple Notes programmatically via AppleScript.
 
+> **⚠️ Known blocker (verified 2026-08-19): every call here hangs ~25s+ and
+> returns nothing.** `python3.14` has no Automation grant for `com.apple.Notes`,
+> so the AppleEvent waits on a prompt that never appears. A denied or pending
+> Automation grant **times out rather than erroring**, so this looks exactly like
+> a wedged Notes.app — do not debug it by restarting Notes.
+>
+> Check first (0 = denied, 2 = allowed, missing row = never prompted):
+> ```bash
+> sqlite3 ~/Library/Application\ Support/com.apple.TCC/TCC.db \
+>   "SELECT client,indirect_object_identifier,auth_value FROM access WHERE service='kTCCServiceAppleEvents';"
+> ```
+>
+> Fix needs a human: System Settings → Privacy & Security → Automation → tick
+> **Notes** for python/uv.
+>
+> **NEVER run `tccutil reset AppleEvents`** to force a re-prompt — it resets the
+> whole service, revoking the `MobileSMS` grant that `send-sms` runs on, i.e. you
+> would cut the channel you need to report the problem.
+> Full writeup: `~/.claude/skills/contacts/SKILL.md` → Troubleshooting.
+
 ## Quick Reference
 
 ```bash

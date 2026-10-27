@@ -33,7 +33,7 @@ BOLD = "\033[1m"
 
 HOME = Path.home()
 CHAT_DB = HOME / "Library/Messages/chat.db"
-SEND_SMS = HOME / "code/sms-cli/send-sms"
+SEND_SMS = HOME / ".claude/skills/sms-assistant/scripts/send-sms"
 SEND_SIGNAL = HOME / "code/signal/send-signal"
 TEST_MSG_DIR = HOME / ".claude/test-messages"
 SIGNAL_SOCKET = Path("/tmp/signal-cli.sock")

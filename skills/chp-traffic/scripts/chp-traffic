@@ -1,0 +1,82 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["requests", "beautifulsoup4"]
+# ///
+"""Query CHP live traffic incidents (cad.chp.ca.gov) by communications center.
+
+Examples:
+  chp-traffic                               # Golden Gate (Bay Area) active incidents
+  chp-traffic --filed                       # + recently closed ("filed") incidents (~last hour)
+  chp-traffic --grep "sr1|pacifica|sharp park"   # regex filter on location/desc/area
+  chp-traffic --center LACC --json
+"""
+import argparse, json, re, sys
+import requests
+from bs4 import BeautifulSoup
+
+URL = "https://cad.chp.ca.gov/Traffic.aspx"
+UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}
+CENTERS = {"BFCC":"Bakersfield","BSCC":"Barstow","BICC":"Bishop","BCCC":"Border","CCCC":"Capitol",
+    "CHCC":"Chico","ECCC":"El Centro","FRCC":"Fresno","GGCC":"Golden Gate","HMCC":"Humboldt",
+    "ICCC":"Indio","INCC":"Inland","LACC":"Los Angeles","MRCC":"Merced","MYCC":"Monterey",
+    "OCCC":"Orange","RDCC":"Redding","SACC":"Sacramento","SLCC":"San Luis Obispo","SKCCSTCC":"Stockton",
+    "SUCC":"Susanville","TKCC":"Truckee","UKCC":"Ukiah","VTCC":"Ventura","YKCC":"Yreka"}
+
+def form_state(html):
+    soup = BeautifulSoup(html, "html.parser")
+    data = {i["name"]: i.get("value", "") for i in soup.select("input[type=hidden]") if i.get("name")}
+    return soup, data
+
+def parse_rows(soup):
+    rows = []
+    for tr in soup.select("table tr"):
+        tds = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+        if len(tds) >= 7 and tds[0] == "Details" and tds[1] != "No.":
+            rows.append(dict(zip(["no","time","type","location","desc","area"], tds[1:7])))
+    return rows
+
+def fetch(center, filed):
+    s = requests.Session(); s.headers.update(UA)
+    soup, data = form_state(s.get(URL, timeout=30).text)
+    if not filed:
+        data.update({"ddlComCenter": center, "btnCCGo": "Go"})
+        soup, _ = form_state(s.post(URL, data=data, timeout=30).text)
+        return parse_rows(soup)
+    # switch search dropdown to Filed Incidents (autopostback), then pick center
+    data.update({"__EVENTTARGET": "ddlSearches", "ddlSearches": "6"})
+    soup, data = form_state(s.post(URL, data=data, timeout=30).text)
+    sel = soup.find("select", id="ddlFiledIncidents")
+    opt = next((o["value"] for o in sel.find_all("option") if o["value"].startswith(center[:4] + "-")), None) if sel else None
+    if not opt:
+        sys.exit(f"no filed-incidents option for {center}")
+    data.update({"__EVENTTARGET": "", "ddlSearches": "6", "ddlFiledIncidents": opt, "btnFiledGo": "Go"})
+    soup, _ = form_state(s.post(URL, data=data, timeout=30).text)
+    return parse_rows(soup)
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--center", default="GGCC", help="comm center code (default GGCC = Bay Area). --list to see all")
+    ap.add_argument("--filed", action="store_true", help="also include recently closed incidents (~last hour)")
+    ap.add_argument("--grep", help="case-insensitive regex filter on location/desc/area/type")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--list", action="store_true", help="list center codes")
+    a = ap.parse_args()
+    if a.list:
+        for k, v in CENTERS.items(): print(f"{k}\t{v}")
+        return
+    rows = [dict(r, status="active") for r in fetch(a.center, False)]
+    if a.filed:
+        seen = {r["no"] for r in rows}
+        rows += [dict(r, status="closed") for r in fetch(a.center, True) if r["no"] not in seen]
+    if a.grep:
+        rx = re.compile(a.grep, re.I)
+        rows = [r for r in rows if rx.search(" ".join([r["type"], r["location"], r["desc"], r["area"]]))]
+    if a.json:
+        print(json.dumps(rows, indent=2)); return
+    print(f"{len(rows)} incident(s) — {CENTERS.get(a.center, a.center)} (times are Pacific)")
+    for r in rows:
+        print(f"[{r['status']}] {r['time']} | {r['type']} | {r['location']} | {r['desc']} | {r['area']}")
+
+if __name__ == "__main__":
+    main()

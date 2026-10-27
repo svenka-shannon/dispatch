@@ -80,7 +80,7 @@ TRUE_POSITIVES = [
 ]
 
 
-async def test_case(case: dict) -> tuple[str, str, bool]:
+async def run_case(case: dict) -> tuple[str, str, bool]:
     """Run one test case through the new prompt."""
     from claude_agent_sdk import (
         query as sdk_query,
@@ -154,7 +154,7 @@ async def main():
         print(f"Testing: {case['label']}")
         print(f"  Expected: {case['expected']}")
 
-        label, result, ok = await test_case(case)
+        label, result, ok = await run_case(case)
         status = "✅ PASS" if ok else "❌ FAIL"
 
         print(f"  Got:      {result[:100]}")

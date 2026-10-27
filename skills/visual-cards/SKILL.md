@@ -67,6 +67,44 @@ bullets:
 poetic: "No itinerary. Just walk into whichever bar has the best fiddle."
 ```
 
+### `option-rank` template (product / option comparison)
+
+For ranked picks with prices — build tiers, product shortlists, anything with a `name | note | price` shape.
+Added 2026-09-18 (SKILL.md had referenced this template for months but the HTML file did not exist — if `render` says "template not found", that's the bug).
+
+```yaml
+template: option-rank
+hero_image: /tmp/cards/hero-office.jpg
+eyebrow: "Office audio · Sep 18"
+page_tag: "3 / 5"
+title: "The Pick"
+subtitle: "What I'd actually buy"
+rows:
+  - { name: "Kanto ORA", note: "powered, USB-C in, desk-sized", price: "$349", pick: true, badge: "best value" }
+  - { name: "JBL 305P MkII", note: "studio monitor, needs an interface", price: "$358" }
+total: "All in: <b>$698</b> shipped"
+poetic: "Buy the sub last. You'll know if you need it."
+```
+
+Row fields: `name`, `note`, `price`, `pick` (bool → orange highlight), `badge` (small uppercase label).
+`total` is **not** HTML-escaped so you can use `<b>` — never interpolate untrusted text into it.
+Keep it to **6-7 rows max**; past that the rows compress and it becomes the text-wall failure mode again.
+
+### `listing-picks` template (marketplace / product listings with real photos)
+For used-item finds and listings where the PHOTO is the point. 2-3 stacked rows, each with a big listing photo,
+a numbered badge, price, title, meta and an italic "why" line. Added 2026-10-08.
+```yaml
+template: listing-picks
+hero_image: /tmp/ct/ct1.jpg          # blurred as the background (use the first listing's photo)
+eyebrow: "Coffee table watch · Oct 8"
+page_tag: "Day 1"
+title: "Today's standouts"
+subtitle: "3 of ~330 listings near Pacifica"
+listings:
+  - { image: /tmp/ct/ct1.jpg, price: "$495", title: "Danish modern teak + tile", meta: "Mission, SF · 46×23×18 in · Craigslist", why: "Real vintage teak" }
+poetic: "Reply 1, 2 or 3 for the link."
+```
+
 ## Image Sourcing Playbook
 
 **Always use SPECIFIC, on-topic photos.** Generic skylines are a fail mode (admin called it out: "the image(s) need to be relevant to the activities").
@@ -135,6 +173,16 @@ print(img.getpixel((0, img.height-1)))  # (255,255,255) = white IN FILE
 ❌ **Generic stock skyline as hero** — when activities are specific (Hattie B's, Lower Broadway), the photo should match. Otherwise "image(s) need to be relevant to the activities" (admin).
 ❌ **Long text wall instead of card** — admin: "this long text format isn't working for me." When the response would be 8+ bullet items, switch to cards.
 ❌ **Too many cards in one image** — 6 options crammed into one image becomes the same problem as a text wall. Use a deck (multiple images), not one giant compendium.
+❌ **Reusing the same photo across cards in one deck** — admin, 2026-08-22: *"the same image is on two visual cards which kinda sucks."* Track which image IDs you've already sent in this conversation and never repeat one. A deck is read as a set; a repeat makes it look auto-generated.
+❌ **Stock photos of the CATEGORY instead of the PLACE** — same message: *"the museum one is pictures of cars."* A card about Nissan Crossing and the Fuji Motorsports Museum needs photos *of Nissan Crossing and the Fuji Motorsports Museum*, not generic sports cars. Unsplash is the last resort, not the first.
+
+**Get the real photo instead — this usually takes one command:**
+```bash
+# most venues expose an OGP image or hero shot right in the homepage HTML
+curl -sL -A "Mozilla/5.0" "https://venue.example.jp/" \
+  | grep -oE 'https?://[^"'"'"' ]+\.(jpg|jpeg|png)' | sort -u | head
+```
+Then `curl -o`, check it with Read, and `sips` to crop letterboxing (OGP images are often 1200×630 with bars) or to resize anything over 2000px. Only fall back to `find-images` when the venue publishes nothing usable — and if you do, **actually look at the result before shipping it**: an Unsplash search for "akihabara electronics" returns Shibuya Crossing, which is exactly the generic-skyline failure above.
 
 ## Testing
 

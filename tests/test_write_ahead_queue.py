@@ -516,6 +516,50 @@ class TestIsSendCommandAdversarial:
     def test_actual_reply_with_full_path(self):
         assert _is_send_command('~/.claude/skills/sms-assistant/scripts/reply "hello"')
 
+    # ── heredoc bodies must not be parsed as shell (2026-09-24) ──────
+    # The detector splits on newlines, so every heredoc body line became its
+    # own segment. Writing a file that merely NAMES a send CLI emitted a real
+    # message.sent on the live bus. A phantom send advances last_send_at and
+    # SUPPRESSES the unanswered-inbound watchdog, so it fails quiet.
+
+    def test_heredoc_body_naming_send_cli(self):
+        """Writing a doc that mentions the send CLI is NOT a send."""
+        assert not _is_send_command(
+            "cat > /tmp/notes.md <<'EOF'\n"
+            "~/.claude/skills/sms-assistant/scripts/send-sms is the CLI\n"
+            "EOF"
+        )
+
+    def test_heredoc_body_with_test_fixture(self):
+        """The exact phantom: testing the detector tripped the detector."""
+        assert not _is_send_command(
+            "cd ~/dispatch && uv run python - <<'PY'\n"
+            "real = 'cd ~/x && ~/.claude/skills/sms-assistant/scripts/reply \"hi\"'\n"
+            "PY"
+        )
+
+    def test_heredoc_unquoted_and_dash_variant(self):
+        """<<-EOF with an indented terminator is still stripped."""
+        assert not _is_send_command(
+            "cat <<-EOF > /tmp/a\n"
+            "\t~/.claude/skills/sms-assistant/scripts/reply \"x\"\n"
+            "EOF"
+        )
+
+    def test_unterminated_heredoc_strips_to_end(self):
+        """An unterminated heredoc consumes to EOF, as the shell would."""
+        assert not _is_send_command(
+            "cat <<'EOF'\n~/.claude/skills/sms-assistant/scripts/reply \"x\""
+        )
+
+    def test_real_send_with_heredoc_argument_still_counts(self):
+        """The documented group-send form must still register."""
+        assert _is_send_command(
+            "~/.claude/skills/sms-assistant/scripts/send-sms \"grp\" \"$(cat <<'ENDMSG'\n"
+            "body line mentioning ~/.claude/skills/sms-assistant/scripts/reply\n"
+            "ENDMSG\n)\""
+        )
+
 
 # ── message.sent emission test ───────────────────────────────────────
 
@@ -592,3 +636,36 @@ class TestReplayOnRestart:
         assert new_session is not None
         assert len(replay_calls) == 1
         assert replay_calls[0][0] == "test:+15555551234"
+
+
+class TestSendCommandChained:
+    """2026-09-23 regression: `cd <dir> && <send script>` was not detected.
+
+    The documented send idiom is `cd ~/transcripts/<backend>/<chat> && .../reply`
+    because the reply CLI infers chat_id from cwd. The old detector read only
+    `cmd.split()[0]`, which is `cd`, so real sends never advanced `last_send_at`
+    and the unanswered-inbound watchdog fired "you have not sent ANY reply" at a
+    session that had replied twice a minute earlier. A false nudge invites
+    re-sending — i.e. duplicate texts to the user.
+    """
+
+    def test_cd_then_reply_is_a_send(self):
+        assert _is_send_command(
+            'cd ~/transcripts/imessage/_15555550100 && '
+            '~/.claude/skills/sms-assistant/scripts/reply "hello"')
+
+    def test_semicolon_chain_is_a_send(self):
+        assert _is_send_command(
+            'cd /tmp; ~/.claude/skills/signal/scripts/send-signal "+1234" "hi"')
+
+    def test_env_prefix_is_a_send(self):
+        assert _is_send_command(
+            'FOO=1 ~/.claude/skills/sms-assistant/scripts/reply "hi"')
+
+    def test_send_sms_after_cd_is_a_send(self):
+        assert _is_send_command(
+            'cd ~/x && ~/.claude/skills/sms-assistant/scripts/send-sms "+1" "hi"')
+
+    def test_chained_non_send_is_still_not_a_send(self):
+        assert not _is_send_command("cd ~/dispatch && git status")
+        assert not _is_send_command("cd /tmp && ls -la | grep foo")

@@ -62,12 +62,17 @@ class TestSDKSessionModel:
         )
 
         opts = session._build_options()
-        assert opts.model == "haiku"
+        # Asserts the RESOLVED id, not the alias. These asserted "haiku"/"opus"
+        # from before _resolve_model_and_betas existed, so they failed on every
+        # run regardless of which model was configured — a permanently-red test
+        # cannot catch a model regression.
+        assert opts.model == "claude-haiku-4-5"
 
     async def test_session_opus_in_options(self, sdk_session):
         """Default opus model should be in options."""
         opts = sdk_session._build_options()
-        assert opts.model == "opus"
+        from assistant.sdk_session import _MODEL_ALIASES
+        assert opts.model == _MODEL_ALIASES["opus"]
 
 
 @pytest.mark.asyncio

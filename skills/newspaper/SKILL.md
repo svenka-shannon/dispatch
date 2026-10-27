@@ -416,3 +416,7 @@ This applies to **all content types** — headlines, body text, sidebar items, t
 - Optimized for 1100px width but responsive
 - Print-friendly — light background, dark text, serif fonts
 - The reference design is "The Foreman Dispatch" — a project status newspaper
+
+## The Svenka Times (nightly gazette on this box)
+
+The nightly `nightly-sventimes` task (2:40am ET) writes a system-activity gazette using this design language. Pipeline lives in `~/code/svenka-times` (see its README): `gather-daily-data` → `archive-edition` → fill `template.html` → `verify-opsec` → `deploy.sh` (public svenka-pages folder `times`). Upstream's version targets `~/code/svenflow.ai`, which is a private repo not available here, so don't point the task back at it.

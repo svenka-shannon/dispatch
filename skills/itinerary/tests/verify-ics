@@ -1,0 +1,148 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["icalendar>=6", "vobject"]
+# ///
+"""Regression test: prove the .ics the skill emits is really valid.
+
+Python's stdlib has no iCalendar parser, so this round-trips the output through
+two independent third-party implementations (icalendar and vobject) and asserts
+the byte-level RFC 5545 rules the writer is supposed to satisfy.
+
+    ~/.claude/skills/itinerary/tests/verify-ics
+
+Generates an .ics from examples/tokyo-2026.yaml and checks it. Exits nonzero on
+any failure. These deps are test-only; the itinerary CLI itself needs only PyYAML.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import icalendar
+import vobject
+
+SKILL = Path(__file__).resolve().parent.parent
+CLI = SKILL / "scripts" / "itinerary"
+PLAN = SKILL / "examples" / "tokyo-2026.yaml"
+
+failures: list[str] = []
+
+
+def check(name: str, ok: bool, detail: str = "") -> None:
+    print(f"  {'ok  ' if ok else 'FAIL'} {name}" + (f"  -> {detail}" if detail and not ok else ""))
+    if not ok:
+        failures.append(name)
+
+
+def main() -> int:
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "trip.ics"
+        subprocess.run(
+            [str(CLI), "ics", str(PLAN), "--out", str(out),
+             "--dtstamp", "2026-08-22T12:00:00Z"],
+            check=True, stdout=subprocess.DEVNULL,
+        )
+        raw = out.read_bytes()
+
+    print(f"verifying {len(raw)} bytes generated from {PLAN.name}")
+
+    # --- byte-level RFC 5545 rules -----------------------------------------
+    lines = raw.split(b"\r\n")
+    check("file ends with CRLF", raw.endswith(b"\r\n"))
+    check("no bare LF", raw.replace(b"\r\n", b"").count(b"\n") == 0)
+    check("no bare CR", raw.replace(b"\r\n", b"").count(b"\r") == 0)
+    long_lines = [(i, len(l)) for i, l in enumerate(lines) if len(l) > 75]
+    check("every line <= 75 octets", not long_lines, str(long_lines[:5]))
+    check("BEGIN:VCALENDAR first", lines[0] == b"BEGIN:VCALENDAR")
+    check("END:VCALENDAR last", lines[-2] == b"END:VCALENDAR")
+    for i, line in enumerate(lines):
+        try:
+            line.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            check(f"line {i} is valid utf-8 (fold split a character)", False, str(exc))
+            break
+    else:
+        check("no fold splits a utf-8 character", True)
+    # Unfolding is defined as removing CRLF + exactly one following space, so a
+    # fold that lands on a space in the source text is legal (the second space is
+    # content). Assert the property that actually matters: unfolded content lines
+    # all look like "NAME[;params]:value".
+    unfolded = raw.decode("utf-8").replace("\r\n ", "").rstrip("\r\n").split("\r\n")
+    malformed = [l for l in unfolded if ":" not in l.split(";")[0] and ":" not in l]
+    check("every unfolded line is a content line", not malformed, str(malformed[:3]))
+    check("a fold landing on a space round-trips exactly",
+          "DESCRIPTION:Allow 90 min of travel plus buffer\\; be at the gate well "
+          "before 18:05." in unfolded)
+
+    # --- parser #1: icalendar ----------------------------------------------
+    cal = icalendar.Calendar.from_ical(raw.decode("utf-8"))
+    events = list(cal.walk("VEVENT"))
+    check("icalendar parses the file", True)
+    check("has events", len(events) > 0, str(len(events)))
+    check("VERSION is 2.0", str(cal.get("VERSION")) == "2.0")
+    check("PRODID present", bool(cal.get("PRODID")))
+    uids = [str(e["UID"]) for e in events]
+    check("UIDs unique", len(set(uids)) == len(uids), f"{len(uids)} events")
+    check("every event has DTSTAMP", all("DTSTAMP" in e for e in events))
+    check("every event has DTSTART", all("DTSTART" in e for e in events))
+    check("every event has SUMMARY", all("SUMMARY" in e for e in events))
+    bad = [str(e["SUMMARY"]) for e in events if e["DTEND"].dt <= e["DTSTART"].dt]
+    check("every event ends after it starts", not bad, str(bad))
+
+    # --- parser #2: vobject -------------------------------------------------
+    vcal = vobject.readOne(raw.decode("utf-8"))
+    check("vobject parses the file", True)
+    check("vobject agrees on event count",
+          len(vcal.contents.get("vevent", [])) == len(events))
+
+    # --- semantics ----------------------------------------------------------
+    tokyo = ZoneInfo("Asia/Tokyo")
+    la = ZoneInfo("America/Los_Angeles")
+    by_summary = {str(e["SUMMARY"]): e for e in events}
+
+    e = by_summary["Land HND + immigration & baggage"]
+    start = e["DTSTART"].dt
+    check("timed DTSTART is stored as UTC", start.utcoffset() == dt.timedelta(0), str(start))
+    check("13:55 Asia/Tokyo round-trips",
+          start.astimezone(tokyo) == dt.datetime(2026, 8, 27, 13, 55, tzinfo=tokyo),
+          str(start.astimezone(tokyo)))
+    check("shows as 2026-08-26 21:55 for a Los Angeles reader",
+          start.astimezone(la) == dt.datetime(2026, 8, 26, 21, 55, tzinfo=la),
+          str(start.astimezone(la)))
+
+    e = by_summary["Nissan Crossing"]
+    check("Nissan Crossing is 16:45-17:45 JST",
+          (e["DTSTART"].dt.astimezone(tokyo).strftime("%H:%M"),
+           e["DTEND"].dt.astimezone(tokyo).strftime("%H:%M")) == ("16:45", "17:45"))
+    check("LOCATION unescapes to the literal address",
+          str(e["LOCATION"]) == "Ginza Place, 5-8-1 Ginza, Chuo-ku, Tokyo",
+          str(e["LOCATION"]))
+    check("URL is not backslash-escaped",
+          str(e["URL"]) == "https://www.nissan.co.jp/crossing/", str(e.get("URL")))
+    check("DESCRIPTION carries notes and url",
+          "Free, no reservation" in str(e["DESCRIPTION"])
+          and "https://www.nissan.co.jp/crossing/" in str(e["DESCRIPTION"]))
+
+    e = by_summary["Return to Tokyo — hotel re-check-in"]
+    d = e["DTSTART"].dt
+    check("all-day DTSTART is a bare DATE",
+          isinstance(d, dt.date) and not isinstance(d, dt.datetime), repr(d))
+    check("all-day DTSTART is 2026-09-07", d == dt.date(2026, 9, 7))
+    check("all-day DTEND is the exclusive next day", e["DTEND"].dt == dt.date(2026, 9, 8))
+    check("em dash survives folding", "—" in str(e["SUMMARY"]), str(e["SUMMARY"]))
+
+    print()
+    if failures:
+        print(f"FAIL — {len(failures)} check(s) failed: {', '.join(failures)}")
+        return 1
+    print("PASS — .ics verified by icalendar and vobject")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

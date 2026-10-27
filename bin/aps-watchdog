@@ -1,0 +1,64 @@
+#!/bin/bash
+# aps-watchdog — mitigate deferred inbound iMessage delivery.
+#
+# ROOT CAUSE (see POSTMORTEMS.md 2026-09-08): apsd's socket to push.apple.com:5223
+# is RST by the wifi/NAT path. apsd's negotiated keepalive is 1560s (26 min), so it
+# sits blind on a dead socket while Apple QUEUES inbound messages. Every STALENESS
+# spike lands ~0.5s after an APS reconnect; worst observed 24m59s, just under 1560s.
+#
+# REAL FIX (needs sudo, not available until the owner is back at the machine):
+#   sudo sysctl -w net.inet.tcp.always_keepalive=1 net.inet.tcp.keepidle=180000
+#
+# THIS STOPGAP: cycling wifi forces apsd to notice the dead socket and reconnect,
+# flushing Apple's queue. Recovery measured at ~4s. To avoid thrashing the network
+# overnight it only fires when a conversation is ACTIVE (traffic in the last 30 min)
+# but inbound has gone quiet (>6 min) — i.e. exactly the stall that hurts.
+
+DB="file:$HOME/Library/Messages/chat.db?mode=ro"
+LOG="$HOME/dispatch/logs/aps-watchdog.log"
+IFACE=en1
+ACTIVE_WINDOW=1800   # conversation counts as live if any traffic in 30 min
+QUIET_INBOUND=360    # inbound silent 6 min
+COOLDOWN=480         # never bounce more than once per 8 min
+LAST_BOUNCE=0
+LAST_QUERY_ERR=0
+
+mkdir -p "$(dirname "$LOG")"
+log(){ echo "$(date '+%Y-%m-%d %H:%M:%S') | $*" >> "$LOG"; }
+log "started (pid $$)"
+
+while true; do
+  NOW=$(date +%s)
+  # NOTE 2026-09-25: this ran for 17 days under a LaunchAgent and never bounced
+  # once, through dozens of qualifying stalls. /bin/bash spawned by launchd has
+  # no Full Disk Access, so sqlite3 cannot open chat.db — and the old
+  # `2>/dev/null` hid that. Failures are now logged (rate-limited) instead.
+  LAST_IN=$(sqlite3 "$DB" "SELECT CAST(MAX(date)/1000000000 + 978307200 AS INT) FROM message WHERE is_from_me=0;" 2>"$LOG.sqlite-err")
+  LAST_OUT=$(sqlite3 "$DB" "SELECT CAST(MAX(date)/1000000000 + 978307200 AS INT) FROM message WHERE is_from_me=1;" 2>>"$LOG.sqlite-err")
+  if [ -z "$LAST_IN" ] || [ -z "$LAST_OUT" ]; then
+    if [ $(( NOW - LAST_QUERY_ERR )) -gt 3600 ]; then
+      log "ERROR: cannot read chat.db (LAST_IN='$LAST_IN' LAST_OUT='$LAST_OUT'): $(head -c 300 "$LOG.sqlite-err" | tr '\n' ' ') — this process needs Full Disk Access; nothing will ever bounce"
+      LAST_QUERY_ERR=$NOW
+    fi
+  fi
+
+  if [ -n "$LAST_IN" ] && [ -n "$LAST_OUT" ]; then
+    NEWEST=$LAST_IN; [ "$LAST_OUT" -gt "$NEWEST" ] && NEWEST=$LAST_OUT
+    SINCE_ANY=$(( NOW - NEWEST ))
+    SINCE_IN=$(( NOW - LAST_IN ))
+    SINCE_BOUNCE=$(( NOW - LAST_BOUNCE ))
+
+    if [ "$SINCE_ANY" -lt "$ACTIVE_WINDOW" ] && [ "$SINCE_IN" -gt "$QUIET_INBOUND" ] && [ "$SINCE_BOUNCE" -gt "$COOLDOWN" ]; then
+      log "BOUNCE: conversation active (${SINCE_ANY}s) but inbound quiet ${SINCE_IN}s — cycling $IFACE"
+      networksetup -setairportpower "$IFACE" off 2>>"$LOG"
+      networksetup -setairportpower "$IFACE" on  2>>"$LOG"
+      for i in $(seq 1 30); do
+        ping -c1 -t2 1.1.1.1 >/dev/null 2>&1 && break
+        sleep 1
+      done
+      log "BOUNCE: network back after ${i}s"
+      LAST_BOUNCE=$(date +%s)
+    fi
+  fi
+  sleep 60
+done

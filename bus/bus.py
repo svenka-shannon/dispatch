@@ -979,7 +979,13 @@ class Producer:
 
                 if total_deleted > 0:
                     prune_conn.execute("PRAGMA incremental_vacuum")
-                    prune_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    # PASSIVE, not TRUNCATE: a TRUNCATE checkpoint blocks ALL new
+                    # writers while it waits (up to busy_timeout=30s) for readers
+                    # to leave the WAL. Every ~3.5h this made the bus writer, task
+                    # consumer and ConsumerRunner time out together with
+                    # 'database is locked' right as auto-prune finished
+                    # (consumer.crashed events, Oct 2026). PASSIVE never blocks.
+                    prune_conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
                     logger.info("Auto-prune: deleted %d record(s), archived %d",
                                 total_deleted, total_archived)
 

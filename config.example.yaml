@@ -97,3 +97,15 @@ ruview:
     ws_port: 8766
     udp_port: 5005
     bind_addr: "0.0.0.0"
+
+screen_lock:
+  # The daemon probes the macOS lock screen every minute (bin/screen-lock). A
+  # locked screen blinds chrome-control, Messages.app and Accessibility
+  # automation. When it finds the Mac locked it types the login password from
+  # Keychain into the lock screen and SMSes the admin if that fails or if the
+  # password is not stored. Store it once, on the Mac itself:
+  #   security add-generic-password -a "$USER" -s mac-login-password -w -U
+  # harden: true additionally turns off "require password after sleep / screen
+  # saver" and the idle screen saver so the lock never re-arms. That is a
+  # security trade-off (the Mac stops asking for a password) — off by default.
+  harden: false

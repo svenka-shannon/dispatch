@@ -132,6 +132,8 @@ The discovery subagent:
 
 For each raw idea from discovery (new skills, skill improvements, AND skill merges), spawn a **refinement subagent** (use `model="sonnet"`) in parallel.
 
+**Run them in the FOREGROUND, all in ONE message** (one assistant turn containing every Task call, so they run concurrently and you get all results back in that turn). Never set `run_in_background`, and never use `ScheduleWakeup` or `/loop` to wait for them, ESPECIALLY in nightly mode. The nightly run is an ephemeral task session. On 2026-10-18 the run used background subagents plus `ScheduleWakeup`, and the task runner idle-killed it mid-pipeline. The admin SMS was never sent, but the run still reported success.
+
 #### For new skill ideas, each refinement subagent:
 
 1. **Checks existing skills** — reads `sed -n '/^---$/,/^---$/p' ~/.claude/skills/*/SKILL.md` to get frontmatter for all existing skills. Decides: is this idea already covered?
@@ -257,7 +259,18 @@ All proposal types go in the same `proposals` array, distinguished by their `typ
 - Show merge proposals with: skills to merge, proposed name, rationale, migration plan
 - For each, end with: `To merge: "merge [skill-a] and [skill-b] into [proposed-name]"`
 
-**Nightly mode** (prompt contains "--nightly"): Send the FULL report via SMS to admin so they can approve/deny when they wake up. Include everything — don't summarize or truncate:
+**Nightly mode** (prompt contains "--nightly"): The admin must be able to approve/deny from their phone, with the FULL report available, but **never as one giant SMS**. Eric has complained about text walls repeatedly, and `reply` blocks long messages for this reason. Do NOT use `--long` for the report. On 2026-10-14 a run did, and sent a ~4,000-char wall. The 2026-10-13 run did it right: one line plus images.
+
+Delivery. Follow this order exactly, and do the persistence steps before any rendering or sending:
+1. **Persist first:** save the run to `~/dispatch/state/skillify-proposals.json` (above), then publish the bus `scan.completed` event (see "Persist Results to Bus" below). That way the results survive even if the session dies during rendering or sending.
+2. Write the full report (format below) to `/tmp/skillify-$RUN_ID.md`.
+3. Render it: `~/.claude/skills/md2img/scripts/md2img /tmp/skillify-$RUN_ID.md /tmp/skillify-$RUN_ID.png --width 800`. If the report is long, split it into one file per section and render each, so the images stay readable on a phone.
+4. **Send LAST:** send ONE short text (≤220 chars) with the counts and the single most important item, and attach the image(s). Run it from the admin's transcript dir:
+   `cd ~/transcripts/imessage/<admin_sanitized_id> && ~/.claude/skills/sms-assistant/scripts/reply "🔧 skillify: N new, M fixes. top: <one line>. reply 'apply X fix' / 'build X'" --image /tmp/skillify-$RUN_ID.png` `reply` takes only ONE `--image`, so send each extra page as its own `reply --image /tmp/skillify-$RUN_ID-2.png` (image-only sends are exempt from the burst/length guards).
+5. **Verify the send:** if the `reply` output does not contain `SENT`, retry that send once. If the retry also fails, say so plainly in your final message.
+6. Never end a turn with "Next I'll…" or "Now I'll…" before the send has happened. In nightly mode, nobody will prompt you again. The task runner treats a quiet session as finished and reports a notify task that never sent as `task.failed`. Do all the steps in one continuous run, and finish only after the send succeeds.
+
+Full report format (goes in the image, not the text):
 
 ```
 🔧 skillify nightly — N new skills, M improvements, K merges
@@ -306,13 +319,13 @@ Reply "build idea-name" to create it.
 - idea-name — [reason]
 ```
 
-Show the FULL details for each proposal. The admin needs enough context to make approve/deny decisions without opening a laptop.
+Show the FULL details for each proposal in the rendered report. The admin needs enough context to make approve/deny decisions without opening a laptop. The SMS text itself stays one line.
 
 **IMPORTANT: Do NOT create or modify any skill files. Propose only.**
 
 #### Persist Results to Bus
 
-**After generating the report (in ALL modes)**, publish a `scan.completed` event to the bus for historical tracking:
+**In ALL modes**, publish a `scan.completed` event to the bus for historical tracking. In nightly mode, publish it right after saving `skillify-proposals.json` and **before** rendering or sending (see the Delivery order above):
 
 ```bash
 RUN_ID=$(date +%Y%m%d-%H%M)

@@ -51,6 +51,13 @@ FATAL_PATTERNS: list[tuple[str, str]] = [
     (r"Failed to authenticate", "auth_error"),
     (r"OAuth (?:session|token) (?:has )?expired", "auth_error"),
     (r"\"billing_error\"", "billing_error"),
+    # Exhausted-retry network failure: the SDK retries ~10x over ~6 min before
+    # emitting this, so by the time it appears the turn is dead. First hit gets
+    # a resume restart (transient drops recover); a repeat within the fast-heal
+    # repeat-fatal window escalates to clean restart — a large context can
+    # exceed what a degraded uplink can upload, and resuming re-sends the same
+    # doomed payload forever (2026-09-18 incident).
+    (r"API Error: Connection dropped", "connection_dropped"),
 ]
 
 # Compiled for performance (called every 60s across all sessions)

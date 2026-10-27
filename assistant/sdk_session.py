@@ -96,16 +96,88 @@ _SEND_SCRIPT_PATTERNS = (
     "/scripts/reply-sven",
 )
 
+# NOTE: deliberately does NOT split on a bare pipe. TestIsSendCommandAdversarial
+# ::test_pipe_to_send asserts `echo hello | /scripts/send-sms` must NOT count,
+# and that contract predates this fix. The bug being fixed here is `cd X && send`
+# and `cd X; send` — pipe behaviour is left exactly as it was.
+_SHELL_SEGMENT_RE = re.compile(r"&&|\|\||;|\n")
+_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+# Matches a heredoc introducer: <<EOF, <<-EOF, <<'EOF', <<"EOF"
+_HEREDOC_RE = re.compile(r"<<-?\s*([\"\']?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+
+def _strip_heredoc_bodies(cmd: str) -> str:
+    """Remove heredoc bodies so their CONTENT is never parsed as shell.
+
+    2026-09-24: _is_send_command splits on newlines, so every line of a
+    heredoc body was treated as its own shell segment. Any body line starting
+    with a send-script path registered a phantom send -- and that is exactly
+    what we write when documenting or testing the send CLIs. Measured on the
+    live bus: writing this module's own test file emitted a real
+    `message.sent` event. The test for the detector tripped the detector.
+
+    Direction of harm: a phantom send advances `last_send_at`, which SUPPRESSES
+    the unanswered-inbound watchdog -- a real user message can go unanswered
+    with no nudge. It fails quiet, so it errs the dangerous way.
+
+    Keeps the introducer line (the real command lives there) and drops body
+    lines up to the terminator. Unterminated heredocs drop to end-of-string,
+    matching how the shell would consume them.
+    """
+    lines = (cmd or "").split("\n")
+    out, i = [], 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)           # keep the introducer -- it holds the command
+        m = _HEREDOC_RE.search(line)
+        i += 1
+        if not m:
+            continue
+        terminator = m.group(2)
+        while i < len(lines) and lines[i].strip() != terminator:
+            i += 1                 # drop body line
+        if i < len(lines):
+            i += 1                 # drop the terminator line itself
+    return "\n".join(out)
+
+
 def _is_send_command(cmd: str) -> bool:
     """Check if a Bash command is a message send.
 
-    Matches the executable (first token) against known send script paths.
-    Strips outer quotes to extract the command path.
+    Checks the first executable of EVERY shell segment, not just the first
+    token of the whole command.
+
+    2026-09-23: this used to read only `cmd.split()[0]`. The documented way to
+    send is `cd ~/transcripts/<backend>/<chat> && .../reply "..."` — the reply
+    CLI infers the chat_id from cwd — so the first token is almost always `cd`
+    and virtually every real send was invisible here. `last_send_at` therefore
+    never advanced, and the unanswered-inbound watchdog fired "you have not sent
+    ANY reply" at a session that had just replied twice. A false nudge like that
+    is not harmless: it invites re-sending a message the user already received,
+    which is the duplicate-texting Eric complained about the same day.
     """
-    # Extract first token (the executable), stripping quotes
-    stripped = cmd.strip().strip('"').strip("'")
-    first_token = stripped.split()[0] if stripped else ""
-    return any(first_token.endswith(pattern) for pattern in _SEND_SCRIPT_PATTERNS)
+    # 2026-10-01: sessions routinely alias the CLI first — `R=~/.../reply; $R "msg"` — so the
+    # executable token is `$R`. Track simple VAR=value assignments and expand them, or every
+    # aliased send is invisible and the unanswered-inbound watchdog nudges a session that
+    # already replied (it fired twice in 30 min that night).
+    aliases: dict[str, str] = {}
+    for segment in _SHELL_SEGMENT_RE.split(_strip_heredoc_bodies(cmd)):
+        tokens = segment.strip().split()
+        i = 0
+        while i < len(tokens) and _ENV_ASSIGN_RE.match(tokens[i]):
+            name, _, value = tokens[i].partition("=")
+            aliases[name] = value.strip('"').strip("'")
+            i += 1  # skip VAR=value prefixes
+        if i >= len(tokens):
+            continue
+        first = tokens[i].strip('"').strip("'")
+        m = re.fullmatch(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", first)
+        if m:
+            first = aliases.get(m.group(1), first)
+        if any(first.endswith(pattern) for pattern in _SEND_SCRIPT_PATTERNS):
+            return True
+    return False
 
 log = logging.getLogger(__name__)
 
@@ -127,10 +199,43 @@ _AUTH_FAILURE_RE = re.compile(
 )
 
 _MODEL_ALIASES = {
-    "opus": "claude-opus-5",
+    # 2026-09-24: Opus 5.5 (released 09-22). Cheaper than Opus 5 ($20/MTok out
+    # vs $25), faster, and beats Fable on many benchmarks. REQUIRES Claude Code
+    # >= 2.1.280 — on 2.1.252 the API returns 400 "does not support this model".
+    # Verified end-to-end with `claude -p --model claude-opus-5-5` BEFORE this
+    # edit; testing after would have broken every session at once.
+    "opus": "claude-opus-5-5",
     "sonnet": "claude-sonnet-4-6",
     "haiku": "claude-haiku-4-5",
 }
+
+
+# Sender tiers whose group messages never obligate a reply. Bots chatter among
+# themselves and unknown senders are ignored by policy, so silence after them is
+# the correct outcome, not an abandoned question (2026-10-18: Sven's "glad you
+# like it" in a 4-way group drove a nudge loop on Svenka).
+_NO_REPLY_GROUP_TIERS = frozenset({"bots", "unknown"})
+_GROUP_TIER_RE = re.compile(r"\[TIER: ([^\]]+)\]---\s*$")
+
+
+def _counts_as_unanswered_inbound(text: str) -> bool:
+    """True if this inject is a correspondent message the session owes a reply to.
+
+    Individual SMS always count. Group messages count unless the sender's tier
+    is bots/unknown. The tier comes from the daemon-written header line (first
+    line of the envelope); correspondent text cannot forge it (common.py
+    neutralizes envelope markers in message bodies).
+    """
+    stripped = text.lstrip()
+    if stripped.startswith("---SMS FROM"):
+        return True
+    if not stripped.startswith("---GROUP SMS"):
+        return False
+    header = stripped.split("\n", 1)[0]
+    m = _GROUP_TIER_RE.search(header)
+    if m and m.group(1).strip().lower() in _NO_REPLY_GROUP_TIERS:
+        return False
+    return True
 
 
 def _resolve_model_and_betas(model: str) -> tuple[str, list[str]]:
@@ -242,7 +347,28 @@ class SDKSession:
         self.last_tool_activity_at: Optional[datetime] = None  # When last ToolResultBlock received
         self._error_count = 0
         self._consecutive_error_turns = 0
+        self._last_dropped_reply_notice_ts = 0.0
         self.last_assistant_text: str | None = None
+        # Live API-retry stall tracking: the SDK streams an api_retry
+        # SystemMessage per retry attempt, minutes before it finally gives up
+        # with "Connection dropped". fast_health_check reads these to abort a
+        # doomed turn early instead of waiting out the SDK's full retry loop
+        # (2026-09-19: 6-12 min silent gaps on a degraded uplink).
+        self.api_retry_streak = 0
+        self.last_api_retry_at: Optional[datetime] = None
+        # Unanswered-inbound tracking for the stuck-session watchdog: a real
+        # correspondent message (SMS/GROUP envelope) with no send-script call
+        # after it means the contact is waiting on a reply that never went out
+        # (2026-09-23: 82 min of silence on a package question — the turn
+        # completed "waiting on" a background run and nothing re-invoked it).
+        self.last_sms_inject_at: Optional[datetime] = None
+        self.last_send_at: Optional[datetime] = None
+        # Last inject that was NOT a watchdog nudge. The watchdog uses this (with
+        # last_send_at) to decide whether the session made real progress since
+        # its last nudge. last_activity can't be used: handling the nudge itself
+        # refreshes it, which reset the 3-nudge cap on every nudge (2026-10-18:
+        # 5+ nudges, every one logged "1/3", on a group with nothing to answer).
+        self.last_non_nudge_inject_at: Optional[datetime] = None
 
         # Heartbeat tracking
         self._last_heartbeat_at: float = time.time()
@@ -265,8 +391,28 @@ class SDKSession:
         self._block_limit_notified: bool = False
         self._block_limit_until: Optional[datetime] = None  # When the limit resets
 
+        # Outage briefing: set ONLY by an explicit auth-failure signal (never by
+        # idleness — see assistant/outage.py rule 1), cleared by the first
+        # successful turn. While set, the next turn is prefixed with a factual
+        # note about the downtime so the model can perceive its own hole.
+        self._outage_started_at: Optional[datetime] = None
+        self._outage_cause: str = "auth failure"
+
         # Tool execution timing: maps tool_use_id -> (start_time, tool_input, tool_name)
         self._pending_tools: dict[str, tuple[float, dict, str]] = {}
+
+        # In-flight work the queue counter (_pending_queries) can't see.
+        # 2026-10-18: nightly skillify was idle-killed mid-pipeline 126s after
+        # its last ResultMessage. Its Task subagents finished in the background
+        # and the CLI woke the model on its own (task_notification -> init ->
+        # tool calls) — none of that went through the queue, so is_busy was
+        # False and last_activity was frozen at the previous ResultMessage.
+        # _turn_in_progress: a turn started (init/assistant output) and has no
+        # ResultMessage yet. _background_tasks: task_started ids without a
+        # matching task_notification (task_id -> time.monotonic() at start).
+        self._turn_in_progress: bool = False
+        self._background_tasks: dict[str, float] = {}
+        self.last_result_is_error: Optional[bool] = None
 
         # Per-session logger
         from assistant.common import get_session_name
@@ -325,6 +471,18 @@ class SDKSession:
         self._client = ClaudeSDKClient(options=options)
         await self._client.connect()
         self.running = True
+        # A flag left behind by a previous daemon process means the outage began
+        # before this session object existed — seed the window so the briefing
+        # spans the whole gap rather than starting at "now".
+        if self._outage_started_at is None and AUTH_FAILURE_FLAG.exists():
+            try:
+                from assistant import outage
+                self._outage_started_at = (
+                    outage.auth_outage_start(self._session_name)
+                    or outage.read_flag_started_at()
+                )
+            except Exception as e:
+                self._log.warning(f"OUTAGE_SEED_FAILED | {e}")
         self._task = asyncio.create_task(self._run_loop())
         self._log.info(f"SESSION_START | resume={resume_session_id} | tier={self.tier}")
         log.info(f"[{self.contact_name}] SDK session started (resume={resume_session_id})")
@@ -390,6 +548,15 @@ class SDKSession:
             await self._message_queue.put(QueueItem(None, "__SHUTDOWN__"))
             return
 
+        # Track real inbound correspondent messages (vs admin/system injects) so
+        # the stuck-session watchdog can detect an inbound that never got any
+        # outbound send ("unanswered" detection). The daemon alone writes these
+        # envelope headers; correspondent text is neutralized (common.py).
+        if _counts_as_unanswered_inbound(text):
+            self.last_sms_inject_at = datetime.now()
+        if not text.lstrip().startswith("---SYSTEM NUDGE"):
+            self.last_non_nudge_inject_at = datetime.now()
+
         # Write-ahead: persist to bus BEFORE memory queue
         # Bus failure is non-fatal — degrade to memory-only (pre-fix behavior)
         message_id = str(uuid4())
@@ -418,6 +585,53 @@ class SDKSession:
     @property
     def is_busy(self) -> bool:
         return self._pending_queries > 0
+
+    # A background task with no task_notification after this long is presumed
+    # lost (e.g. CLI restarted) so it can't pin a session "busy" forever.
+    BACKGROUND_TASK_STALE_SECS = 3600
+
+    @property
+    def active_background_tasks(self) -> int:
+        """Count of SDK background tasks started but not yet notified (non-stale)."""
+        now = time.monotonic()
+        return sum(
+            1 for started in self._background_tasks.values()
+            if now - started < self.BACKGROUND_TASK_STALE_SECS
+        )
+
+    @property
+    def has_inflight_work(self) -> bool:
+        """True if the session is mid-work in any way we can observe.
+
+        Broader than is_busy (queued queries only): also covers a turn the CLI
+        started on its own (background-task wake-up) and background subagents /
+        shells whose completion notification hasn't arrived yet. Used by the
+        ephemeral task supervisor before idle-cleanup.
+        """
+        return (self.is_busy or self._turn_in_progress
+                or self.active_background_tasks > 0)
+
+    def _track_inflight(self, message) -> None:
+        """Update turn / background-task state from an SDK message."""
+        if isinstance(message, ResultMessage):
+            self._turn_in_progress = False
+            return
+        if isinstance(message, AssistantMessage):
+            self._turn_in_progress = True
+            return
+        if isinstance(message, SystemMessage):
+            subtype = getattr(message, "subtype", None)
+            data = message.data if isinstance(getattr(message, "data", None), dict) else {}
+            if subtype == "init":
+                self._turn_in_progress = True
+            elif subtype == "task_started":
+                tid = getattr(message, "task_id", None) or data.get("task_id")
+                if tid:
+                    self._background_tasks[tid] = time.monotonic()
+            elif subtype == "task_notification":
+                tid = getattr(message, "task_id", None) or data.get("task_id")
+                if tid:
+                    self._background_tasks.pop(tid, None)
 
     @property
     def is_block_limited(self) -> bool:
@@ -468,6 +682,19 @@ class SDKSession:
         turn (any session) or by the probe once the keychain shows a fresh token.
         """
         self._log.error(f"AUTH_FAILURE | {text}")
+        # Open the outage window on the FIRST failure of the run. Reconstruct it
+        # from the bus (earliest failure since our last clean turn) so repeated
+        # failures don't keep shrinking the window to "just now".
+        if self._outage_started_at is None:
+            try:
+                from assistant import outage
+                self._outage_started_at = (
+                    outage.auth_outage_start(self._session_name)
+                    or datetime.now().astimezone()
+                )
+            except Exception:
+                self._outage_started_at = datetime.now().astimezone()
+            self._outage_cause = "auth failure"
         try:
             AUTH_FAILURE_FLAG.write_text(json.dumps({
                 "ts": datetime.now().astimezone().isoformat(),
@@ -489,6 +716,37 @@ class SDKSession:
             AUTH_FAILURE_FLAG.unlink(missing_ok=True)
         except OSError:
             pass
+
+    def _prepend_outage_briefing(self, msg: str) -> str:
+        """Prefix the next turn with a factual note about downtime we just had.
+
+        Runs BEFORE client.query() on purpose: the model must see the outage in
+        the SAME turn as the message that references it. Injecting a separate
+        follow-up message would arrive one turn too late — which is exactly how
+        "Login fixed" got misread on 2026-08-31.
+
+        The window is NOT closed here. Turns attempted while auth is still
+        broken die in ~50ms, so the briefing has to survive until a turn
+        actually succeeds; _handle_message closes it on the first clean
+        ResultMessage. Re-prefixing a few doomed turns costs nothing.
+        """
+        if self._outage_started_at is None or msg == "__SHUTDOWN__":
+            return msg
+        try:
+            from assistant import outage
+            briefing = outage.render_briefing(
+                chat_id=self.chat_id,
+                session_name=self._session_name,
+                started_at=self._outage_started_at,
+                cause=self._outage_cause,
+            )
+        except Exception as e:
+            self._log.warning(f"OUTAGE_BRIEFING_FAILED | {e}")
+            return msg
+        if not briefing:
+            return msg
+        self._log.info(f"OUTAGE_BRIEFING | since={self._outage_started_at.isoformat()}")
+        return f"{briefing}\n\n{msg}"
 
     def _maybe_handle_oauth_quota_error(self, error_text: str) -> bool:
         """If error_text indicates OAuth quota exhaustion, switch to API key.
@@ -639,6 +897,7 @@ class SDKSession:
 
                 try:
                     assert self._client is not None
+                    msg = self._prepend_outage_briefing(msg)
                     await self._client.query(msg)
                     # Log wake latency - time from queue get to query completion
                     wake_ms = (time.time() - wake_start) * 1000
@@ -702,6 +961,14 @@ class SDKSession:
         try:
             assert self._client is not None
             async for message in self._client.receive_messages():
+                # Any SDK output (stream/system events, tool results, task
+                # notifications, background wake-up turns) is activity — not
+                # just ResultMessage. Idle cleanup keys off last_activity.
+                self.last_activity = datetime.now()
+                try:
+                    self._track_inflight(message)
+                except Exception as e:  # never let bookkeeping kill the receiver
+                    self._log.warning(f"INFLIGHT_TRACK_ERROR | {e}")
                 await self._handle_message(message)
                 # Refresh busy flag periodically so updated_at stays fresh
                 # during long operations (prevents staleness guard false negatives)
@@ -1115,6 +1382,98 @@ class SDKSession:
         except Exception:
             return None
 
+    async def _notify_if_reply_dropped(self, message):
+        """An errored turn usually sends the user NOTHING. Tell them.
+
+        Measured 2026-09-21 across this machine's full bus history:
+            errored turns: 49 sent no outbound message,  9 replied
+            clean   turns: 17 sent no outbound message, 88 replied
+        ~84% of errored turns end in total silence and nothing retries -- the
+        silence only ends when the human gives up and re-pings. That is 23,339s
+        (6.5 h) of dead air and the single largest component of the user's
+        "why are you unresponsive" complaint. Clean turns are the mirror image
+        (84% do reply), so the signal is sharp, not noise.
+
+        Ground truth for "did we reply" is chat.db, NOT any in-process counter:
+        the agent replies by shelling out to the reply/send-sms CLI, so this
+        object never observes the send.
+        """
+        import sqlite3
+        now = time.time()
+        # Debounce. On 2026-09-18 78% of turns errored; that must not become an
+        # SMS storm. At most one notice per 10 minutes per session.
+        if now - self._last_dropped_reply_notice_ts < 600:
+            return
+        # chat.db is iMessage ground truth only. A Signal 1:1 chat_id also
+        # starts with "+", so without this guard a Signal session would find no
+        # outbound row (its messages live in signal-cli, not chat.db), conclude
+        # the reply was dropped, and fire a false notice -- delivered over
+        # iMessage to a Signal contact. Latent today (no Signal sessions), real
+        # the moment one exists.
+        if (self.source or "imessage") != "imessage":
+            return
+        is_group = not str(self.chat_id).startswith("+")
+        try:
+            turn_start = now - ((message.duration_ms or 0) / 1000.0) - 5
+            chat_db = Path.home() / "Library" / "Messages" / "chat.db"
+            if not chat_db.exists():
+                return
+            conn = sqlite3.connect(f"file:{chat_db}?mode=ro", uri=True, timeout=5)
+            conn.execute("PRAGMA read_uncommitted=1")
+            apple_ns = int((turn_start - 978307200) * 1_000_000_000)
+            # 2026-09-24: this used to run the handle-join for EVERY session and
+            # bail out early on groups, so a dead turn in a group was silent.
+            # Sven's box has no such guard and its notices went to 3 group chats
+            # on sep 17 alone -- groups are where silence lasts longest, because
+            # everyone assumes someone else saw it.
+            #
+            # The guard could not simply be deleted: a hex group chat_id can
+            # never equal a handle `h.id`, so the handle-join returns no row for
+            # every group turn and would have claimed "nothing was sent" even
+            # when we had just replied. Groups need the chat join, same shape
+            # send-sms's verify_delivery already uses.
+            if is_group:
+                sql = (
+                    "SELECT 1 FROM message m "
+                    "JOIN chat_message_join cmj ON m.ROWID = cmj.message_id "
+                    "JOIN chat c ON c.ROWID = cmj.chat_id "
+                    "WHERE m.is_from_me = 1 AND c.chat_identifier = ? "
+                    "AND m.date >= ? LIMIT 1"
+                )
+            else:
+                sql = (
+                    "SELECT 1 FROM message m JOIN handle h ON m.handle_id = h.ROWID "
+                    "WHERE m.is_from_me = 1 AND h.id = ? AND m.date >= ? LIMIT 1"
+                )
+            row = conn.execute(sql, (self.chat_id, apple_ns)).fetchone()
+            conn.close()
+            if row is not None:
+                return  # we did reply inside this turn -- nothing was dropped
+        except Exception as e:
+            self._log.debug(f"DROPPED_REPLY_CHECK | skipped: {e}")
+            return
+
+        mins = round((message.duration_ms or 0) / 60000.0)
+        text = (
+            f"[!] my last turn failed after ~{mins} min without sending you "
+            f"anything. i'm not stuck - resend and i'll pick it up."
+        )
+        try:
+            send_sms = Path.home() / ".claude/skills/sms-assistant/scripts/send-sms"
+            proc = await asyncio.create_subprocess_exec(
+                str(send_sms), str(self.chat_id), text,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=30)
+            self._last_dropped_reply_notice_ts = now
+            self._log.warning(
+                f"DROPPED_REPLY_NOTICE | sent | turn_ms={message.duration_ms} "
+                f"| rc={proc.returncode}"
+            )
+        except Exception as e:
+            self._log.warning(f"DROPPED_REPLY_NOTICE | failed: {e}")
+
     async def _handle_message(self, message):
         """Handle messages from client.receive_response().
 
@@ -1200,6 +1559,7 @@ class SDKSession:
                         if tool_name == "Bash" and tool_input and not (block.is_error or False):
                             cmd = tool_input.get("command", "")
                             if _is_send_command(cmd):
+                                self.last_send_at = datetime.now()
                                 if self._producer:
                                     produce_event(self._producer, "messages", "message.sent", {
                                         "chat_id": self.chat_id,
@@ -1216,11 +1576,35 @@ class SDKSession:
                 self.session_id = message.session_id
             self.last_activity = datetime.now()
             self.last_response_at = datetime.now()  # Track for stuck detection
+            self.last_result_is_error = bool(message.is_error)
             if message.is_error:
                 self._consecutive_error_turns += 1
+                await self._notify_if_reply_dropped(message)
             else:
                 self._consecutive_error_turns = 0
                 self._clear_auth_failure_flag()
+                # A clean turn means the briefing (if any) landed in the model's
+                # context — close the window and record the recovery so the
+                # outage has an end timestamp on the bus, not just a start.
+                if self._outage_started_at is not None:
+                    started = self._outage_started_at
+                    ended = datetime.now().astimezone()
+                    self._outage_started_at = None
+                    self._log.info(
+                        f"OUTAGE_RECOVERED | {started.isoformat()} -> {ended.isoformat()}"
+                    )
+                    try:
+                        produce_event(self._producer, "sessions", "session.auth_recovered", {
+                            "session_name": self._session_name,
+                            "chat_id": self.chat_id,
+                            "contact_name": self.contact_name,
+                            "started_at": started.isoformat(),
+                            "ended_at": ended.isoformat(),
+                            "down_seconds": round((ended - started).total_seconds()),
+                        }, key=self._session_name, source="sdk_session")
+                    except Exception:
+                        pass
+            self.api_retry_streak = 0  # turn ended (either way) — stall is over
             self._log.info(
                 f"TURN | #{self.turn_count} | "
                 f"duration={message.duration_ms}ms | error={message.is_error} | "
@@ -1239,6 +1623,32 @@ class SDKSession:
             }, key=session_name, source="sdk")
             # Populate sdk_events table for tool-level observability
             if self._producer and hasattr(self._producer, 'send_sdk_event'):
+                # 2026-09-24: we recorded THAT a turn errored and never WHY.
+                # 58 errored turns on 09-18..20 all carry payload={}, so the
+                # only surviving question about the worst outage this system
+                # has had -- what the error actually said -- is unanswerable.
+                # manager.log can't fill it either (no lines for 09-18).
+                #
+                # duration_api_ms is the field that would have settled it: those
+                # 58 turns share a hard floor at 339.8s, and api vs wall time
+                # separates "the API call hung" from "we hung around it".
+                # Errors only, so this stays cheap on clean turns.
+                err_payload = None
+                if message.is_error:
+                    try:
+                        detail = {
+                            "subtype": getattr(message, "subtype", None),
+                            "stop_reason": getattr(message, "stop_reason", None),
+                            "duration_ms": message.duration_ms,
+                            "duration_api_ms": getattr(message, "duration_api_ms", None),
+                            "num_turns": message.num_turns,
+                            "result": (getattr(message, "result", None) or "")[:2000],
+                        }
+                        err_payload = json.dumps(
+                            {k: v for k, v in detail.items() if v not in (None, "")}
+                        )
+                    except Exception as e:          # never let telemetry kill a turn
+                        err_payload = json.dumps({"payload_error": str(e)[:200]})
                 self._producer.send_sdk_event(
                     session_name=session_name,
                     chat_id=self.chat_id,
@@ -1246,6 +1656,7 @@ class SDKSession:
                     duration_ms=message.duration_ms,
                     is_error=message.is_error or False,
                     num_turns=message.num_turns,
+                    payload=err_payload,
                 )
 
         elif isinstance(message, SystemMessage):
@@ -1254,4 +1665,8 @@ class SDKSession:
                 sid = message.data.get('session_id')
                 if sid and not self.session_id:
                     self.session_id = sid
-            self._log.info(f"SYSTEM | {getattr(message, 'subtype', 'unknown')}")
+            subtype = getattr(message, 'subtype', 'unknown')
+            if subtype == 'api_retry':
+                self.api_retry_streak += 1
+                self.last_api_retry_at = datetime.now()
+            self._log.info(f"SYSTEM | {subtype}")

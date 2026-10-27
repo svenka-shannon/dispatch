@@ -154,18 +154,42 @@ These areas are most likely to cause production issues:
 
 ## Safe Restart Procedure
 
+Follows `~/dispatch/CLAUDE.md` → "Reloading daemon code after an edit". Key facts:
+`restart-sessions` does NOT reload `manager.py`/`sdk_session.py`/`sdk_backend.py`
+(only a daemon restart does); stopping the daemon also kills the session issuing
+the command, so the restart must be **detached**; and the daemon must come back
+under **launchd** (`claude-assistant restart` does a `launchctl kickstart`; never
+`stop; start` from a session).
+
+**Before claiming no regressions, compare test results against a baseline taken
+before your edits (git stash or a run before editing) — ~8 tests fail pre-existing.**
+
 ```bash
-# 1. Check what's running
+# 1. Check what's running; don't restart mid-conversation
 claude-assistant status
 
-# 2. If sessions are idle, restart
-claude-assistant restart
+# 2. Record the old daemon PID and the edit time of what you changed
+OLD_PID=$(cat ~/dispatch/state/daemon.pid)
+stat -f "%Sm" ~/dispatch/assistant/manager.py   # (each file you edited)
 
-# 3. Verify it came back
+# 3. Arm a post-check BEFORE restarting - the restart can kill this session,
+#    and the reminder is what brings you back to verify
+claude-assistant remind add "post-restart check: verify daemon PID != $OLD_PID, ps -o lstart= newer than edit, launchctl shows PID, logs clean" \
+  --contact "<this chat_id>" --in 3m
+
+# 4. Restart DETACHED (plain `claude-assistant restart` dies with this session)
+nohup claude-assistant restart >/dev/null 2>&1 &
+
+# 5. Verify (in the post-check): PID changed, process is newer than the edit,
+#    and launchd owns it
+NEW_PID=$(cat ~/dispatch/state/daemon.pid)
+[ "$NEW_PID" != "$OLD_PID" ] && echo "PID changed: $OLD_PID -> $NEW_PID"
+ps -o lstart= -p "$NEW_PID"                     # must be LATER than the edit time
+launchctl list | grep claude-assistant          # must show the PID, not "-"
 claude-assistant status
 claude-assistant logs  # watch for 30s
 
-# 4. Test with a message
+# 6. Test with a message
 # Send yourself a test via the test adapter:
 echo '{"from":"+15555551234","text":"restart test","chat_id":"+15555551234"}' > ~/.claude/test-messages/test.json
 ```
@@ -213,3 +237,40 @@ The daemon picks these up within 100ms and processes them through the full routi
 5. **Adding new tools to tier configs** → Security implications. Check `_permission_check` in `sdk_session.py`
 6. **Forgetting `flush()` on registry** → Data loss on shutdown. The debounce system handles this but verify
 7. **Running `asyncio.gather` with SDK clients** → Each client's cancel scope is task-bound. Connect+disconnect must happen in the same task
+
+---
+
+## A positive control must exercise the same PATH as the decision
+
+Credit: Sven (Nikhil's assistant), 2026-08-27. This is the sharpest rule to come
+out of the admin-override incident and it generalises well beyond it.
+
+**The failure shape:** you test a mechanism by calling its function directly,
+with data you already hold in memory. It passes. You then make a real decision
+using that mechanism on data that arrived by a *different route* — rendered,
+serialized, re-parsed, copied out of a prompt — and the route mutated the data.
+Your positive control passed and was **irrelevant to what it reassured you about.**
+
+**What happened here.** I added HMAC tokens to admin overrides and tested them
+with `mint(payload) → verify(payload)` in a scratch script, holding raw bytes
+the whole time. Green. But a session verifying a real override can only retype
+the body out of its rendered prompt — and the sanitizer I shipped alongside was
+inserting invisible U+2060 joiners into that body. Three invisible bytes, and
+every genuine override failed verification. The unit test could never have
+caught it, because it never travelled the path the decision travels.
+
+**The rule:** when testing a control that gates a decision, drive it end-to-end
+through the same transport the real decision uses. For this codebase that means:
+
+- Verifying an admin override? Actually inject one (your own session is a safe
+  target), then verify using the body **as rendered in the prompt** — retyped,
+  not the string you passed to the CLI.
+- Testing message formatting? Send through the real backend and read it back
+  out of `chat.db` / the session JSONL, not just `wrap_sms()` in isolation.
+- Testing a chat.db query? Remember outbound rows keep their content in
+  `attributedBody` with `text` empty. A query that passes on inbound rows can be
+  silently wrong on your own sends — two agents reached opposite, confident,
+  wrong conclusions this way on the same day.
+
+Unit tests are still worth writing — they pin the logic. They just cannot
+substitute for one real trip through the pipe before you claim something works.

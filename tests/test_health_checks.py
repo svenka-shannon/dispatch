@@ -172,6 +172,13 @@ class TestCheckFatalRegex:
         result = check_fatal_regex(entries)
         assert result is not None
 
+    def test_detects_connection_dropped(self):
+        from assistant.health import check_fatal_regex
+        entries = [_make_assistant_entry(
+            'API Error: Connection dropped (ECONNRESET)'
+        )]
+        assert check_fatal_regex(entries) == "connection_dropped"
+
     def test_detects_image_processing_failed(self):
         from assistant.health import check_fatal_regex
         entries = [_make_assistant_entry(
@@ -395,13 +402,13 @@ class TestCheckDeepHaiku:
 
     async def test_returns_none_for_empty_entries(self):
         from assistant.health import check_deep_haiku
-        result = await check_deep_haiku([], "test-session")
+        result, _ = await check_deep_haiku([], "test-session")
         assert result is None
 
     async def test_returns_none_for_short_text(self):
         from assistant.health import check_deep_haiku
         entries = [_make_assistant_entry("ok")]
-        result = await check_deep_haiku(entries, "test-session")
+        result, _ = await check_deep_haiku(entries, "test-session")
         assert result is None
 
     async def test_fatal_response_returns_reason(self):
@@ -415,10 +422,11 @@ class TestCheckDeepHaiku:
         entries = [_make_assistant_entry("API Error: 400 image dimensions exceed max")]
 
         with patch("claude_agent_sdk.query", _fake_query):
-            result = await check_deep_haiku(entries, "test-session")
+            result, reasoning = await check_deep_haiku(entries, "test-session")
 
         assert result is not None
         assert "image" in result.lower()
+        assert reasoning.startswith("FATAL:")
 
     async def test_healthy_response_returns_none(self):
         from assistant.health import check_deep_haiku
@@ -431,9 +439,10 @@ class TestCheckDeepHaiku:
         entries = [_make_assistant_entry("I'll help with that task.")]
 
         with patch("claude_agent_sdk.query", _fake_query):
-            result = await check_deep_haiku(entries, "test-session")
+            result, reasoning = await check_deep_haiku(entries, "test-session")
 
         assert result is None
+        assert reasoning == "HEALTHY"
 
     async def test_api_failure_returns_none(self):
         from assistant.health import check_deep_haiku, HaikuCallFailed
@@ -502,6 +511,158 @@ class TestFastHealthCheck:
 
 
 @pytest.mark.asyncio
+class TestRepeatFatalLadder:
+    """Repeated fatals escalate resume restarts to clean restarts + admin SMS.
+
+    2026-09-18: a session whose context outgrew a degraded uplink failed every
+    turn with connection_dropped; resume restarts re-sent the same doomed
+    payload forever and the admin was never notified.
+    """
+
+    CHAT_ID = "test:+15555550006"
+
+    async def _run_fast_check_with_fatal(self, sdk_backend, label):
+        entry = _make_assistant_entry('API Error: Connection dropped (ECONNRESET)')
+        with patch("assistant.sdk_backend.get_transcript_entries_since", return_value=[entry]):
+            with patch("assistant.sdk_backend.check_fatal_regex", return_value=label):
+                with patch.object(sdk_backend, "restart_session", new=AsyncMock()) as mock_restart:
+                    with patch.object(sdk_backend, "_send_heal_escalation_notification") as mock_notify:
+                        result = await sdk_backend.fast_health_check()
+                        # restart is fired via _fire_and_forget; let it run
+                        await asyncio.sleep(0)
+        return result, mock_restart, mock_notify
+
+    async def test_first_fatal_restarts_with_resume(self, sdk_backend):
+        await sdk_backend.create_session("User", self.CHAT_ID, "admin", source="test")
+        result, mock_restart, mock_notify = await self._run_fast_check_with_fatal(
+            sdk_backend, "connection_dropped")
+        assert self.CHAT_ID in result
+        mock_restart.assert_awaited_once_with(self.CHAT_ID, clean=False)
+        mock_notify.assert_not_called()
+
+    async def test_repeat_fatal_escalates_to_clean_and_notifies(self, sdk_backend):
+        await sdk_backend.create_session("User", self.CHAT_ID, "admin", source="test")
+        await self._run_fast_check_with_fatal(sdk_backend, "connection_dropped")
+        # Simulate the 5-min heal shield expiring before the repeat
+        sdk_backend._recently_healed.pop(self.CHAT_ID, None)
+
+        result, mock_restart, mock_notify = await self._run_fast_check_with_fatal(
+            sdk_backend, "connection_dropped")
+        assert self.CHAT_ID in result
+        mock_restart.assert_awaited_once_with(self.CHAT_ID, clean=True)
+        mock_notify.assert_called_once()
+
+    async def test_repeat_outside_window_stays_resume(self, sdk_backend):
+        from assistant.sdk_backend import REPEAT_FATAL_WINDOW_S
+        await sdk_backend.create_session("User", self.CHAT_ID, "admin", source="test")
+        stale = datetime.now() - timedelta(seconds=REPEAT_FATAL_WINDOW_S + 60)
+        sdk_backend._repeat_fatals[self.CHAT_ID] = ("connection_dropped", stale)
+
+        result, mock_restart, mock_notify = await self._run_fast_check_with_fatal(
+            sdk_backend, "connection_dropped")
+        mock_restart.assert_awaited_once_with(self.CHAT_ID, clean=False)
+        mock_notify.assert_not_called()
+
+    async def test_different_fatal_label_is_not_a_repeat(self, sdk_backend):
+        await sdk_backend.create_session("User", self.CHAT_ID, "admin", source="test")
+        sdk_backend._repeat_fatals[self.CHAT_ID] = ("auth_error", datetime.now())
+
+        result, mock_restart, mock_notify = await self._run_fast_check_with_fatal(
+            sdk_backend, "connection_dropped")
+        mock_restart.assert_awaited_once_with(self.CHAT_ID, clean=False)
+        mock_notify.assert_not_called()
+
+    async def test_escalation_notification_debounced(self, sdk_backend):
+        await sdk_backend.create_session("User", self.CHAT_ID, "admin", source="test")
+        sdk_backend._last_heal_escalation_notification = datetime.now()
+        sdk_backend._repeat_fatals[self.CHAT_ID] = ("connection_dropped", datetime.now())
+
+        result, mock_restart, mock_notify = await self._run_fast_check_with_fatal(
+            sdk_backend, "connection_dropped")
+        mock_restart.assert_awaited_once_with(self.CHAT_ID, clean=True)
+        mock_notify.assert_not_called()
+
+    async def test_context_size_error_still_clean_on_first_hit(self, sdk_backend):
+        await sdk_backend.create_session("User", self.CHAT_ID, "admin", source="test")
+        result, mock_restart, mock_notify = await self._run_fast_check_with_fatal(
+            sdk_backend, "prompt_too_long")
+        mock_restart.assert_awaited_once_with(self.CHAT_ID, clean=True)
+        # context-size clean restarts on first hit are routine, not escalations
+        mock_notify.assert_not_called()
+
+
+@pytest.mark.asyncio
+class TestApiRetryStallAbort:
+    """A turn wedged in the SDK's api_retry loop is aborted early by fast-heal
+    instead of leaving the contact in silence for the SDK's full ~6-min retry
+    window (2026-09-19 degraded-uplink incident)."""
+
+    CHAT_ID = "test:+15555550006"
+
+    async def _run_fast_check(self, sdk_backend):
+        with patch("assistant.sdk_backend.get_transcript_entries_since", return_value=[]):
+            with patch.object(sdk_backend, "restart_session", new=AsyncMock()) as mock_restart:
+                with patch.object(sdk_backend, "_send_heal_escalation_notification") as mock_notify:
+                    result = await sdk_backend.fast_health_check()
+                    await asyncio.sleep(0)  # let fire-and-forget restart run
+        return result, mock_restart, mock_notify
+
+    async def test_stalled_session_aborted_with_resume_first(self, sdk_backend):
+        await sdk_backend.create_session("User", self.CHAT_ID, "admin", source="test")
+        session = sdk_backend.sessions[self.CHAT_ID]
+        session.api_retry_streak = 4
+        session.last_api_retry_at = datetime.now()
+
+        result, mock_restart, mock_notify = await self._run_fast_check(sdk_backend)
+        assert self.CHAT_ID in result
+        mock_restart.assert_awaited_once_with(self.CHAT_ID, clean=False)
+        mock_notify.assert_not_called()
+
+    async def test_below_threshold_not_aborted(self, sdk_backend):
+        await sdk_backend.create_session("User", self.CHAT_ID, "admin", source="test")
+        session = sdk_backend.sessions[self.CHAT_ID]
+        session.api_retry_streak = 3
+        session.last_api_retry_at = datetime.now()
+
+        result, mock_restart, _ = await self._run_fast_check(sdk_backend)
+        assert result == []
+        mock_restart.assert_not_awaited()
+
+    async def test_stale_streak_not_aborted(self, sdk_backend):
+        await sdk_backend.create_session("User", self.CHAT_ID, "admin", source="test")
+        session = sdk_backend.sessions[self.CHAT_ID]
+        session.api_retry_streak = 10
+        session.last_api_retry_at = datetime.now() - timedelta(seconds=600)
+
+        result, mock_restart, _ = await self._run_fast_check(sdk_backend)
+        assert result == []
+        mock_restart.assert_not_awaited()
+
+    async def test_stall_abort_uses_short_heal_shield(self, sdk_backend):
+        await sdk_backend.create_session("User", self.CHAT_ID, "admin", source="test")
+        session = sdk_backend.sessions[self.CHAT_ID]
+        session.api_retry_streak = 4
+        session.last_api_retry_at = datetime.now()
+
+        await self._run_fast_check(sdk_backend)
+        # Shield is backdated so a re-wedge can be acted on in ~2 min, not 5
+        shield_ts = sdk_backend._recently_healed[self.CHAT_ID]
+        assert shield_ts <= datetime.now() - timedelta(seconds=170)
+
+    async def test_stall_repeat_escalates_to_clean(self, sdk_backend):
+        await sdk_backend.create_session("User", self.CHAT_ID, "admin", source="test")
+        session = sdk_backend.sessions[self.CHAT_ID]
+        session.api_retry_streak = 5
+        session.last_api_retry_at = datetime.now()
+        # A connection_dropped fatal was already healed recently → ladder rung 2
+        sdk_backend._repeat_fatals[self.CHAT_ID] = ("connection_dropped", datetime.now())
+
+        result, mock_restart, mock_notify = await self._run_fast_check(sdk_backend)
+        mock_restart.assert_awaited_once_with(self.CHAT_ID, clean=True)
+        mock_notify.assert_called_once()
+
+
+@pytest.mark.asyncio
 class TestDeepHealthCheck:
     """Test Tier 2 deep Haiku health check on SDKBackend."""
 
@@ -530,7 +691,7 @@ class TestDeepHealthCheck:
         entries = [_make_assistant_entry("Something suspicious")]
 
         with patch("assistant.sdk_backend.get_transcript_entries_since", return_value=entries):
-            with patch("assistant.sdk_backend.check_deep_haiku", new_callable=AsyncMock, return_value=None) as mock_haiku:
+            with patch("assistant.sdk_backend.check_deep_haiku", new_callable=AsyncMock, return_value=(None, "HEALTHY")) as mock_haiku:
                 await sdk_backend.deep_health_check()
                 mock_haiku.assert_called_once()
 
@@ -540,7 +701,7 @@ class TestDeepHealthCheck:
         entries = [_make_assistant_entry("Repeated errors")]
 
         with patch("assistant.sdk_backend.get_transcript_entries_since", return_value=entries):
-            with patch("assistant.sdk_backend.check_deep_haiku", new_callable=AsyncMock, return_value="Session stuck in error loop"):
+            with patch("assistant.sdk_backend.check_deep_haiku", new_callable=AsyncMock, return_value=("Session stuck in error loop", "FATAL: Session stuck in error loop")):
                 result = await sdk_backend.deep_health_check()
 
         assert "test:+15555550006" in result

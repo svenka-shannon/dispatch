@@ -1,0 +1,285 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = []
+# ///
+"""
+Host-level macOS defaults Dispatch depends on. Idempotent; safe to re-run.
+
+WHY THIS FILE EXISTS
+--------------------
+macOS App Nap suspends `IMDPersistenceAgent` when Messages.app is
+deep-backgrounded, which defers Messages' **inbound** `chat.db` writes. The
+daemon polls `chat.db` every 100ms, so a deferred write is invisible to it —
+the row simply is not in the database yet, and the reply looks like it took
+minutes. On 2026-09-07 that delayed one inbound message by 18m23s (98.5% of
+the end-to-end latency) with zero daemon fault in the logs, and `chatdb_stale`
+peaked at 18.5h. Full writeup: POSTMORTEMS.md → "2026-09-07: Deferred chat.db
+inbound writes (App Nap)".
+
+The fix is two `defaults` keys. They are MACHINE STATE, not code — a fresh
+install on a new Mac silently reintroduces the bug, and a macOS update can
+reset them — which is why this is a script (run at install time, per README)
+*and* a daemon dependency-health check (`imessage_app_nap` in
+assistant/dependency_checks.py, which shells out to this same script).
+
+    com.apple.MobileSMS                          NSAppSleepDisabled = YES
+    com.apple.messageshelper.MessageController   SOAppNapDisabled   = YES
+
+Messages' bundle id on macOS is **com.apple.MobileSMS**, NOT `com.apple.iChat`
+— writing to the latter is a silent no-op (it succeeds and does nothing).
+
+Both keys are read **at launch**, so writing them does not affect an
+already-running Messages.app. A quit + relaunch is required for the setting to
+take effect; `--restart-messages` does that.
+
+Usage:
+    setup-macos-defaults                    # apply (idempotent), report what changed
+    setup-macos-defaults --check            # verify only; exit 1 if any key is unset
+    setup-macos-defaults --restart-messages # apply, then quit+relaunch Messages.app
+    setup-macos-defaults --json             # machine-readable (works with --check)
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path.home()
+
+# (domain, key, why) — every entry is written as `-bool YES` and expected to read "1".
+DEFAULTS = [
+    (
+        "com.apple.MobileSMS",
+        "NSAppSleepDisabled",
+        "stop App Nap from suspending Messages.app (defers inbound chat.db writes)",
+    ),
+    (
+        "com.apple.messageshelper.MessageController",
+        "SOAppNapDisabled",
+        "stop App Nap from suspending the Messages helper / IMDPersistenceAgent",
+    ),
+]
+
+# Stamp of the last time WE wrote one of these keys. Needed because the keys are
+# read at launch: a Messages.app that has been running since before the write is
+# still running without them. The app's own plist mtime is useless for this —
+# Messages rewrites com.apple.MobileSMS.plist constantly (window state etc.), so
+# mtime-vs-process-start reports a pending relaunch forever.
+STAMP = HOME / "dispatch" / "state" / "macos-defaults.json"
+
+OK, WARN, FAIL = "OK", "WARN", "FAIL"
+
+
+def _run(cmd, timeout=15):
+    """Run argv, return (rc, stdout, stderr). rc=124 on timeout, 127 if missing."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return 124, "", "timed out"
+    except FileNotFoundError as e:
+        return 127, "", str(e)
+
+
+def read_default(domain: str, key: str):
+    """Current value as a string, or None if the key is unset."""
+    rc, out, _ = _run(["defaults", "read", domain, key])
+    if rc != 0:
+        return None
+    return out
+
+
+def write_default(domain: str, key: str) -> tuple[bool, str]:
+    rc, _, err = _run(["defaults", "write", domain, key, "-bool", "YES"])
+    return rc == 0, err
+
+
+def messages_pid():
+    """PID of a running Messages.app, or None."""
+    rc, out, _ = _run(["pgrep", "-x", "Messages"])
+    if rc != 0 or not out:
+        return None
+    try:
+        return int(out.split()[0])
+    except ValueError:
+        return None
+
+
+def _process_start_epoch(pid: int):
+    """Unix epoch when `pid` started, or None if it can't be determined."""
+    rc, out, _ = _run(["ps", "-o", "lstart=", "-p", str(pid)])
+    if rc != 0 or not out:
+        return None
+    for fmt in ("%a %b %d %H:%M:%S %Y", "%a %d %b %H:%M:%S %Y"):
+        try:
+            return datetime.strptime(out.strip(), fmt).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def _read_stamp() -> dict:
+    try:
+        return json.loads(STAMP.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_stamp(**fields) -> None:
+    stamp = _read_stamp()
+    stamp.update(fields)
+    try:
+        STAMP.parent.mkdir(parents=True, exist_ok=True)
+        STAMP.write_text(json.dumps(stamp, indent=2))
+    except OSError as e:
+        print(f"{WARN:<5} could not write stamp {STAMP}: {e}", file=sys.stderr)
+
+
+def relaunch_pending(pid) -> bool:
+    """True if the running Messages.app started BEFORE we last wrote the keys.
+
+    Unknown (no stamp, unparseable `ps` output) → False. Never cry wolf: a false
+    WARN here would be permanent, and the keys are almost always already right.
+    """
+    if pid is None:
+        return False
+    last_write = _read_stamp().get("last_write_ts")
+    if not isinstance(last_write, (int, float)):
+        return False
+    started = _process_start_epoch(pid)
+    if started is None:
+        return False
+    return last_write > started
+
+
+def restart_messages() -> tuple[bool, str]:
+    """Quit Messages.app gracefully and relaunch it in the background."""
+    pid = messages_pid()
+    if pid is not None:
+        rc, _, err = _run(["osascript", "-e", 'quit app "Messages"'], timeout=30)
+        if rc != 0:
+            return False, f"quit failed: {err or f'rc={rc}'}"
+        for _ in range(20):  # up to ~10s for it to actually exit
+            if messages_pid() is None:
+                break
+            time.sleep(0.5)
+        else:
+            _run(["killall", "Messages"])
+            time.sleep(1.0)
+    # -g: don't steal focus from whatever the human is doing.
+    rc, _, err = _run(["open", "-ga", "Messages"], timeout=30)
+    if rc != 0:
+        return False, f"relaunch failed: {err or f'rc={rc}'}"
+    for _ in range(20):  # confirm it actually came back
+        new_pid = messages_pid()
+        if new_pid is not None:
+            return True, f"Messages.app relaunched (pid={new_pid})"
+        time.sleep(0.5)
+    return False, "Messages.app did not come back within 10s"
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Apply/verify the macOS defaults Dispatch needs (App Nap off for Messages).",
+    )
+    ap.add_argument("--check", action="store_true",
+                    help="verify only, write nothing; exit 1 if any key is unset")
+    ap.add_argument("--restart-messages", action="store_true",
+                    help="quit + relaunch Messages.app so the keys take effect now")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    args = ap.parse_args()
+
+    if args.check and args.restart_messages:
+        print("error: --check and --restart-messages are mutually exclusive", file=sys.stderr)
+        return 2
+
+    if sys.platform != "darwin":
+        msg = f"not macOS (sys.platform={sys.platform}) — nothing to do"
+        print(json.dumps({"platform_ok": False, "detail": msg}) if args.json else f"SKIP  {msg}")
+        return 0
+
+    results = []
+    changed = 0
+    unset = 0
+    for domain, key, why in DEFAULTS:
+        current = read_default(domain, key)
+        if current == "1":
+            results.append({"domain": domain, "key": key, "status": OK,
+                            "action": "already set", "value": current, "why": why})
+            continue
+        if args.check:
+            unset += 1
+            results.append({"domain": domain, "key": key, "status": FAIL,
+                            "action": "unset" if current is None else f"wrong value ({current})",
+                            "value": current, "why": why})
+            continue
+        ok, err = write_default(domain, key)
+        if not ok:
+            unset += 1
+            results.append({"domain": domain, "key": key, "status": FAIL,
+                            "action": f"write failed: {err}", "value": current, "why": why})
+            continue
+        changed += 1
+        results.append({"domain": domain, "key": key, "status": OK,
+                        "action": "set", "value": read_default(domain, key), "why": why})
+
+    if changed:
+        _write_stamp(last_write_ts=time.time(),
+                     keys=[f"{d}:{k}" for d, k, _ in DEFAULTS])
+
+    pid = messages_pid()
+    # A key we just wrote definitely needs a relaunch; otherwise ask the stamp
+    # whether the running Messages predates our last write.
+    needs_relaunch = pid is not None and (changed > 0 or relaunch_pending(pid))
+
+    restart = None
+    if args.restart_messages:
+        ok, detail = restart_messages()
+        restart = {"ok": ok, "detail": detail}
+        if ok:
+            needs_relaunch = False
+            _write_stamp(last_relaunch_ts=time.time())
+
+    payload = {
+        "checked_only": args.check,
+        "defaults": results,
+        "changed": changed,
+        "unset": unset,
+        "messages_pid": pid,
+        "messages_running": pid is not None,
+        "relaunch_required": needs_relaunch,
+        "restart": restart,
+    }
+
+    if args.json:
+        print(json.dumps(payload, indent=2))
+    else:
+        for r in results:
+            print(f"{r['status']:<5} {r['domain']} {r['key']} — {r['action']}")
+        if pid is None:
+            print(f"{OK:<5} Messages.app not running — it will read both keys on next launch")
+        elif restart is not None:
+            print(f"{OK if restart['ok'] else FAIL:<5} {restart['detail']}")
+        elif needs_relaunch:
+            print(f"{WARN:<5} Messages.app (pid={pid}) has been running since before the keys "
+                  f"were written — they are read AT LAUNCH, so they are not in effect yet")
+            print(f"      fix: bin/{Path(__file__).name} --restart-messages   "
+                  f"(or quit Messages.app and reopen it)")
+        else:
+            print(f"{OK:<5} Messages.app (pid={pid}) — no relaunch pending")
+        if args.check and unset:
+            print(f"{FAIL:<5} {unset} key(s) not set — run: bin/{Path(__file__).name}")
+
+    if unset:
+        return 1
+    if restart is not None and not restart["ok"]:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

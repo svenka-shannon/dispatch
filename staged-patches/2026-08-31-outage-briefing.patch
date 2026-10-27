@@ -1,0 +1,480 @@
+# outage-briefing.patch — let an SDK session perceive its own downtime.
+#
+# APPLY:  cd ~/dispatch && patch -p1 < /tmp/outage-briefing.patch
+# REVERT: cd ~/dispatch && patch -p1 -R < /tmp/outage-briefing.patch
+# (Verified: applies cleanly to assistant/ as of 2026-08-31. NOT applied.)
+#
+# WHAT IT DOES
+#   New assistant/outage.py computes an outage window from state/bus.db and
+#   renders one [SYSTEM] line. Two hook points prepend it:
+#     1. sdk_session.SDKSession._run_loop -> _prepend_outage_briefing(msg),
+#        immediately BEFORE client.query(). Auth-failure path. Prefixing the
+#        SAME turn (rather than injecting a follow-up message) is the whole
+#        point: on 2026-08-31 "Login fixed" was misread because the session had
+#        no outage context IN that turn.
+#     2. sdk_backend._recreate_active_sessions -> prefixes the existing
+#        "Session resumed after daemon restart" nudge. COMPOSES, does not
+#        replace: briefing = facts, nudge = instruction.
+#
+# WINDOW COMPUTATION (bus.db, not flag mtime)
+#   auth_failure.json is REWRITTEN on every failing turn, so its `ts` is the
+#   LAST failure, not the first — mtime alone would understate the outage.
+#   outage.auth_outage_start() instead takes MIN(session.auth_failure.timestamp)
+#   for this session_name occurring after its last clean sdk.turn_complete
+#   (is_error=0). The flag is used only as a fallback and as the "are we
+#   currently down?" boolean at session start. Window END = the first clean
+#   turn (sdk_session) or daemon.started (sdk_backend).
+#   Validated against the real incident: last clean turn 06:01:47, failures
+#   06:28:53 + 07:27:35, recovery 08:57:42 -> window 06:28-08:57, and the
+#   rendered line names the "Pack Lactaid in your bag" reminder due 07:27.
+#
+# ENUMERATING WHAT WAS MISSED
+#   reminder.due on topic 'reminders' keyed by chat_id within the window
+#   (+ a count of message.received). Everything in the window is reported as
+#   "may NOT have reached you" by construction — no turn could complete, and
+#   today's reminder was marked message.delivered against a turn that died in
+#   54ms, so delivery events cannot be trusted inside an outage.
+#
+# FALSE-POSITIVE GUARDS
+#   1. Idleness is NEVER an outage. The window only opens on an explicit
+#      session.auth_failure / auth_failure.json / daemon-restart-gap signal.
+#      An 8-hour idle session has _outage_started_at is None -> no briefing.
+#   2. MIN_OUTAGE_SECONDS = 120 — blips and fast `restart-sessions` are silent
+#      (verified: daemon_downtime_window() returns (None, None) for the
+#      01:42:39 restart, so that path emits the unchanged original nudge).
+#   3. Window closes only on a CLEAN turn, so the briefing is seen exactly once
+#      per outage; doomed 50ms turns re-prefix harmlessly.
+#   4. MAX_ITEMS = 5 caps the reminder list.
+#   5. Read-only sqlite, 2s timeout, every failure path degrades to "no
+#      briefing" — a briefing never breaks a turn.
+#
+# NEW BUS EVENT: session.auth_recovered (topic 'sessions') with
+#   started_at/ended_at/down_seconds — gives outages an END timestamp, which
+#   the bus currently lacks entirely.
+#
+--- a/assistant/outage.py	2026-08-31 09:36:08
++++ b/assistant/outage.py	2026-08-31 09:35:11
+@@ -0,0 +1,257 @@
++"""Outage briefing — let a session perceive its own downtime.
++
++An SDK session cannot see a hole in its own timeline. When OAuth dies or the
++daemon restarts, the session simply receives the next message as if nothing
++happened. On 2026-08-31 OAuth died at 06:28:53 PDT and recovered ~08:57; a
++reminder fired at 07:27 into a dead session, the turn errored in 54ms, and the
++message was still marked delivered. When the user then texted "Login fixed",
++the session had no evidence an outage had occurred and misread it as referring
++to an unrelated login thread.
++
++The daemon already records every fact needed (state/bus.db + auth_failure.json).
++This module turns those facts into one short [SYSTEM] line that the session
++prepends to its next turn.
++
++DESIGN RULES
++  1. NEVER infer an outage from idleness. An outage must be marked by an
++     explicit signal — a session.auth_failure event / auth_failure.json flag,
++     or a daemon restart gap. A session idle for 8 hours is NOT down, and must
++     never be briefed. This is the primary false-positive guard.
++  2. Blips shorter than MIN_OUTAGE_SECONDS are never reported.
++  3. Read-only bus access, short timeout, every failure degrades to "no
++     briefing". A briefing is never worth breaking a turn over.
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++from datetime import datetime, timedelta
++from typing import Optional
++
++from assistant.common import AUTH_FAILURE_FLAG, STATE_DIR
++
++BUS_DB = STATE_DIR / "bus.db"
++
++# Never brief for a blip. Guards against a 30-second token refresh hiccup or a
++# fast `claude-assistant restart-sessions` being reported as an "outage".
++MIN_OUTAGE_SECONDS = 120
++
++# Cap the enumerated items so the briefing can never become a wall of text.
++MAX_ITEMS = 5
++
++# Don't look further back than this when reconstructing a window.
++LOOKBACK_HOURS = 24
++
++
++# ── bus access ────────────────────────────────────────────────────────────
++
++def _conn() -> sqlite3.Connection:
++    """Read-only connection, separate from the Producer's writer connection."""
++    return sqlite3.connect(f"file:{BUS_DB}?mode=ro", uri=True, timeout=2.0)
++
++
++def _ms(dt: datetime) -> int:
++    return int(dt.timestamp() * 1000)
++
++
++def _dt(ms: int) -> datetime:
++    return datetime.fromtimestamp(ms / 1000).astimezone()
++
++
++def _clock(dt: datetime) -> str:
++    # Include the tz abbrev: the model reasons across EDT/PDT and a bare
++    # "06:28" is exactly the kind of ambiguity that caused the misread.
++    return dt.strftime("%H:%M %Z").strip()
++
++
++def _duration(seconds: float) -> str:
++    mins = int(seconds // 60)
++    return f"{mins // 60}h{mins % 60:02d}m" if mins >= 60 else f"{mins}m"
++
++
++# ── window computation ────────────────────────────────────────────────────
++
++def read_flag_started_at() -> Optional[datetime]:
++    """Start time recorded in state/auth_failure.json.
++
++    NOTE: _note_auth_failure OVERWRITES this file on every failing turn, so its
++    `ts` is the LAST failure of the outage, not the first. Use it only as a
++    fallback for auth_outage_start(), which reconstructs the true start.
++    """
++    try:
++        return datetime.fromisoformat(json.loads(AUTH_FAILURE_FLAG.read_text())["ts"])
++    except Exception:
++        try:
++            return _dt(int(AUTH_FAILURE_FLAG.stat().st_mtime * 1000))
++        except Exception:
++            return None
++
++
++def auth_outage_start(session_name: str, before: Optional[datetime] = None) -> Optional[datetime]:
++    """First session.auth_failure in the run of failures that is still open.
++
++    Definition: the earliest auth failure that occurred AFTER this session's
++    last clean turn (sdk.turn_complete with is_error=0). That anchor is what
++    makes the window a real outage boundary rather than "whenever the flag file
++    happened to get rewritten".
++
++    Verified against the 2026-08-31 incident: last clean turn 06:01:47,
++    auth failures at 06:28:53 and 07:27:35, recovery 08:57:42 -> returns
++    06:28:53.
++    """
++    before = before or datetime.now().astimezone()
++    floor = _ms(before - timedelta(hours=LOOKBACK_HOURS))
++    try:
++        with _conn() as c:
++            row = c.execute(
++                """
++                SELECT MIN(timestamp) FROM records
++                 WHERE topic = 'sessions'
++                   AND type = 'session.auth_failure'
++                   AND json_extract(payload, '$.session_name') = ?
++                   AND timestamp <= ?
++                   AND timestamp > COALESCE((
++                         SELECT MAX(timestamp) FROM records
++                          WHERE type = 'sdk.turn_complete'
++                            AND json_extract(payload, '$.session_name') = ?
++                            AND json_extract(payload, '$.is_error') IN (0, 'false')
++                            AND timestamp <= ?
++                       ), ?)
++                """,
++                (session_name, _ms(before), session_name, _ms(before), floor),
++            ).fetchone()
++    except Exception:
++        return None
++    return _dt(row[0]) if row and row[0] else None
++
++
++_daemon_window: Optional[tuple] = None
++
++
++def daemon_downtime_window() -> tuple[Optional[datetime], Optional[datetime]]:
++    """(down_since, back_up_at) for the gap preceding THIS daemon process.
++
++    down_since = newest bus record strictly older than the newest daemon.started
++    event, i.e. the daemon's last sign of life before it went away.
++    back_up_at = that daemon.started event.
++
++    Returns (None, None) when the gap is under MIN_OUTAGE_SECONDS — a fast
++    restart is not an outage worth telling the model about.
++
++    Cached per process: the window is identical for every session recreated at
++    startup, so it is computed once.
++    """
++    global _daemon_window
++    if _daemon_window is not None:
++        return _daemon_window
++    result: tuple[Optional[datetime], Optional[datetime]] = (None, None)
++    try:
++        with _conn() as c:
++            started = c.execute(
++                "SELECT MAX(timestamp) FROM records WHERE type = 'daemon.started'"
++            ).fetchone()
++            if started and started[0]:
++                up = started[0]
++                prev = c.execute(
++                    "SELECT MAX(timestamp) FROM records WHERE timestamp < ?", (up,)
++                ).fetchone()
++                if prev and prev[0] and (up - prev[0]) / 1000.0 >= MIN_OUTAGE_SECONDS:
++                    result = (_dt(prev[0]), _dt(up))
++    except Exception:
++        result = (None, None)
++    _daemon_window = result
++    return result
++
++
++# ── what the session missed ───────────────────────────────────────────────
++
++def _reminders_during(chat_id: str, start: datetime, end: datetime) -> list[tuple[datetime, str]]:
++    """reminder.due events for this chat inside the window.
++
++    Everything in the window is suspect by construction: the session could not
++    complete a turn, so a reminder injected into it was at best queued and at
++    worst (today's case) marked delivered against a turn that died in 54ms.
++    """
++    try:
++        with _conn() as c:
++            rows = c.execute(
++                """SELECT timestamp, payload FROM records
++                    WHERE topic = 'reminders' AND type = 'reminder.due' AND key = ?
++                      AND timestamp BETWEEN ? AND ?
++                    ORDER BY timestamp""",
++                (chat_id, _ms(start), _ms(end)),
++            ).fetchall()
++    except Exception:
++        return []
++    out = []
++    for ts, payload in rows:
++        try:
++            title = json.loads(payload).get("title", "") or "(untitled)"
++        except Exception:
++            title = "(unparseable)"
++        out.append((_dt(ts), title))
++    return out
++
++
++def _inbound_count(chat_id: str, start: datetime, end: datetime) -> int:
++    try:
++        with _conn() as c:
++            row = c.execute(
++                """SELECT COUNT(*) FROM records
++                    WHERE topic = 'messages' AND type = 'message.received' AND key = ?
++                      AND timestamp BETWEEN ? AND ?""",
++                (chat_id, _ms(start), _ms(end)),
++            ).fetchone()
++        return int(row[0]) if row else 0
++    except Exception:
++        return 0
++
++
++# ── rendering ─────────────────────────────────────────────────────────────
++
++def render_briefing(
++    *,
++    chat_id: str,
++    session_name: str,
++    started_at: Optional[datetime],
++    ended_at: Optional[datetime] = None,
++    cause: str = "auth failure",
++) -> Optional[str]:
++    """Render the [SYSTEM] outage line, or None if there is nothing to report.
++
++    Returns None (never raises) for: no start time, a sub-MIN_OUTAGE_SECONDS
++    window, or an inverted window.
++    """
++    if started_at is None:
++        return None
++    ended_at = ended_at or datetime.now().astimezone()
++    try:
++        down = (ended_at - started_at).total_seconds()
++    except TypeError:
++        return None
++    if down < MIN_OUTAGE_SECONDS:
++        return None
++
++    parts = [
++        f"[SYSTEM] You were unreachable {_clock(started_at)}–{_clock(ended_at)} "
++        f"({_duration(down)}, {cause}). You have a hole in this conversation: "
++        f"messages you appear to be answering may refer to that outage rather "
++        f"than to the last topic you remember."
++    ]
++
++    fired = _reminders_during(chat_id, started_at, ended_at)
++    if fired:
++        shown = fired[:MAX_ITEMS]
++        listed = "; ".join(f'"{title}" (due {_clock(ts)})' for ts, title in shown)
++        more = f" (+{len(fired) - len(shown)} more)" if len(fired) > len(shown) else ""
++        parts.append(
++            f"{len(fired)} reminder(s) fired during the window and may NOT have "
++            f"reached you: {listed}{more}. Check whether each still needs action."
++        )
++
++    inbound = _inbound_count(chat_id, started_at, ended_at)
++    if inbound:
++        parts.append(f"{inbound} inbound message(s) also arrived during the window.")
++
++    parts.append("Pick up any dropped work; do not apologise at length.")
++    return " ".join(parts)
+--- a/assistant/sdk_session.py	2026-08-31 09:34:33
++++ b/assistant/sdk_session.py	2026-08-31 09:35:43
+@@ -264,6 +264,13 @@
+         # we send ONE notification and suppress further responses until the limit resets.
+         self._block_limit_notified: bool = False
+         self._block_limit_until: Optional[datetime] = None  # When the limit resets
++
++        # Outage briefing: set ONLY by an explicit auth-failure signal (never by
++        # idleness — see assistant/outage.py rule 1), cleared by the first
++        # successful turn. While set, the next turn is prefixed with a factual
++        # note about the downtime so the model can perceive its own hole.
++        self._outage_started_at: Optional[datetime] = None
++        self._outage_cause: str = "auth failure"
+ 
+         # Tool execution timing: maps tool_use_id -> (start_time, tool_input, tool_name)
+         self._pending_tools: dict[str, tuple[float, dict, str]] = {}
+@@ -325,6 +332,18 @@
+         self._client = ClaudeSDKClient(options=options)
+         await self._client.connect()
+         self.running = True
++        # A flag left behind by a previous daemon process means the outage began
++        # before this session object existed — seed the window so the briefing
++        # spans the whole gap rather than starting at "now".
++        if self._outage_started_at is None and AUTH_FAILURE_FLAG.exists():
++            try:
++                from assistant import outage
++                self._outage_started_at = (
++                    outage.auth_outage_start(self._session_name)
++                    or outage.read_flag_started_at()
++                )
++            except Exception as e:
++                self._log.warning(f"OUTAGE_SEED_FAILED | {e}")
+         self._task = asyncio.create_task(self._run_loop())
+         self._log.info(f"SESSION_START | resume={resume_session_id} | tier={self.tier}")
+         log.info(f"[{self.contact_name}] SDK session started (resume={resume_session_id})")
+@@ -468,6 +487,19 @@
+         turn (any session) or by the probe once the keychain shows a fresh token.
+         """
+         self._log.error(f"AUTH_FAILURE | {text}")
++        # Open the outage window on the FIRST failure of the run. Reconstruct it
++        # from the bus (earliest failure since our last clean turn) so repeated
++        # failures don't keep shrinking the window to "just now".
++        if self._outage_started_at is None:
++            try:
++                from assistant import outage
++                self._outage_started_at = (
++                    outage.auth_outage_start(self._session_name)
++                    or datetime.now().astimezone()
++                )
++            except Exception:
++                self._outage_started_at = datetime.now().astimezone()
++            self._outage_cause = "auth failure"
+         try:
+             AUTH_FAILURE_FLAG.write_text(json.dumps({
+                 "ts": datetime.now().astimezone().isoformat(),
+@@ -490,6 +522,37 @@
+         except OSError:
+             pass
+ 
++    def _prepend_outage_briefing(self, msg: str) -> str:
++        """Prefix the next turn with a factual note about downtime we just had.
++
++        Runs BEFORE client.query() on purpose: the model must see the outage in
++        the SAME turn as the message that references it. Injecting a separate
++        follow-up message would arrive one turn too late — which is exactly how
++        "Login fixed" got misread on 2026-08-31.
++
++        The window is NOT closed here. Turns attempted while auth is still
++        broken die in ~50ms, so the briefing has to survive until a turn
++        actually succeeds; _handle_message closes it on the first clean
++        ResultMessage. Re-prefixing a few doomed turns costs nothing.
++        """
++        if self._outage_started_at is None or msg == "__SHUTDOWN__":
++            return msg
++        try:
++            from assistant import outage
++            briefing = outage.render_briefing(
++                chat_id=self.chat_id,
++                session_name=self._session_name,
++                started_at=self._outage_started_at,
++                cause=self._outage_cause,
++            )
++        except Exception as e:
++            self._log.warning(f"OUTAGE_BRIEFING_FAILED | {e}")
++            return msg
++        if not briefing:
++            return msg
++        self._log.info(f"OUTAGE_BRIEFING | since={self._outage_started_at.isoformat()}")
++        return f"{briefing}\n\n{msg}"
++
+     def _maybe_handle_oauth_quota_error(self, error_text: str) -> bool:
+         """If error_text indicates OAuth quota exhaustion, switch to API key.
+ 
+@@ -639,6 +702,7 @@
+ 
+                 try:
+                     assert self._client is not None
++                    msg = self._prepend_outage_briefing(msg)
+                     await self._client.query(msg)
+                     # Log wake latency - time from queue get to query completion
+                     wake_ms = (time.time() - wake_start) * 1000
+@@ -1221,6 +1285,27 @@
+             else:
+                 self._consecutive_error_turns = 0
+                 self._clear_auth_failure_flag()
++                # A clean turn means the briefing (if any) landed in the model's
++                # context — close the window and record the recovery so the
++                # outage has an end timestamp on the bus, not just a start.
++                if self._outage_started_at is not None:
++                    started = self._outage_started_at
++                    ended = datetime.now().astimezone()
++                    self._outage_started_at = None
++                    self._log.info(
++                        f"OUTAGE_RECOVERED | {started.isoformat()} -> {ended.isoformat()}"
++                    )
++                    try:
++                        produce_event(self._producer, "sessions", "session.auth_recovered", {
++                            "session_name": self._session_name,
++                            "chat_id": self.chat_id,
++                            "contact_name": self.contact_name,
++                            "started_at": started.isoformat(),
++                            "ended_at": ended.isoformat(),
++                            "down_seconds": round((ended - started).total_seconds()),
++                        }, key=self._session_name, source="sdk_session")
++                    except Exception:
++                        pass
+             self._log.info(
+                 f"TURN | #{self.turn_count} | "
+                 f"duration={message.duration_ms}ms | error={message.is_error} | "
+--- a/assistant/sdk_backend.py	2026-08-31 09:34:33
++++ b/assistant/sdk_backend.py	2026-08-31 09:35:51
+@@ -472,10 +472,33 @@
+                 # Replay undelivered messages from bus WAL
+                 await self._replay_undelivered(chat_id, stored_session_id)
+ 
+-                # Nudge session to continue any in-progress work
++                # Nudge session to continue any in-progress work.
++                # COMPOSES with the outage briefing rather than replacing it:
++                # the briefing supplies the facts (how long, what fired), the
++                # nudge supplies the instruction (continue or stay silent).
++                # daemon_downtime_window() returns (None, None) for restarts
++                # shorter than MIN_OUTAGE_SECONDS, so a fast `restart-sessions`
++                # produces exactly the old message with no prefix.
+                 session = self.sessions.get(chat_id)
+                 if session:
++                    prefix = ""
++                    try:
++                        from assistant import outage as _outage
++                        down_since, back_up_at = _outage.daemon_downtime_window()
++                        if down_since:
++                            briefing = _outage.render_briefing(
++                                chat_id=chat_id,
++                                session_name=session_name,
++                                started_at=down_since,
++                                ended_at=back_up_at,
++                                cause="daemon restart",
++                            )
++                            if briefing:
++                                prefix = briefing + "\n\n"
++                    except Exception as e:
++                        log.warning(f"STARTUP | outage briefing failed for {session_name}: {e}")
+                     await session.inject(
++                        prefix +
+                         "[SYSTEM] Session resumed after daemon restart. "
+                         "If you were in the middle of a task, continue where you left off. "
+                         "If you were idle/waiting for user input, ignore this message and wait silently."

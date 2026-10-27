@@ -1,0 +1,61 @@
+#!/bin/bash
+# usps-watch — daily check of a USPS tracking number; texts the owner when
+# delivery is 1 day out, and again when it actually delivers.
+#
+# USPS blocks plain curl (403). Chrome-control is the only path that works.
+# Expected-delivery date is split across lines in the rendered text, e.g.
+#   Expected Delivery by / TUESDAY / 22 / September / 2026 / by / 9:00pm
+# so we reassemble day+month+year from the lines after the header.
+
+TRACK="9534616388586260386892"
+LABEL="Emily's package"
+NUM="$("$HOME/dispatch/bin/identity" owner.phone)"
+SMS="$HOME/.claude/skills/sms-assistant/scripts/send-sms"
+CHROME="$HOME/.claude/skills/chrome-control/scripts/chrome"
+STATE="$HOME/dispatch/state/usps-$TRACK.state"
+LOG="$HOME/dispatch/logs/usps-watch.log"
+mkdir -p "$(dirname "$LOG")" "$(dirname "$STATE")"
+log(){ echo "$(date '+%Y-%m-%d %H:%M:%S') | $*" >> "$LOG"; }
+
+URL="https://tools.usps.com/go/TrackConfirmAction?tLabels=$TRACK"
+"$CHROME" open "$URL" >/dev/null 2>&1
+sleep 12
+TAB=$("$CHROME" tabs 2>/dev/null | grep -B1 "/tracking/$TRACK" | grep -oE "^[0-9]+" | head -1)
+[ -z "$TAB" ] && { log "no tab opened"; exit 1; }
+TXT=$("$CHROME" text "$TAB" 2>/dev/null)
+"$CHROME" close "$TAB" >/dev/null 2>&1
+
+[ -z "$TXT" ] && { log "empty page text"; exit 1; }
+
+# delivered?
+if echo "$TXT" | grep -qiE "^Delivered$|Delivered, (In/At|Front|Mail)" && echo "$TXT" | grep -qi "your item was delivered"; then
+  if [ "$(cat "$STATE" 2>/dev/null)" != "DELIVERED" ]; then
+    "$SMS" "$NUM" "$LABEL delivered. tracking $TRACK."
+    echo "DELIVERED" > "$STATE"; log "delivered - notified"
+  fi
+  exit 0
+fi
+
+# reassemble the expected date
+DATE_BLOCK=$(echo "$TXT" | grep -A6 -i "Expected Delivery by" | tr -d ' \t')
+DAY=$(echo "$DATE_BLOCK" | grep -oE "^[0-9]{1,2}$" | head -1)
+MON=$(echo "$DATE_BLOCK" | grep -oiE "^(January|February|March|April|May|June|July|August|September|October|November|December)$" | head -1)
+YR=$(echo "$DATE_BLOCK" | grep -oE "^20[0-9]{2}$" | head -1)
+
+if [ -z "$DAY" ] || [ -z "$MON" ] || [ -z "$YR" ]; then
+  log "could not parse date; block=[$(echo "$DATE_BLOCK" | tr '\n' '/')]"
+  exit 1
+fi
+
+ETA_EPOCH=$(date -j -f "%d %B %Y" "$DAY $MON $YR" +%s 2>/dev/null)
+[ -z "$ETA_EPOCH" ] && { log "date parse failed for $DAY $MON $YR"; exit 1; }
+TODAY_EPOCH=$(date -j -f "%Y-%m-%d" "$(date +%Y-%m-%d)" +%s)
+DAYS=$(( (ETA_EPOCH - TODAY_EPOCH) / 86400 ))
+log "eta=$DAY $MON $YR days_out=$DAYS"
+
+if [ "$DAYS" -le 1 ] && [ "$DAYS" -ge 0 ]; then
+  if [ "$(cat "$STATE" 2>/dev/null)" != "ONEDAY-$DAY$MON" ]; then
+    "$SMS" "$NUM" "$LABEL arrives tomorrow — USPS says $MON $DAY by 9pm. tracking $TRACK."
+    echo "ONEDAY-$DAY$MON" > "$STATE"; log "1-day notice sent"
+  fi
+fi

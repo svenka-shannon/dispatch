@@ -1567,7 +1567,16 @@ connectNativeHost();
 // alarm fires, the worker wakes, runs the heartbeat handler below, and
 // reconnects the native host without any manual intervention.
 function setupKeepaliveAlarm() {
-  chrome.alarms.create('keepalive', { periodInMinutes: 0.5 }); // 30s — Chrome's minimum
+  // 24s, NOT 30s. The service worker idle timeout is 30s, so a 30s alarm ties
+  // it and loses on jitter. Measured here 2026-08-19: nominal 0.5 produced a
+  // TRUE mean interval of 31.74s over 19.93 days / 54,245 beats — i.e. the
+  // average beat arrived 1.74s AFTER the worker had already gone idle, which
+  // matches 1,290 'Extension disconnected' events in the host log (worker dies
+  // first, native host is collateral).
+  //
+  // 0.4 is not clamped up to 30s for unpacked extensions (verify with:
+  //   grep -c 'Heartbeat received' /tmp/chrome_control.log  vs log age).
+  chrome.alarms.create('keepalive', { periodInMinutes: 0.4 }); // 24s
 }
 
 // Set up hourly alarm for stale tab cleanup

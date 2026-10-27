@@ -172,6 +172,11 @@ uv sync
 cp config.example.yaml config.local.yaml
 # Edit config.local.yaml — at minimum set assistant.name and contacts.owner_phone
 
+# Apply required host defaults, then relaunch Messages.app so they take effect.
+# Without this, macOS App Nap defers Messages' inbound chat.db writes and
+# messages can arrive minutes late (see POSTMORTEMS.md, 2026-09-07).
+./bin/setup-macos-defaults --restart-messages
+
 # Start the daemon
 ./bin/claude-assistant start
 
@@ -183,7 +188,19 @@ Verify it's running:
 
 ```bash
 ./bin/claude-assistant status    # Should show "running" with 0 active sessions
+./bin/setup-macos-defaults --check   # Exits non-zero if the App Nap defaults are unset
 ```
+
+(The daemon re-checks and re-applies those defaults itself — `imessage_app_nap` in the dependency-health runner — since a macOS update can reset them.)
+
+Store the Mac login password in Keychain so the daemon can unlock the lock screen by itself (display sleep → "require password" otherwise blinds every GUI-driven skill, and the `screen_lock` health check would only be able to text you about it):
+
+```bash
+security add-generic-password -a "$USER" -s mac-login-password -w -U   # prompts for the password
+./bin/screen-lock status                                              # locked? settings? password stored?
+```
+
+Set `screen_lock.harden: true` in `config.local.yaml` if you also want the daemon to turn off "require password after sleep / screen saver" so the lock never re-arms (a security trade-off, off by default).
 
 Send a text to your Mac's phone number from a contact in your Admin group — the assistant should respond within a few seconds.
 

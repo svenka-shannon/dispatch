@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Verify Amazon ASINs against live product pages using the logged-in Chrome
+# (chrome-control extension). Prints exact productTitle, buybox price (or the
+# variant price range), availability and review count for each ASIN.
+#
+# Why: amazon-search truncates many titles to the brand name and its review
+# counts are unreliable; sponsored rows can also misreport price. This reads the
+# real rendered product page.
+#
+# Usage:  amazon-verify B0DHZ8NB77 B077PRV231 ...
+#         amazon-verify --file /tmp/asins.txt
+set -uo pipefail
+CHROME="$HOME/.claude/skills/chrome-control/scripts/chrome"
+
+ASINS=()
+if [[ "${1:-}" == "--file" ]]; then
+  while read -r l; do [[ -n "$l" && "$l" != \#* ]] && ASINS+=("$l"); done < "$2"
+else
+  ASINS=("$@")
+fi
+[[ ${#ASINS[@]} -eq 0 ]] && { echo "usage: amazon-verify <ASIN>... | --file <path>" >&2; exit 1; }
+
+JS='var q=function(s){var e=document.querySelector(s);return e?e.textContent.trim():null};
+var prices=[...document.querySelectorAll("span.a-price>span.a-offscreen")].map(function(e){return e.textContent}).filter(function(v,i,a){return v&&a.indexOf(v)===i}).slice(0,6);
+JSON.stringify({title:q("#productTitle"),apex:(document.querySelector("#apex_desktop")||{innerText:""}).innerText.replace(/\s+/g," ").slice(0,220),prices:prices,avail:q("#availability"),reviews:q("#acrCustomerReviewText"),stars:(document.querySelector("#acrPopover")||{getAttribute:function(){return null}}).getAttribute("title")});'
+
+for asin in "${ASINS[@]}"; do
+  out=$("$CHROME" open "https://www.amazon.com/dp/$asin" 2>&1)
+  tab=$(echo "$out" | sed -n 's/^Opened tab \([0-9]*\).*/\1/p')
+  if [[ -z "$tab" ]]; then echo "=== $asin: FAILED TO OPEN ($out)"; continue; fi
+  data=$("$CHROME" js "$tab" "$JS" 2>&1)
+  echo "=== $asin  https://www.amazon.com/dp/$asin"
+  echo "$data"
+  "$CHROME" close "$tab" >/dev/null 2>&1
+done

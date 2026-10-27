@@ -1,0 +1,275 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = []
+# ///
+"""
+Outbound path probe — does each way of reaching a human actually work?
+
+Read-only. Sends nothing to anyone. Exits 1 if any path is dead.
+
+RULE: every check must CROSS THE BOUNDARY AND COME BACK WITH DATA. Not "the
+binary exists", not "the process is running" — a returned id, a count, an
+enumerated profile. Presence checks pass while the path is dead, which is the
+whole reason this file exists.
+
+Near-misses that produced that rule (all real, all from 2026-08-26/27):
+
+  * `which gws` / `command -v gws` returns not-found under a headless PATH even
+    when the tool is installed at ~/.local/bin. A peer nearly reported having no
+    email path at all on that basis. Resolve by filesystem, not PATH.
+  * Piping `osascript` into `head` and reading the exit code reports `head`'s
+    status, not osascript's. That made two TCC-denied apps look healthy.
+  * The daemon's own health checks are liveness-only (pid, kill -0, log
+    freshness) and `health.check_failed` has zero producers — so health can
+    report success and is structurally incapable of reporting failure.
+
+Usage:
+    outbound-probe            # human-readable
+    outbound-probe --json
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+
+# Three verdicts, not two. A presence check cannot produce OK — the whole point
+# is that presence proves nothing — but calling it FAIL is equally dishonest
+# when the path may be perfectly fine. UNPROVEN says what actually happened:
+# nothing crossed the boundary, so nothing is known. Only a returned payload
+# earns OK.
+OK, FAIL, UNPROVEN = "OK", "FAIL", "UNPROVEN"
+
+
+def _run(cmd, timeout=15):
+    """Run argv, return (rc, stdout, stderr). rc=124 on timeout, like /usr/bin/timeout."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return 124, "", "timed out"
+    except FileNotFoundError as e:
+        return 127, "", str(e)
+
+
+def check_imessage():
+    """Outbound iMessage — PERMANENTLY UNPROVEN by construction.
+
+    This can never be OK. Proving it would mean sending a message, and every
+    iMessage lands on a human, so the probe would have to spam someone to earn
+    its green tick.
+
+    An earlier version scored OK off "N sends in the last 24h". That is history,
+    not a crossing: the Messages TCC grant could have been revoked a minute ago
+    and yesterday's sends would still read green. Same class as a socket file
+    outliving its daemon.
+
+    So it reports the strongest available evidence — recency and delivery error
+    state, which is better than a bare count because chat.db records whether
+    Messages actually *sent* rather than merely queued — and refuses the verdict.
+    """
+    db = f"{HOME}/Library/Messages/chat.db"
+    if not os.path.exists(db):
+        return FAIL, "chat.db not readable"
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        cutoff = time.time() - 86400
+        ok_n, err_n = con.execute(
+            "select sum(case when error=0 then 1 else 0 end), "
+            "       sum(case when error!=0 then 1 else 0 end) "
+            "from message where is_from_me=1 and date/1000000000 + 978307200 > ?",
+            (cutoff,)).fetchone()
+        last = con.execute(
+            "select max(date)/1000000000 + 978307200 from message where is_from_me=1"
+        ).fetchone()[0]
+        con.close()
+    except sqlite3.Error as e:
+        return FAIL, f"chat.db query failed: {e}"
+
+    ok_n, err_n = ok_n or 0, err_n or 0
+    if err_n:
+        # Delivery errors ARE a crossing that came back negative — that is real.
+        return FAIL, f"{err_n} outbound message(s) errored in 24h (and {ok_n} clean)"
+    age = f"{int((time.time() - last) / 60)} min ago" if last else "never"
+    return UNPROVEN, (f"{ok_n} sent clean in 24h, last {age} — history, not a crossing; "
+                      "cannot be proven without messaging a human")
+
+
+def check_signal():
+    """Signal: the daemon must ANSWER, not merely have left a socket behind.
+
+    A unix socket file outlives the process that created it, so `exists()`
+    passes against a dead daemon — the same lie as a binary being on disk or an
+    app answering `get name`.
+
+    An *error* envelope counts as success: it proves the daemon parsed the
+    request and replied. Requiring the string "result" would score a live daemon
+    as dead, which is how the first version of this check was written.
+    """
+    sock = "/tmp/signal-cli.sock"
+    if not os.path.exists(sock):
+        return FAIL, "no socket and no daemon"
+    rc, out, _ = _run(["bash", "-lc",
+                       "printf '{\"jsonrpc\":\"2.0\",\"method\":\"version\",\"id\":1}\\n' "
+                       f"| nc -U -w 5 {sock}"], timeout=12)
+    if rc == 0 and out:
+        try:
+            reply = json.loads(out.splitlines()[0])
+        except (ValueError, IndexError):
+            return FAIL, f"socket answered but reply was not JSON-RPC: {out[:40]}"
+        if "result" in reply or "error" in reply:
+            kind = "result" if "result" in reply else "error envelope"
+            return OK, f"daemon answered rpc ({kind}) — round trip proven"
+        return FAIL, "reply had neither result nor error"
+    return FAIL, f"socket present but daemon did not answer (rc={rc}) — stale socket file"
+
+
+def check_chrome():
+    """chrome-control: must enumerate at least one profile, not merely be installed."""
+    cli = f"{HOME}/.claude/skills/chrome-control/scripts/chrome"
+    if not os.path.exists(cli):
+        return FAIL, "chrome CLI missing"
+    rc, out, err = _run([cli, "profiles"], timeout=25)
+    if rc != 0:
+        return FAIL, f"rc={rc} {(err or out)[:60]}"
+    # `rc == 0 and out` is NOT enough: the CLI exits 0 and prints
+    # "No Chrome profiles connected" when the extension is disconnected, so the
+    # earlier version scored OK on a message whose literal content was "zero".
+    # Require an actual profile id in the output.
+    ids = re.findall(r"\b[0-9a-f]{8,}\b", out)
+    if ids:
+        return OK, f"{len(ids)} profile(s) connected: {ids[0][:12]}"
+    return FAIL, f"CLI answered but no profile connected: {out.splitlines()[0][:50] if out else '(empty)'}"
+
+
+def check_gws():
+    """Gmail API via gws. Resolve on disk — PATH lies in headless contexts."""
+    for cand in (f"{HOME}/.local/bin/gws", f"{HOME}/bin/gws",
+                 "/opt/homebrew/bin/gws", "/usr/local/bin/gws"):
+        if os.path.exists(cand):
+            # --help proves the binary runs. It does NOT prove OAuth is valid,
+            # so this is UNPROVEN, not OK. Installed-but-unauthenticated is a
+            # real state and it fails only at the moment you need it.
+            rc, out, err = _run([cand, "--help"], timeout=20)
+            if rc != 0:
+                return FAIL, f"present at {cand} but --help rc={rc}"
+            rc2, out2, _ = _run([cand, "gmail", "profile"], timeout=25)
+            if rc2 == 0 and out2:
+                return OK, f"gmail profile returned: {out2[:40]}"
+            return UNPROVEN, f"binary runs at {cand}; OAuth unverified (profile rc={rc2})"
+    which = shutil.which("gws")
+    if which:
+        return UNPROVEN, f"on PATH at {which}; OAuth unverified"
+    return FAIL, "not installed (checked disk, not just PATH)"
+
+
+def _osa_app(app, bundle, script):
+    """AppleScript reachability — must return REAL DATA, not just a handshake.
+
+    `tell application "Mail" to get name` returns "Mail" even when the app is
+    TCC-gated: that reply comes from the scripting layer, not from Mail's data.
+    This probe's first version used exactly that and reported OK for two apps
+    whose real queries hang forever. The query below reads actual content, so a
+    denial shows up as the timeout it really is.
+
+    Do NOT pipe osascript into anything — a pipe reports the last command's rc.
+    """
+    rc, out, err = _run(["osascript", "-e", script], timeout=12)
+    if rc == 0:
+        return OK, f"returned data: {out[:45] or '(empty)'}"
+    if rc == 124:
+        return FAIL, (f"hung on a real query — TCC denied ({bundle}); needs a human in "
+                       "System Settings > Privacy > Automation")
+    return FAIL, f"rc={rc} {err[:70]}"
+
+
+def check_mail():
+    return _osa_app("Mail", "com.apple.mail",
+                    'tell application "Mail" to get name of every account')
+
+
+def check_calendar():
+    return _osa_app("Calendar", "com.apple.iCal",
+                    'tell application "Calendar" to get name of every calendar')
+
+
+def check_attachment_path():
+    """iMessage file attachment — the route that needs neither TCC nor OAuth."""
+    send = f"{HOME}/.claude/skills/sms-assistant/scripts/send-sms"
+    if not os.path.exists(send):
+        return FAIL, "send-sms missing"
+    rc, out, _ = _run([send, "--help"], timeout=15)
+    if rc != 0:
+        return FAIL, f"send-sms --help rc={rc}"
+    if "--file" not in out:
+        return FAIL, "send-sms has no --file flag"
+    # A flag in --help is presence, not function. Proving delivery means sending
+    # an attachment to a human. Same permanent-UNPROVEN as the iMessage check —
+    # applying the standard only where it is convenient would make it decoration.
+    return UNPROVEN, "send-sms exposes --file; delivery unproven without attaching to a human"
+
+
+# WHAT EACH CHECK ACTUALLY PROVES.
+#
+# This file is called "outbound-probe", and for a long time four of these seven
+# checks proved something other than the ability to send: a version RPC, a
+# profile enumeration, a mailbox read. Liveness and read access are not send
+# capability, and a green board labelled "outbound" implied all three.
+#
+# So every check now declares its direction, and the summary counts SEND
+# separately. A path can be perfectly alive and still unable to deliver
+# anything to a human.
+SEND, READ, LIVE = "send", "read", "liveness"
+
+CHECKS = [
+    ("imessage",         check_imessage,        SEND),
+    ("imessage-attach",  check_attachment_path, SEND),
+    ("signal",           check_signal,          LIVE),
+    ("chrome-control",   check_chrome,          LIVE),
+    ("gmail (gws)",      check_gws,             READ),
+    ("Mail.app",         check_mail,            READ),
+    ("Calendar.app",     check_calendar,        READ),
+]
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Probe outbound paths (read-only, sends nothing).")
+    ap.add_argument("--json", action="store_true", dest="as_json")
+    args = ap.parse_args()
+
+    results = []
+    for name, fn, proves in CHECKS:
+        try:
+            verdict, detail = fn()
+        except Exception as e:
+            verdict, detail = FAIL, f"probe raised: {e}"
+        results.append({"path": name, "verdict": verdict, "proves": proves,
+                        "detail": detail})
+
+    if args.as_json:
+        print(json.dumps({"results": results}, indent=2))
+    else:
+        width = max(len(r["path"]) for r in results)
+        for r in results:
+            print(f"{r['verdict']:<8}  {r['path']:<{width}}  [{r['proves']:<8}] {r['detail']}")
+        n_ok = sum(r["verdict"] == OK for r in results)
+        n_un = sum(r["verdict"] == UNPROVEN for r in results)
+        n_bad = sum(r["verdict"] == FAIL for r in results)
+        send_ok = sum(r["verdict"] == OK and r["proves"] == SEND for r in results)
+        print(f"\n{n_ok} proven / {n_un} unproven / {n_bad} dead, of {len(results)}.")
+        print(f"Of those, {send_ok} prove the ability to SEND — the rest prove "
+              "liveness or read access, which is not the same thing.")
+        print("Read-only — nothing was sent.")
+
+    return 1 if any(r["verdict"] == FAIL for r in results) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

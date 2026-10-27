@@ -1,0 +1,64 @@
+title: Conflict Torture Test
+timezone: Asia/Tokyo
+default_transit_min: 5
+
+days:
+  - date: 2026-08-24
+    label: overlaps and transit
+    items:
+      - start: "10:00"
+        end: "12:00"
+        title: Museum A
+        location: "Ueno"
+      - start: "11:30"          # OVERLAP with Museum A by 30 min
+        end: "13:00"
+        title: Lunch B
+      - start: "13:05"          # only 5 min after Lunch B ends, needs 45
+        end: "14:00"
+        title: Far Away C
+        transit_min: 45
+      - start: "22:00"          # BIG GAP after C, and crosses midnight
+        end: "01:30"
+        title: Late night bar
+        transit_min: 10
+
+  - date: 2026-08-24            # DUPLICATE date
+    items: []
+
+  - date: 2026-08-25
+    label: closures and deadlines
+    items:
+      - start: "10:00"
+        end: "11:00"
+        title: Closed-on-Tuesday Museum
+        closed_days: [tuesday]
+      - start: "12:00"
+        end: "13:00"
+        title: Special Closure Gallery
+        closed_dates: [2026-08-25]
+        transit_min: 0
+      - start: "14:00"
+        end: "15:00"
+        title: Deadline Already Passed Tour
+        booking_deadline: 2026-08-20
+        transit_min: 0
+      - start: "16:00"
+        end: "17:00"
+        title: Deadline In 2 Days Tour
+        booking_deadline: 2026-08-24
+        transit_min: 0
+      - start: "18:00"
+        end: "18:00"
+        title: Zero Length Thing
+        transit_min: 0
+
+  - date: 2026-08-26
+    label: sloppy authoring
+    items:
+      - start: 16:00            # UNQUOTED -> YAML sexagesimal int 960
+        title: No End Time      # missing end -> assume 60 min
+        colour: blue            # unknown field
+      - start: "09:00"
+        end: "09:30"
+        title: Listed Out Of Order
+        transit_min: 0

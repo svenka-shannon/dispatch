@@ -1,0 +1,329 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""opentable-watch: check OpenTable availability and text someone when new tables open.
+
+Availability comes from OpenTable's booking widget page
+(/booking/restref/availability), opened in a Chrome tab via chrome-control and polled until results render.
+Plain HTTP gets blocked by Akamai, and the main restaurant page hides slots behind JS and a cookie banner.
+
+  opentable-watch avail <rid> --party 4 --date 2026-11-06 [--time 19:30] [--json]
+  opentable-watch add <name> --rid 1329550 --party 4 --days fri,sat,sun --contact +15555550100 \
+        [--window 21] [--earliest 17:00] [--latest 23:00] [--windows "fri=18:00-20:00,sat=17:00-20:00"] \
+        [--label "Four Kings"] [--quiet 0-7] [--drop-time 12:00] [--autobook --session imessage/_15555550100 --instructions "..."]
+  opentable-watch check [<name>]     # one pass; texts the contact about NEW slots
+  opentable-watch list | rm <name> | reset <name>
+
+Restaurants that drop their book at a fixed time (e.g. Four Kings: 21 days out at noon PT)
+can set "drop_time": "12:00" and "window": 21. From drop_time-2min to +10min, check() polls the newly opened date every 2 min.
+Bot limits: OpenTable (Akamai) returned "Access Denied" after ~50 widget loads in 20 min. Each pass checks only
+`per_pass` dates (default 3, rotating, plus anything 1-2 days out), waits `gap_seconds` between loads, and cools down
+`cooldown_minutes` after a block.
+
+State: ~/dispatch/state/opentable-watch.json   Log: ~/dispatch/logs/opentable-watch.log
+"""
+import argparse
+import json
+import re
+import subprocess
+import sys
+import time
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+HOME = Path.home()
+CHROME = HOME / ".claude/skills/chrome-control/scripts/chrome"
+SEND_SMS = HOME / ".claude/skills/sms-assistant/scripts/send-sms"
+STATE = HOME / "dispatch/state/opentable-watch.json"
+LOG = HOME / "dispatch/logs/opentable-watch.log"
+PT = ZoneInfo("America/Los_Angeles")
+DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+TIME_RE = re.compile(r"^\d{1,2}:\d{2} [AP]M$")
+
+
+def log(msg):
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    with LOG.open("a") as f:
+        f.write(f"{datetime.now(PT):%Y-%m-%d %H:%M:%S} {msg}\n")
+
+
+def widget_url(rid, party, d, t="19:30"):
+    return (f"https://www.opentable.com/booking/restref/availability?rid={rid}&restref={rid}"
+            f"&partySize={party}&dateTime={d}T{t}&lang=en-US")
+
+
+def parse_widget(text: str) -> dict:
+    """Return {"status": "ok"|"none"|"unknown", "slots": ["9:30 PM", ...], "future": [...]}.
+
+    The page lists every half hour in a time <select>, then the party-size <select>,
+    then the real results after the last 'N people' line. Only that tail is parsed.
+    """
+    if "Access Denied" in text[:300] or "You don't have permission to access" in text:
+        return {"status": "blocked", "slots": [], "future": []}
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    idx = max((i for i, l in enumerate(lines) if re.fullmatch(r"\d+ (people|person)", l)), default=-1)
+    if idx < 0:
+        return {"status": "unknown", "slots": [], "future": []}
+    tail = []
+    for l in lines[idx + 1:]:
+        if l.startswith("Four Kings has partnered") or "has partnered with OpenTable" in l or l.startswith("Your cookie choices"):
+            break
+        tail.append(l)
+    blob = " ".join(tail)
+    future_at = next((i for i, l in enumerate(tail) if l.startswith("Future availability")), None)
+    today_part = tail if future_at is None else tail[:future_at]
+    slots = [l for l in today_part if TIME_RE.match(l)]
+    future = []
+    if future_at is not None:
+        rest = tail[future_at + 1:]
+        for i, l in enumerate(rest):
+            if re.match(r"^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), ", l) and i + 1 < len(rest) and TIME_RE.match(rest[i + 1]):
+                future.append(f"{l} {rest[i + 1]}")
+    if slots:
+        return {"status": "ok", "slots": slots, "future": future}
+    if "no availability" in blob.lower():
+        return {"status": "none", "slots": [], "future": future}
+    return {"status": "unknown", "slots": [], "future": future}
+
+
+def _chrome(*args, timeout=60):
+    return subprocess.run([str(CHROME), *args], capture_output=True, text=True, timeout=timeout).stdout
+
+
+def avail(rid, party, d, t="19:30", tries=2, wait=25) -> dict:
+    """Open the widget in a tab and poll its text until results render (they load via XHR
+    a few seconds after the page; `chrome fetch` often returns before that), then close it."""
+    last = {"status": "unknown", "slots": [], "future": []}
+    for _ in range(tries):
+        if last["status"] == "blocked":
+            break
+        tab = None
+        try:
+            m = re.search(r"Opened tab (\d+)", _chrome("open", widget_url(rid, party, d, t)))
+            if not m:
+                continue
+            tab = m.group(1)
+            deadline = time.time() + wait
+            while time.time() < deadline:
+                time.sleep(3)
+                last = parse_widget(_chrome("text", tab))
+                if last["status"] != "unknown":
+                    return last
+        except subprocess.TimeoutExpired:
+            pass
+        finally:
+            if tab:
+                try:
+                    _chrome("close", tab, timeout=20)
+                except subprocess.TimeoutExpired:
+                    pass
+    return last
+
+
+def to_24h(s):
+    return datetime.strptime(s, "%I:%M %p").strftime("%H:%M")
+
+
+def load():
+    if STATE.exists():
+        return json.loads(STATE.read_text())
+    return {"watches": {}}
+
+
+def save(st):
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(json.dumps(st, indent=1))
+
+
+def target_dates(w, today):
+    days = {DAYS.index(x) for x in w["days"]}
+    return [today + timedelta(days=i) for i in range(0, w["window"] + 1) if (today + timedelta(days=i)).weekday() in days]
+
+
+def in_quiet(w, now):
+    q = w.get("quiet")
+    if not q:
+        return False
+    a, b = (int(x) for x in q.split("-"))
+    return a <= now.hour < b if a < b else (now.hour >= a or now.hour < b)
+
+
+def window_for(w, ds):
+    """(earliest, latest) HH:MM for a date; per-day 'windows' override earliest/latest."""
+    day = DAYS[date.fromisoformat(ds).weekday()]
+    win = (w.get("windows") or {}).get(day)
+    return tuple(win) if win else (w["earliest"], w["latest"])
+
+
+def notify(w, new):
+    lines = [f"{w.get('label', 'OpenTable')} for {w['party']} just opened:"]
+    for d, s in new:
+        lines.append(f"{datetime.strptime(d, '%Y-%m-%d'):%a %b %-d} {s.lower().replace(' ', '')}")
+    d0, s0 = new[0]
+    lines.append(widget_url(w["rid"], w["party"], d0, to_24h(s0)))
+    msg = "\n".join(lines)
+    r = subprocess.run([str(SEND_SMS), w["contact"], msg], capture_output=True, text=True, timeout=60)
+    log(f"[{w['name']}] NOTIFY {new} rc={r.returncode} {r.stdout.strip()[-120:]} {r.stderr.strip()[-200:]}")
+    return r.returncode == 0
+
+
+def autobook(w, new):
+    """Wake the owning session to book the first matching slot (booking needs the browser UI)."""
+    d0, s0 = new[0]
+    others = ", ".join(f"{d} {s}" for d, s in new[1:]) or "none"
+    msg = (f"OPENTABLE MATCH for watch '{w['name']}' ({w.get('label')}): {d0} at {s0}, party {w['party']}. Other matches: {others}.\n"
+           f"Booking page (signed-in Chrome): https://www.opentable.com/r/{w.get('slug', '')}?covers={w['party']}&dateTime={d0}T{to_24h(s0)}\n"
+           f"Widget URL (fallback): {widget_url(w['rid'], w['party'], d0, to_24h(s0))}\n"
+           f"Instructions from the owner: {w.get('instructions', '')}\n"
+           f"OpenTable holds the table only 5 minutes after you pick seating — have the card saved; "
+           f"if the hold is lost, immediately book the next-best matching slot listed here.\n"
+           f"BOOK IT NOW following the 'Booking' section of ~/.claude/skills/opentable-watch/SKILL.md (slots vanish in minutes). "
+           f"Then text the owner the confirmation, and run: opentable-watch rm {w['name']} once booked.")
+    r = subprocess.run([str(HOME / "dispatch/bin/claude-assistant") if (HOME / "dispatch/bin/claude-assistant").exists() else "claude-assistant",
+                        "inject-prompt", w["session"], "--admin", msg], capture_output=True, text=True, timeout=60)
+    log(f"[{w['name']}] AUTOBOOK inject {d0} {s0} rc={r.returncode} {r.stdout.strip()[-150:]} {r.stderr.strip()[-200:]}")
+    return r.returncode == 0
+
+
+def pick_dates(w, all_dates, now):
+    """Rotate through the window a few dates per pass to stay under OpenTable's bot limits.
+    Always include the date ~2 days out (cancellation-fee deadline churn)."""
+    n = w.get("per_pass", 3)
+    if len(all_dates) <= n:
+        return all_dates
+    cur = w.get("cursor", 0) % len(all_dates)
+    picked = [all_dates[(cur + i) % len(all_dates)] for i in range(n)]
+    w["cursor"] = (cur + n) % len(all_dates)
+    hot = [d for d in all_dates if 1 <= (d - now.date()).days <= 2]
+    for d in hot:
+        if d not in picked:
+            picked.append(d)
+    return sorted(picked)
+
+
+def check_watch(w, dates, now):
+    """Query dates, act on slots inside the window that weren't acted on before.
+    Returns False if OpenTable blocked us (caller should back off)."""
+    current = {}
+    for i, d in enumerate(dates):
+        if i:
+            time.sleep(w.get("gap_seconds", 20))
+        ds = d.isoformat()
+        res = avail(w["rid"], w["party"], ds)
+        if res["status"] == "blocked":
+            w["blocked_until"] = (now + timedelta(minutes=w.get("cooldown_minutes", 60))).isoformat()
+            log(f"[{w['name']}] BLOCKED by OpenTable (Access Denied) on {ds}; cooling down until {w['blocked_until']}")
+            break
+        if res["status"] == "unknown":
+            log(f"[{w['name']}] {ds} unknown (page did not render results)")
+            current[ds] = w.get("last_seen", {}).get(ds, [])  # keep previous view, don't treat as gone
+            continue
+        lo, hi = window_for(w, ds)
+        current[ds] = [s for s in res["slots"] if lo <= to_24h(s) <= hi]
+    alerted = {tuple(x) for x in w.get("alerted", [])}
+    present = {(d, s) for d, ss in current.items() for s in ss}
+    new = sorted(present - alerted)
+    # a slot that disappeared can alert again if it comes back
+    alerted = {a for a in alerted if a[0] not in current or a in present}
+    if new:
+        if w.get("autobook"):
+            ok = autobook(w, new)          # booking beats quiet hours: the owner pre-authorized it
+        elif not in_quiet(w, now):
+            ok = notify(w, new)
+        else:
+            ok = False
+            log(f"[{w['name']}] quiet hours, holding {new}")
+        if ok:
+            alerted |= set(new)
+    today = now.date().isoformat()
+    w["alerted"] = sorted(a for a in alerted if a[0] >= today)
+    w["last_seen"] = {k: v for k, v in {**w.get("last_seen", {}), **current}.items() if k >= today}
+    w["last_check"] = now.strftime("%Y-%m-%d %H:%M:%S")
+    opened = ", ".join(f"{k}={v}" for k, v in current.items() if v) or "none in window"
+    log(f"[{w['name']}] checked {list(current)}: {opened}")
+    return "blocked_until" not in w or datetime.fromisoformat(w["blocked_until"]) <= now
+
+
+def check(st, only=None):
+    for name, w in st["watches"].items():
+        if only and name != only:
+            continue
+        w["name"] = name
+        now = datetime.now(PT)
+        if w.get("blocked_until") and datetime.fromisoformat(w["blocked_until"]) > now:
+            log(f"[{name}] cooling down after block until {w['blocked_until']}")
+            continue
+        w.pop("blocked_until", None)
+        days = {DAYS.index(x) for x in w["days"]}
+        drop = w.get("drop_time")
+        if drop:
+            hh, mm = (int(x) for x in drop.split(":"))
+            drop_dt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            new_date = now.date() + timedelta(days=w["window"])
+            if drop_dt - timedelta(minutes=2) <= now <= drop_dt + timedelta(minutes=10) and new_date.weekday() in days:
+                log(f"[{name}] drop window: polling {new_date} every 2 min")
+                while datetime.now(PT) <= drop_dt + timedelta(minutes=10):
+                    if datetime.now(PT) >= drop_dt - timedelta(seconds=5):
+                        if not check_watch(w, [new_date], datetime.now(PT)):
+                            break
+                        save(st)
+                    time.sleep(120 if datetime.now(PT) >= drop_dt else 5)
+                save(st)
+                continue
+        all_dates = target_dates(w, now.date())
+        check_watch(w, pick_dates(w, all_dates, now), now)
+        save(st)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp = ap.add_subparsers(dest="cmd", required=True)
+    a = sp.add_parser("avail"); a.add_argument("rid"); a.add_argument("--party", type=int, default=2)
+    a.add_argument("--date", required=True); a.add_argument("--time", default="19:30"); a.add_argument("--json", action="store_true")
+    ad = sp.add_parser("add"); ad.add_argument("name"); ad.add_argument("--rid", required=True); ad.add_argument("--party", type=int, required=True)
+    ad.add_argument("--days", default="fri,sat,sun"); ad.add_argument("--contact", required=True); ad.add_argument("--window", type=int, default=21)
+    ad.add_argument("--earliest", default="00:00"); ad.add_argument("--latest", default="23:59"); ad.add_argument("--label")
+    ad.add_argument("--quiet", default="0-7", help="PT hours with no texts, e.g. 0-7 (empty string disables)")
+    ad.add_argument("--drop-time", help="HH:MM PT when the book opens a new date (polls that date every 60s around it)")
+    ad.add_argument("--windows", help='per-day time windows, e.g. "fri=18:00-20:00,sat=17:00-20:00"')
+    ad.add_argument("--autobook", action="store_true", help="wake --session to book the first match instead of texting")
+    ad.add_argument("--session", help="session to wake for --autobook, e.g. imessage/_15555550100")
+    ad.add_argument("--instructions", default="", help="owner's booking instructions passed to the session")
+    c = sp.add_parser("check"); c.add_argument("name", nargs="?")
+    sp.add_parser("list")
+    r = sp.add_parser("rm"); r.add_argument("name")
+    rs = sp.add_parser("reset"); rs.add_argument("name")
+    args = ap.parse_args()
+    st = load()
+    if args.cmd == "avail":
+        res = avail(args.rid, args.party, args.date, args.time)
+        print(json.dumps(res, indent=1) if args.json else f"{args.date} party {args.party}: {res['status']} {' '.join(res['slots'])}"
+              + (f" | future: {'; '.join(res['future'])}" if res["future"] else ""))
+    elif args.cmd == "add":
+        st["watches"][args.name] = {
+            "rid": args.rid, "party": args.party, "days": [d.strip().lower()[:3] for d in args.days.split(",")],
+            "contact": args.contact, "window": args.window, "earliest": args.earliest, "latest": args.latest,
+            "label": args.label or args.name, "quiet": args.quiet or None, "drop_time": args.drop_time,
+            "windows": {k.strip()[:3].lower(): v.split("-") for k, v in (x.split("=") for x in args.windows.split(","))} if args.windows else {},
+            "autobook": args.autobook, "session": args.session, "instructions": args.instructions,
+            "per_pass": 3, "gap_seconds": 20, "cooldown_minutes": 60,
+            "alerted": [], "last_seen": {}, "created": datetime.now(PT).strftime("%Y-%m-%d %H:%M"),
+        }
+        save(st); print(f"added {args.name}")
+    elif args.cmd == "check":
+        check(st, args.name)
+    elif args.cmd == "list":
+        print(json.dumps(st["watches"], indent=1))
+    elif args.cmd == "rm":
+        print("removed" if st["watches"].pop(args.name, None) else "no such watch"); save(st)
+    elif args.cmd == "reset":
+        if args.name in st["watches"]:
+            st["watches"][args.name]["alerted"] = []; st["watches"][args.name]["last_seen"] = {}
+        save(st); print("reset")
+
+
+if __name__ == "__main__":
+    main()

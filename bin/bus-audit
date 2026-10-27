@@ -1,0 +1,243 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = []
+# ///
+"""
+Bus wiring audit — find topics/consumers that LOOK covered but aren't.
+
+Read-only. Touches no daemon code, requires no restart. Exits 1 if anything
+is found, 0 if the bus is cleanly wired (so it works as a cron/startup check).
+
+Four failure states, because a "does this topic have a consumer?" check only
+finds the first one and every audit we wrote before this started from
+"records exist" — which makes a dead producer structurally unfindable:
+
+  1. ORPHAN         records > 0, no consumer group has an offset row.
+                    Events are produced and nobody ever reads them.
+  2. NEVER-READ     group has an offset row but committed_offset <= 0 while
+                    records exist. Looks covered. The guard never opened
+                    his eyes.
+  3. UNSUBSCRIBED   group registered in consumer_groups with no offset row on
+                    any topic. A guard posted to a room that doesn't exist.
+  4. DEAD-PRODUCER  topic declared but zero records EVER (live + archive).
+                    The monitor is fine; the thing was never wired up. This
+                    presents as silence, which is what healthy looks like.
+
+Counts always span `records` UNION `records_archive`. Reading only the live
+table under-reports anything past its retention window — that mistake has
+been made twice on this bus while reporting on this exact class of bug.
+
+messages.dlq is special-cased: an entry there means a human sent something
+and never got an answer. It prints loud, with the query to read them.
+
+Usage:
+    bus-audit                 # audit, human-readable
+    bus-audit --json          # machine-readable
+    bus-audit --db PATH       # non-default bus.db
+"""
+import argparse
+import json
+import os
+import sqlite3
+import sys
+
+DEFAULT_DB = os.path.expanduser("~/dispatch/state/bus.db")
+
+DLQ_TOPICS = ("messages.dlq",)
+
+
+def _q(conn, sql, args=()):
+    return conn.execute(sql, args).fetchall()
+
+
+def audit(db_path):
+    if not os.path.exists(db_path):
+        raise SystemExit(f"bus-audit: no such db: {db_path}")
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+
+    # Record counts across BOTH tables. Archived rows are still records.
+    counts = {
+        r[0]: {"n": r[1], "first": r[2], "last": r[3]}
+        for r in _q(conn, """
+            select topic, count(*),
+                   datetime(min(timestamp)/1000,'unixepoch','localtime'),
+                   datetime(max(timestamp)/1000,'unixepoch','localtime')
+            from (select topic,timestamp from records
+                  union all select topic,timestamp from records_archive)
+            group by topic
+        """)
+    }
+
+    declared = [r[0] for r in _q(conn, "select name from topics")]
+    offsets = _q(conn, "select group_id, topic, committed_offset from consumer_offsets")
+    groups = [r[0] for r in _q(conn, "select group_id from consumer_groups")]
+
+    by_topic = {}
+    for gid, topic, off in offsets:
+        by_topic.setdefault(topic, []).append((gid, off))
+    groups_with_offsets = {gid for gid, _, _ in offsets}
+
+    findings = []
+
+    # 1 + 2: topics that have records.
+    for topic, meta in sorted(counts.items()):
+        subs = by_topic.get(topic, [])
+        if not subs:
+            findings.append({
+                "state": "ORPHAN", "topic": topic, "records": meta["n"],
+                "first": meta["first"], "last": meta["last"],
+                "detail": "records produced, no consumer group has ever committed an offset",
+            })
+            continue
+        for gid, off in subs:
+            if off is not None and off <= 0:
+                findings.append({
+                    "state": "NEVER-READ", "topic": topic, "group": gid,
+                    "records": meta["n"], "committed_offset": off,
+                    "first": meta["first"], "last": meta["last"],
+                    "detail": "consumer group exists but its offset has never advanced",
+                })
+
+    # 3: registered groups subscribed to nothing at all.
+    for gid in sorted(set(groups) - groups_with_offsets):
+        findings.append({
+            "state": "UNSUBSCRIBED", "group": gid,
+            "detail": "group registered in consumer_groups with no offset row on any topic",
+        })
+
+    # 4: declared topics that have never received a single record.
+    for topic in sorted(set(declared) - set(counts)):
+        findings.append({
+            "state": "DEAD-PRODUCER", "topic": topic, "records": 0,
+            "detail": "topic declared but zero records ever (live + archive) — check the producer exists, runs, and its dependencies are installed",
+        })
+
+    dlq = [
+        {"topic": t, "records": counts[t]["n"], "first": counts[t]["first"], "last": counts[t]["last"]}
+        for t in DLQ_TOPICS if counts.get(t, {}).get("n")
+    ]
+    conn.close()
+    return findings, dlq
+
+
+TAXONOMY_SRC = os.path.expanduser("~/dispatch/assistant/bus_helpers.py")
+
+
+def audit_types(db_path, taxonomy_src=TAXONOMY_SRC):
+    """State 5: declared event TYPES that have never been emitted.
+
+    The topic-level audit is blind here — a topic can have records and a live
+    consumer (so it reports green) while a single declared event type inside it
+    has never fired. `session.tier_mismatch` was found exactly this way: listed
+    in the taxonomy, zero producers, zero records, and the topic-level check
+    said `sessions` was fine.
+
+    A dead *failure* event is the worst case: it reads as coverage in the
+    schema and can only ever report green.
+    """
+    import re
+    import subprocess
+
+    try:
+        src = open(taxonomy_src).read()
+        tax = src.split("Topic/type taxonomy")[1].split('"""')[0]
+    except (OSError, IndexError):
+        return []
+
+    declared = set()
+    for m in re.finditer(r"\b([a-z_]+)\.([a-z_]+(?:/[a-z_]+)*)\b", tax):
+        for part in m.group(2).split("/"):
+            declared.add(f"{m.group(1)}.{part}")
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    present = {r[0] for r in conn.execute(
+        "select distinct type from records union select distinct type from records_archive")}
+    # Topic names also match the `word.word` shape (messages.dlq, imessage.ui),
+    # so the taxonomy parse picks them up as if they were event types. Drop any
+    # declared name that is actually a topic — read from the table rather than
+    # hardcoding, because the first version discarded only the one topic that
+    # happened to be visible in the output and left `imessage.ui` misreported.
+    topics = {r[0] for r in conn.execute("select name from topics")}
+    conn.close()
+    declared -= topics
+
+    root = os.path.dirname(os.path.dirname(taxonomy_src))
+    out = []
+    for t in sorted(declared - present):
+        # Search for a producer EXCLUDING the declaration site — otherwise every
+        # declared type trivially "has a producer" because it is named in the
+        # taxonomy comment we just parsed. (Got this wrong once; the first run
+        # reported 42 wired types that were all just the docstring.)
+        # Exclude THIS FILE too: bus-audit's own docstring names example event
+        # types, which made `session.tier_mismatch` report as wired on the first
+        # run. A detector that mentions what it detects becomes its own producer.
+        r = subprocess.run(
+            ["grep", "-rl", "--exclude=bus_helpers.py", "--exclude=bus-audit",
+             "--exclude-dir=__pycache__",
+             t, os.path.join(root, "assistant"), os.path.join(root, "bin")],
+            capture_output=True, text=True)
+        files = [f for f in r.stdout.split() if f]
+        out.append({
+            "state": "DEAD-TYPE" if not files else "TYPE-NEVER-FIRED",
+            "type": t,
+            "detail": ("declared in the taxonomy, no producer in code, no records ever"
+                       if not files else
+                       f"producer exists ({os.path.basename(files[0])}) but zero records ever"),
+        })
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Audit bus topic/consumer wiring (read-only).")
+    ap.add_argument("--db", default=DEFAULT_DB)
+    ap.add_argument("--json", action="store_true", dest="as_json")
+    ap.add_argument("--types", action="store_true",
+                    help="also audit declared event TYPES that have never been emitted")
+    args = ap.parse_args()
+
+    findings, dlq = audit(args.db)
+    if args.types:
+        findings = findings + audit_types(args.db)
+
+    if args.as_json:
+        print(json.dumps({"findings": findings, "dlq": dlq}, indent=2))
+        return 1 if findings else 0
+
+    if dlq:
+        for d in dlq:
+            print("!" * 66)
+            print(f"  DEAD LETTERS: {d['records']} message(s) in {d['topic']}")
+            print(f"  {d['first']} .. {d['last']}")
+            print("  Each one is a person who sent something and never got an answer.")
+            print("  Read them:")
+            print(f"    bus-audit --dlq          # or, raw:")
+            inner = (
+                "select datetime(timestamp/1000,'unixepoch','localtime') t,"
+                "json_extract(payload,'$.original_payload.phone') from_,"
+                "json_extract(payload,'$.original_payload.text') text "
+                f"from {{tbl}} where topic='{d['topic']}'"
+            )
+            sql = f"{inner.format(tbl='records')} union all {inner.format(tbl='records_archive')} order by t;"
+            print(f'    sqlite3 -header "{args.db}" "{sql}"')
+            print("!" * 66)
+
+    if not findings:
+        print("bus-audit: clean — every topic has records and a live reader.")
+        return 0
+
+    width = max(len(f["state"]) for f in findings)
+    for f in findings:
+        target = f.get("topic") or f.get("type") or ""
+        if f.get("group"):
+            target = f"{target}[{f['group']}]" if target else f["group"]
+        n = f.get("records")
+        n_s = f" records={n}" if n is not None else ""
+        print(f"{f['state']:<{width}}  {target}{n_s}")
+        print(f"{'':<{width}}  └─ {f['detail']}")
+
+    print(f"\n{len(findings)} finding(s). Nothing changed — this audit is read-only.")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

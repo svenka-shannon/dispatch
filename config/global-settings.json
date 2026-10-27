@@ -7,6 +7,7 @@
     ],
     "defaultMode": "auto"
   },
+  "model": "opus",
   "hooks": {
     "PreToolUse": [
       {
@@ -25,5 +26,38 @@
   "tui": "fullscreen",
   "skipDangerousModePermissionPrompt": true,
   "skipAutoPermissionPrompt": true,
-  "model": "claude-fable-5[1m]"
+  "autoMode": {
+    "environment": [
+      "### Org-wide",
+      "**Organization**: None configured",
+      "**Cloud provider(s)**: None configured",
+      "**Repository visibility**: PUBLIC — svenka-shannon/dispatch (origin fork, github.com/svenka-shannon/dispatch) and upstream svenflow/dispatch are both public; any push publishes",
+      "**Internal sharing / snippet hosting**: None configured — treat public paste/gist services as outside the trust boundary",
+      "**Secrets management**: Local dotenv/files only — .env, secrets.env, .pii-blocklist, **/allowed_tokens.json, **/dispatch-apns-tokens.json, skills/sven-pages/.api-key (gitignored, repo-local; no external secrets manager configured)",
+      "**Default / protected branches**: main (default); Protected branches: none listed, Rulesets: none listed per gh — treat main as unprotected at the platform level, rely on the local pre-commit ty hook only",
+      "**CI/CD deploy targets**: None configured",
+      "**Network posture**: None configured",
+      "**Host containment**: None configured — assume Claude Code runs on an ordinary developer machine (this is a personal macOS assistant host) with open internet",
+      "**Source control**: This repo only — origin (svenka-shannon/dispatch, push target) and upstream (svenflow/dispatch, fetch/PR-only, never push directly per CLAUDE.md workflow)",
+      "**Trusted internal domains**: None configured",
+      "**Trusted cloud buckets**: None configured",
+      "**Key internal services**: None configured",
+      "**Internal package registry**: None configured",
+      "**Sensitive data locations & audiences**: .env, secrets.env, .pii-blocklist, **/allowed_tokens.json, **/dispatch-apns-tokens.json, skills/sven-pages/.api-key, tests/unit/test_no_pii_anywhere.py — personal conversation data, contact PII, API keys/tokens; never commit or push to either public remote",
+      "**Data retention / declassification**: None configured",
+      "**Sensitive remote targets**: any namespace, host, or container whose name carries `prod` or `production` as a whole word or name segment",
+      "**Protected deployment namespaces / environments**: None configured — fall back to the Sensitive remote targets heuristic",
+      "**Protected IaC scopes**: IAM, RBAC, networking, quota, and node-pool resources; anything whose name or tag carries `prod` or `production` as a whole word or name segment",
+      "### User-specific",
+      "**Primary use of Claude Code**: personal assistant daemon development (software development, hobby/personal posture)",
+      "**Trusted repo**: ~/dispatch (svenka-shannon/dispatch fork, public) — only this repo's own work belongs here; upstream (svenflow/dispatch) is fetch/PR-only, never a direct push target",
+      "**Org-specific CLIs**: claude-assistant (dispatch daemon control: start/stop/status/restart-session/remind/commitment/health-history), uv (Python package/script runner — never bare python3/pip), chrome CLI (~/.claude/skills/chrome-control/scripts/chrome), bus CLI (python -m bus.cli), fact CLI (~/dispatch/scripts/fact)",
+      "**routine under ~/dispatch/ prefix**: daemon code edits, pytest runs, uv sync/pyproject edits, reminder/task management via claude-assistant"
+    ],
+    "soft_deny": [
+      "$defaults",
+      "Bash(git push upstream:*) in ~/dispatch — CLAUDE.md states upstream is fetch/PR-only and must never be pushed directly",
+      "Bash(gh pr create --repo svenflow/dispatch:*) without --web/explicit review — upstream PRs should go through the documented cherry-pick branch flow, not casual direct creation"
+    ]
+  }
 }

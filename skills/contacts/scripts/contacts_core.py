@@ -10,6 +10,7 @@ Write path uses AppleScript (Contacts.app required for mutations).
 
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 from typing import Optional, Dict, List
 
@@ -24,6 +25,57 @@ TIER_GROUP_MAP = {
     "Claude Favorites": "favorite",
     "Claude Bots": "bots",
 }
+
+# Explicit tier precedence — MOST privileged wins (lower number = higher rank).
+#
+# Do NOT rely on "first match wins" over a SQL result: the group query has no
+# ORDER BY, so row order is undefined and a contact in two tier groups would get
+# a random tier that can change between calls. Tier IS access control, so that
+# is a security bug, not a cosmetic one: an admin who is also in Favorites could
+# resolve to 'favorite' and silently lose access (or the reverse).
+TIER_PRECEDENCE = {
+    "admin": 0,
+    "partner": 1,
+    "family": 2,
+    "favorite": 3,
+    "bots": 4,
+}
+
+
+def _assign_tier(tier_map: Dict[int, str], contact_pk: int, group_name: str) -> None:
+    """Record the HIGHEST-precedence tier for a contact, independent of row order.
+
+    Policy is highest-privilege-wins, matching what the docs and the AppleScript
+    path already claimed. That is a deliberate choice, NOT obviously the right
+    one — see the note below — so multi-group membership is also reported loudly
+    rather than resolved in silence.
+
+    Dual membership is ALWAYS a data error. The danger is not which way it
+    resolves, it's that either policy resolves it invisibly and the bad data
+    survives. Warn, so a human fixes the card.
+    """
+    tier = TIER_GROUP_MAP[group_name]
+    current = tier_map.get(contact_pk)
+
+    # Conflict state is derived from tier_map itself — deliberately NOT module
+    # state keyed by pk. Z_PK is only unique WITHIN one AddressBook source DB,
+    # and callers walk several, so a module-global set would merge pk=30 in one
+    # DB with pk=30 in another and report two unrelated people as one contact in
+    # "multiple tier groups". tier_map is already per-DB, so scoping to it makes
+    # the false positive structurally impossible rather than merely unlikely.
+    if current is not None and current != tier:
+        winner = min((current, tier), key=lambda t: TIER_PRECEDENCE[t])
+        print(
+            f"WARNING: contact pk={contact_pk} is in MULTIPLE tier groups "
+            f"({current}, {tier}) — resolving to '{winner}' "
+            f"(highest privilege of {current}/{tier}). "
+            f"This is a data error: fix the card in Contacts.app so it belongs "
+            f"to exactly one Claude tier group.",
+            file=sys.stderr,
+        )
+
+    if current is None or TIER_PRECEDENCE[tier] < TIER_PRECEDENCE[current]:
+        tier_map[contact_pk] = tier
 
 
 # ──────────────────────────────────────────────────────────────
@@ -126,11 +178,7 @@ def list_contacts_sqlite(tier_filter: str | None = None) -> List[Dict[str, str]]
                 WHERE g.ZNAME IN ({})
             """.format(",".join(f"'{g}'" for g in TIER_GROUP_MAP)))
             for row in cursor:
-                group_name = row["group_name"]
-                contact_pk = row["contact_pk"]
-                # First match wins (admin > partner > family > favorite)
-                if contact_pk not in tier_map:
-                    tier_map[contact_pk] = TIER_GROUP_MAP[group_name]
+                _assign_tier(tier_map, row["contact_pk"], row["group_name"])
 
             # Get all contacts with phones and emails (local to this DB)
             contacts_by_pk: Dict[int, Dict] = {}
@@ -226,8 +274,7 @@ def lookup_phone_sqlite(phone: str) -> Optional[Dict[str, str]]:
             WHERE g.ZNAME IN ({})
         """.format(",".join(f"'{g}'" for g in TIER_GROUP_MAP)))
         for row in cursor:
-            if row[0] not in tier_map:
-                tier_map[row[0]] = TIER_GROUP_MAP[row[1]]
+            _assign_tier(tier_map, row[0], row[1])
 
         # Find phone number owner
         cursor = conn.execute(
@@ -273,8 +320,7 @@ def lookup_email_sqlite(email: str) -> Optional[Dict[str, str]]:
             WHERE g.ZNAME IN ({})
         """.format(",".join(f"'{g}'" for g in TIER_GROUP_MAP)))
         for row in cursor:
-            if row[0] not in tier_map:
-                tier_map[row[0]] = TIER_GROUP_MAP[row[1]]
+            _assign_tier(tier_map, row[0], row[1])
 
         row = conn.execute(
             "SELECT ZOWNER, ZADDRESS FROM ZABCDEMAILADDRESS WHERE ZADDRESSNORMALIZED = ?",
@@ -332,8 +378,7 @@ def get_tier_sqlite(name: str) -> Optional[str]:
             WHERE g.ZNAME IN ({})
         """.format(",".join(f"'{g}'" for g in TIER_GROUP_MAP)))
         for row in cursor:
-            if row[0] not in tier_map:
-                tier_map[row[0]] = TIER_GROUP_MAP[row[1]]
+            _assign_tier(tier_map, row[0], row[1])
 
         # Find contact by name
         row = conn.execute("""

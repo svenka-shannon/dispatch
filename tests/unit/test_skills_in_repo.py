@@ -42,7 +42,7 @@ class TestSkillsInRepo:
                     gitignored.add(Path(line).name)
         except Exception:
             pass
-        skill_dirs = [d for d in SKILLS_DIR.iterdir() if d.is_dir() and d.name not in ("__pycache__", "_lib") and d.name not in gitignored]
+        skill_dirs = [d for d in SKILLS_DIR.iterdir() if d.is_dir() and not d.name.startswith(".") and d.name not in ("__pycache__", "_lib") and d.name not in gitignored]
         missing = []
         for d in skill_dirs:
             if not (d / "SKILL.md").exists():

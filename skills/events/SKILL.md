@@ -105,3 +105,13 @@ Look for facts with type `preference` related to music/events. If the user has s
 - Uses Ticketmaster Discovery API (key stored in `~/.claude/secrets.env` as `TICKETMASTER_API_KEY`)
 - Alerts stored as reminders via the reminders system
 - Facts saved via structured facts pipeline
+
+## Riftbound / TCG store events (playriftbound.com locator)
+- The locator (`https://playriftbound.com/en-US/events?lat=..&lng=..&types=PRE_RIFT`) defaults to **20 mi**. URL params don't change that. Use the "20 mi." dropdown (native select: `chrome os-type <tab> --at X,Y --select --text 50 --enter`).
+- **The "N/M players" and "EVENT IS CLOSED" fields are unreliable.** Many stores take sign-ups in person, by phone, on Discord or on their own site, so "0/40" can mean full. Only "FULL"/"WAITLIST" badges and the store's **own** signup page count. Open the event page and follow its registration link (e.g. Game Kastle uses events.gamekastle.com, which shows "N spots available").
+- Store Discords are worth searching (e.g. "pre-rift"); stores post when sessions sell out. The assistant's Discord is in GK Redwood City's server.
+- When the owner asks about "today", answer only about today, with a wide radius. Don't pad the answer with other days.
+- `scripts/riftbound-slot-watch <event_id|url> --contact <chat> --until HH:MM --session <session_name> [--interval 300] [--label "..."]` polls a playriftbound.com event page every N seconds until the event starts. It texts on full→open (and open→full). Counts are only meaningful for stores that register on playriftbound.com.
+  - **Always pass `--session`** with the owning chat's session name (e.g. `imessage/_15555550100`; see `claude-assistant status`). After each alert that actually sends (send-sms exit 0 + `SENT`), the watcher runs `claude-assistant inject-prompt <session> "FYI from riftbound-slot-watch: I already texted the owner at HH:MM: '<msg>'. Do NOT re-send it."` Don't re-send that alert.
+  - It's a long-running loop, so it still runs detached (`nohup ... > /dev/null 2>&1 &`). A health-check reminder is **required** (e.g. `claude-assistant remind add "check riftbound-slot-watch is alive (pgrep -f riftbound-slot-watch; tail its log)" --contact <chat_id> --in 30m`). A bare `nohup &` with no reminder can die silently.
+  - **The watcher texts out-of-band.** Before stopping or summarizing a watch, `tail ~/dispatch/logs/riftbound-slot-watch.log` (look for `ALERT` lines) and run `read-sms --chat <chat> --limit 10`. Never claim no alert went out based on `full=True` poll lines alone.

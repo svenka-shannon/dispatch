@@ -1,0 +1,296 @@
+#!/usr/bin/env -S uv run --script
+"""package-watch — watch any number of packages, notify on ETA and delivery.
+
+Replaces the single-number `usps-watch`, which failed twice on 2026-09-22:
+
+  1. It grepped the USPS page prose for delivery. Once a package IS delivered,
+     USPS DROPS the "Expected Delivery by" block, so the date parse fell through
+     to `could not parse date` and the delivery notice never fired. A delivered
+     package would log that error forever.
+  2. It called send-sms and never checked the exit code, so it logged
+     "1-day notice sent" for a message that never reached the recipient — there
+     is no such row in chat.db. Same bug class as the send-sms "prints SENT on
+     hard failure" defect fixed 2026-09-21.
+
+This version keys off `track --json` (status/eta fields) instead of scraping,
+and treats a non-zero send-sms exit as a hard error.
+
+Config: ~/dispatch/state/package-watch.json
+    [{"tracking": "...", "label": "Emily's package", "contact": "+1..."}]
+State:  ~/dispatch/state/package-watch.state.json   {tracking: last_event}
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import date, datetime
+from pathlib import Path
+
+HOME = Path.home()
+TRACK = HOME / "dispatch/bin/track"
+SMS = HOME / ".claude/skills/sms-assistant/scripts/send-sms"
+# PACKAGE_WATCH_STATE_DIR / PACKAGE_WATCH_LOG let the subprocess smoke test run
+# the real script against a throwaway config. 2026-09-26: that test ran against
+# the LIVE config and could have texted Eric a real digest from `pytest`.
+_STATE_DIR = Path(os.environ.get("PACKAGE_WATCH_STATE_DIR", HOME / "dispatch/state"))
+CONFIG = _STATE_DIR / "package-watch.json"
+STATE = _STATE_DIR / "package-watch.state.json"
+LOG = Path(os.environ.get("PACKAGE_WATCH_LOG", HOME / "dispatch/logs/package-watch.log"))
+QUEUE = _STATE_DIR / "package-watch.queue.json"
+
+# 2026-09-24, Eric: "even if I had multiple shipments I would expect a single
+# message, or a group of them at the same time, not an hour apart."
+# Grouping WITHIN one run was not enough — the watcher runs 4x/day, so two
+# parcels crossing their thresholds in different runs still meant two
+# interruptions hours apart. Non-urgent notices now accumulate and go out as one
+# digest at most once per DIGEST_INTERVAL_SEC. Anything urgent (a delivery)
+# sends immediately AND sweeps up whatever is queued, so nothing is ever stale.
+DIGEST_HOUR = 8        # first run at/after this hour sends the day's digest. MUST be <= the earliest launchd slot (08:15) or the "arriving today" digest slips to 12:15, after delivery (bug 2026-09-25)
+
+
+
+
+def _owner_phone() -> str:
+    """Owner's chat_id from the identity CLI (never hardcode it: the repo is public)."""
+    try:
+        return subprocess.run([str(Path.home() / "dispatch/bin/identity"), "owner.phone"],
+                              capture_output=True, text=True, timeout=10).stdout.strip()
+    except Exception:
+        return ""
+
+def log(msg: str) -> None:
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    line = f"{datetime.now():%Y-%m-%d %H:%M:%S} | {msg}"
+    with LOG.open("a") as f:
+        f.write(line + "\n")
+    print(line)
+
+
+def recently_spoke(contact: str, minutes: int = 20) -> bool:
+    """True if WE sent this contact anything in the last `minutes`.
+
+    2026-09-23 and again 2026-09-24: I answered a package question by hand and
+    the watcher repeated the same fact a minute later. The first fix was "remember
+    to seed state after reporting manually" — a mitigation that depends on memory,
+    and it failed the very next day.
+
+    So: if a live conversation is in progress, the human already has a human
+    answering them. Hold the automated line until the next cycle rather than
+    talking over it. Delivery notices are exempt (see caller) because those are
+    time-critical.
+    """
+    import sqlite3
+    db = Path.home() / "Library/Messages/chat.db"
+    if not db.exists():
+        return False
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+        row = con.execute(
+            """SELECT COUNT(*) FROM message m JOIN handle h ON m.handle_id = h.ROWID
+               WHERE h.id = ? AND m.is_from_me = 1
+                 AND m.date/1000000000 + 978307200 > ?""",
+            (contact, time.time() - minutes * 60),
+        ).fetchone()
+        con.close()
+        return bool(row and row[0])
+    except Exception:
+        return False  # fail open: a broken check must not mute a real alert
+
+
+def notify(contact: str, text: str) -> bool:
+    """Send, and VERIFY. send-sms exits non-zero when chat.db reports failure."""
+    try:
+        p = subprocess.run([str(SMS), contact, text], capture_output=True, timeout=120)
+    except Exception as e:
+        log(f"SEND FAILED (exception) contact={contact}: {e}")
+        return False
+    if p.returncode != 0:
+        # Do NOT record state on a failed send — we must retry next run.
+        log(f"SEND FAILED rc={p.returncode} contact={contact}: "
+            f"{(p.stderr or b'').decode(errors='replace').strip()[:200]}")
+        return False
+    return True
+
+
+def _parse_eta(eta: str):
+    """Parse a carrier ETA string. Returns a date, or None.
+
+    2026-09-23: this was `strptime(eta, "%Y-%m-%d")` only. FedEx actually
+    returns "9/25/26" (M/D/YY), so every parse raised, hit a bare `except:
+    continue`, and the 1-day-out alert could NEVER fire — silently. The
+    first-ETA alert still worked, which is exactly why it looked fine.
+    """
+    eta = (eta or "").strip()
+    for fmt in ("%Y-%m-%d", "%m/%d/%y", "%m/%d/%Y", "%d %B %Y", "%B %d, %Y",
+                "%b %d, %Y", "%d %b %Y"):
+        try:
+            return datetime.strptime(eta, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def main() -> int:
+    if not CONFIG.exists():
+        log(f"no config at {CONFIG}")
+        return 1
+    watches = json.loads(CONFIG.read_text())
+    if not watches:
+        log("config is empty")
+        return 0
+    state = json.loads(STATE.read_text()) if STATE.exists() else {}
+    digest_lines: list[str] = []
+
+    # Entries with no tracking number yet are ORDERS AWAITING SHIPMENT. The
+    # watcher cannot call `track` on them, but dropping them means an order that
+    # is never dispatched stays invisible — which is exactly how TR103896 sat 4
+    # days while a later order shipped and nobody noticed. Age them instead, and
+    # speak up once they cross their threshold.
+    pending = [w for w in watches if not w.get("tracking")]
+    for w in pending:
+        label = w.get("label", w.get("order", "?"))
+        contact = w.get("contact") or _owner_phone()
+        try:
+            ordered = datetime.strptime(w["ordered"], "%Y-%m-%d").date()
+        except Exception:
+            log(f"{label}: bad/missing 'ordered' date — cannot age it")
+            continue
+        days = (date.today() - ordered).days
+        limit = int(w.get("alert_after_days", 7))
+        key = w.get("order", label)
+        prev = state.get(key, "")
+        log(f"{label}: awaiting shipment, {days}d since order (alert at {limit}d)")
+        # 2026-09-24: this used to assert "not shipped". It was WRONG — the
+        # monitor stand had already been delivered; I simply had no tracking
+        # number for it because the dispatch email was never forwarded to me.
+        # Absence of a forwarded email is not absence of a shipment. Say only
+        # what is actually known: that WE have no tracking for it.
+        flag = "  ⚠️ chase for a tracking number" if days >= limit else ""
+        digest_lines.append(
+            f"· {label} — no tracking number known, {days}d since order{flag}")
+
+    nums = [w["tracking"] for w in watches if w.get("tracking")]
+    # NOTE: do NOT return early when there is nothing to track. Once the in-transit
+    # parcels deliver, only awaiting-shipment orders remain — and an early return
+    # here would silently stop the digest, which is exactly how the monitor stand
+    # went unnoticed for four days in the first place. Fall through to the digest.
+    results = []
+    if nums:
+        try:
+            p = subprocess.run([str(TRACK), "--json", *nums],
+                               capture_output=True, timeout=600)
+            out = (p.stdout or b"").decode(errors="replace")
+            results = json.loads(out[out.index("["):out.rindex("]") + 1])
+        except Exception as e:
+            log(f"track failed or unparseable: {e}")
+            results = []
+
+    by_num = {r.get("tracking"): r for r in results}
+    retire: set[str] = set()
+    delivered_now: list[str] = []
+    for w in watches:
+        if not w.get("tracking"):
+            continue  # awaiting-shipment entries were handled above
+        num, label = w["tracking"], w.get("label", w["tracking"])
+        contact = w.get("contact") or _owner_phone()
+        r = by_num.get(num)
+        if not r:
+            log(f"{label}: no result returned for {num}")
+            continue
+        status = (r.get("status") or "").strip()
+        eta = r.get("eta")
+        prev = state.get(num, "")
+        log(f"{label}: status={status!r} eta={eta!r} prev={prev!r}")
+
+        # 1. Delivered — highest priority, and the case the old watcher missed.
+        if "delivered" in status.lower():
+            # 2026-09-26, Eric: "Why are you pinging me about shit delivered
+            # already". The digest listed parcels delivered 1-2 days earlier,
+            # every day, forever. A delivery is news ONCE: only on the day it
+            # happens, and only if not already reported. After that the entry
+            # is retired from the config so it can never show up again.
+            # 2026-10-02: the single-package FedEx parser reports the delivery time in
+            # `delivered_at` and leaves `eta` empty, so this date came back None, the
+            # parcel was never retired, and Eric got "DELIVERED" a day after he'd
+            # already told me it arrived. Prefer delivered_at.
+            when = r.get("delivered_at") or eta or ""
+            ddate = _parse_eta(when.split(" ")[0]) if when else None
+            reported = state.get(f"{num}:delivered_reported")
+            if reported or (ddate is not None and ddate < date.today()):
+                log(f"{label}: delivered {eta} — already news, retiring")
+                retire.add(num)
+                continue
+            digest_lines.append(f"· {label} — DELIVERED" + (f" ({eta})" if eta else ""))
+            delivered_now.append(num)
+            continue
+
+        if not eta:
+            digest_lines.append(f"· {label} — {status or 'no update'}, no ETA yet")
+            continue
+
+        # Render one status line. No per-milestone state machine any more —
+        # the daily digest IS the notification, so there is nothing to
+        # de-duplicate and nothing that can fire twice for one parcel.
+        parsed = _parse_eta(eta)
+        if parsed is None:
+            digest_lines.append(f"· {label} — {status}, eta {eta} (unparsed)")
+            continue
+        days = (parsed - date.today()).days
+        if days < 0:
+            when = f"carrier ETA {eta} has passed — late, not lost"
+        elif days == 0:
+            when = f"ARRIVING TODAY ({eta})"
+        elif days == 1:
+            when = f"arrives tomorrow ({eta})"
+        else:
+            when = f"eta {eta} ({days}d)"
+        win = r.get("delivery_window")
+        digest_lines.append(f"· {label} — {when}" + (f", {win.lower()}" if win else ""))
+
+    if retire:
+        kept = [w for w in watches if w.get("tracking") not in retire]
+        CONFIG.write_text(json.dumps(kept, indent=2) + "\n")
+        log(f"retired {len(retire)} delivered entr(ies) from config: {sorted(retire)}")
+
+    # ── DAILY DIGEST ──────────────────────────────────────────────────
+    # 2026-09-24, Eric: "I don't need a text every milestone, just a daily or
+    # sub-daily tracker. Nice to know the day before it arrives and the day it
+    # arrives, as well as periodic reminders of the eta."
+    #
+    # So this is no longer event-driven. Per-milestone alerting is what produced
+    # a text for box 1 and another an hour later for box 2. Instead: ONE message
+    # a day listing everything being tracked and where it is. Day-before and
+    # day-of fall out of that naturally, and it doubles as the periodic ETA
+    # reminder he asked for.
+    today = date.today().isoformat()
+    if state.get("_last_digest_date") == today:
+        log("digest already sent today — nothing to do")
+        STATE.write_text(json.dumps(state, indent=2))
+        return 0
+    if datetime.now().hour < DIGEST_HOUR:
+        log(f"before {DIGEST_HOUR}:00 — holding digest")
+        STATE.write_text(json.dumps(state, indent=2))
+        return 0
+    if not digest_lines:
+        log("nothing tracked — no digest")
+        STATE.write_text(json.dumps(state, indent=2))
+        return 0
+
+    contact = watches[0].get("contact") or _owner_phone()
+    if recently_spoke(contact):
+        log("spoke to them recently — digest waits for the next run")
+        STATE.write_text(json.dumps(state, indent=2))
+        return 0
+
+    header = "📦 package tracker"
+    if notify(contact, header + "\n" + "\n".join(digest_lines)):
+        state["_last_digest_date"] = today
+        for n in delivered_now:
+            state[f"{n}:delivered_reported"] = today
+    STATE.write_text(json.dumps(state, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

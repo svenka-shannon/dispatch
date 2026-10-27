@@ -1,0 +1,406 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = []
+# ///
+"""track — on-demand package tracking for USPS, FedEx and UPS.
+
+All three carriers block plain HTTP scraping (403 / bot-wall), so this drives
+the chrome-control extension, which is the only path that reliably works.
+
+Usage:
+    track 383700923102
+    track 383700923102 383700935080 383700940355     # batched per carrier
+    track --carrier usps 9534616388586260386892
+    track --json 1Z999AA10123456784
+"""
+import argparse, json, re, subprocess, sys, time
+from pathlib import Path
+from datetime import datetime, timedelta
+
+CHROME = Path.home() / ".claude/skills/chrome-control/scripts/chrome"
+
+
+def detect_carrier(num: str) -> str:
+    n = re.sub(r"[^0-9A-Za-z]", "", num).upper()
+    if n.startswith("1Z"):
+        return "ups"
+    if n.startswith("1LS") or re.fullmatch(r"[CD]\d{14}", n):
+        return "ontrac"   # OnTrac (incl. ex-LaserShip 1LS... numbers)
+    if len(n) == 12 or len(n) == 15:
+        return "fedex"
+    if len(n) in (20, 22, 26) and n.startswith("9"):
+        return "usps"
+    if len(n) in (20, 22) and n.startswith("96"):
+        return "fedex"
+    return "fedex" if n.isdigit() and len(n) <= 15 else "usps"
+
+
+def url_for(carrier: str, nums: list[str]) -> str:
+    joined = ",".join(nums)
+    return {
+        "fedex": f"https://www.fedex.com/fedextrack/?trknbr={joined.replace(',', '%2C')}",
+        "usps": f"https://tools.usps.com/go/TrackConfirmAction?tLabels={joined}",
+        "ups": f"https://www.ups.com/track?tracknum={joined}",
+        "ontrac": f"https://www.ontrac.com/tracking/?number={joined}",
+    }[carrier]
+
+
+def fetch(url: str, timeout: int, expect: list[str], attempts: int = 3) -> str:
+    """Fetch via chrome-control, retrying until the tracking rows actually render.
+
+    All three carriers render the results table asynchronously, so a plain
+    fetch usually returns just the page nav. Retry until every tracking number
+    we asked about appears in the text (or we run out of attempts).
+    """
+    last = ""
+    for i in range(attempts):
+        r = subprocess.run(
+            [str(CHROME), "fetch", url, "--timeout", str(timeout), "--min-chars", "1200"],
+            capture_output=True, text=True, timeout=timeout + 60,
+        )
+        last = r.stdout
+        if all(n in last for n in expect):
+            return last
+        time.sleep(3 * (i + 1))
+    return last
+
+
+def fetch_ups(num: str, timeout: int) -> str:
+    """UPS renders its tracking widget late. `chrome fetch --min-chars 1200` returned
+    as soon as the nav/footer passed 1200 chars, before the widget existed, so every
+    UPS lookup came back status=None (2026-10-26: Eric's Riot box was out of SSF with
+    a next-day ETA while `track` said "unknown"). Open a tab and poll until the
+    tracking number itself is in the page text, then close the tab."""
+    out = subprocess.run([str(CHROME), "open", url_for("ups", [num])],
+                         capture_output=True, text=True, timeout=60).stdout
+    m = re.search(r"tab (\d+)", out)
+    if not m:
+        return ""
+    tab, text = m.group(1), ""
+    try:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(3)
+            text = subprocess.run([str(CHROME), "text", tab], capture_output=True,
+                                  text=True, timeout=60).stdout
+            if num in text and re.search(r"Estimated delivery|Scheduled delivery|Delivered|Label Created|Exception", text, re.I):
+                time.sleep(2)   # let the ETA block finish rendering
+                text = subprocess.run([str(CHROME), "text", tab], capture_output=True,
+                                      text=True, timeout=60).stdout
+                break
+    finally:
+        subprocess.run([str(CHROME), "close", tab], capture_output=True, text=True, timeout=60)
+    return text
+
+
+def _relative_day(word: str, month_day: str | None):
+    """'Tomorrow' / 'Monday' / 'October 26' -> date (or None)."""
+    today = datetime.now().date()
+    w = word.lower()
+    if w == "today":
+        return today
+    if w == "tomorrow":
+        return today + timedelta(days=1)
+    if month_day:
+        for fmt in ("%B %d %Y", "%b %d %Y"):
+            try:
+                d = datetime.strptime(f"{month_day} {today.year}", fmt).date()
+                if d < today - timedelta(days=60):   # year rollover (Dec -> Jan)
+                    d = d.replace(year=today.year + 1)
+                return d
+            except ValueError:
+                pass
+    names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+    if w in names:
+        return today + timedelta(days=(names.index(w) - today.weekday()) % 7)
+    return None
+
+
+def parse_ups(text: str, num: str) -> dict:
+    """UPS single-package page, e.g.
+        On the Way / 1ZY22D060314732060 / content_copy / Estimated delivery /
+        Tomorrow, October 26 by 9:00 P.M. / Last Location: / South San Francisco, CA, ...
+    The status is the line right ABOVE the tracking number. Below it the progress
+    legend lists every stage ("Label Created, We Have Your Package, On the Way, Out
+    for Delivery, Delivered") regardless of state, so never match bare stage words."""
+    rec = {"tracking": num, "carrier": "ups", "status": None, "delivered_at": None,
+           "eta": None, "as_of": None, "location": None}
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if num not in lines:
+        return rec
+    i = lines.index(num)
+    if i > 0 and len(lines[i - 1]) < 40:
+        rec["status"] = lines[i - 1]
+    head = lines[i + 1:i + 25]
+    for j, l in enumerate(head):
+        nxt = head[j + 1] if j + 1 < len(head) else ""
+        if re.fullmatch(r"(Estimated|Scheduled) delivery", l, re.I) and nxt:
+            m = re.match(r"(Today|Tomorrow|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)?,?\s*([A-Z][a-z]+ \d{1,2})?(.*)", nxt)
+            d = _relative_day(m.group(1) or "", m.group(2)) if m else None
+            if d:
+                rec["eta"] = d.strftime("%-m/%-d/%y")
+                win = (m.group(3) or "").strip()
+                if win:
+                    rec["delivery_window"] = win
+        if l.startswith("Last Location") and nxt:
+            rec["location"] = nxt
+            m = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", nxt)
+            if m:
+                rec["as_of"] = m.group(1)
+        if re.match(r"Delivered On", l, re.I):
+            m = re.search(r"(\d{1,2}/\d{1,2}/\d{4})(.*)", l + " " + nxt)
+            if m:
+                rec["delivered_at"] = m.group(1)
+    # 2026-10-26: was `"deliver" in status and "out for" not in status`, which turned some
+    # other pre-delivery heading into "Delivered" at 08:15 and the digest told Eric his
+    # Riot box was DELIVERED while it was still out for delivery. Exact word only.
+    if rec["status"] and re.fullmatch(r"Delivered\b.*", rec["status"], re.I):
+        rec["status"] = "Delivered"
+        if not rec["delivered_at"]:
+            m = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", " ".join(head))
+            if m:
+                rec["delivered_at"] = m.group(1)
+    return rec
+
+
+def fetch_ontrac(num: str, timeout: int) -> str:
+    """OnTrac renders client-side; poll a real tab until the status block exists."""
+    out = subprocess.run([str(CHROME), "open", url_for("ontrac", [num])],
+                         capture_output=True, text=True, timeout=60).stdout
+    m = re.search(r"tab (\d+)", out)
+    if not m:
+        return ""
+    tab, text = m.group(1), ""
+    try:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(3)
+            text = subprocess.run([str(CHROME), "text", tab], capture_output=True,
+                                  text=True, timeout=60).stdout
+            if re.search(r"Most Recent Tracking Event|GOING TO|not found|invalid", text, re.I):
+                break
+    finally:
+        subprocess.run([str(CHROME), "close", tab], capture_output=True, text=True, timeout=60)
+    return text
+
+
+def parse_ontrac(text: str, num: str) -> dict:
+    """OnTrac page, e.g.  In Transit / GOING TO / PACIFICA, CA / EXPECTED / 10/28/26 /
+    Most Recent Tracking Event / EVENT / Origin Scan / CITY / LEBANON, TN / 10/24/26 at 10:00 PM
+    Delivered pages show DELIVERED + a date in the same slot."""
+    rec = {"tracking": num, "carrier": "ontrac", "status": None, "delivered_at": None,
+           "eta": None, "as_of": None, "location": None}
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if "GOING TO" not in lines:
+        return rec
+    i = lines.index("GOING TO")
+    if i > 0 and len(lines[i - 1]) < 40:
+        rec["status"] = lines[i - 1]
+    for j, l in enumerate(lines[i:i + 30]):
+        nxt = lines[i + j + 1] if i + j + 1 < len(lines) else ""
+        if l.upper() in ("EXPECTED", "ESTIMATED DELIVERY") and re.fullmatch(r"\d{1,2}/\d{1,2}/\d{2,4}", nxt):
+            rec["eta"] = nxt
+        if l.upper() in ("DELIVERED", "DELIVERED ON") and re.match(r"\d{1,2}/\d{1,2}/\d{2,4}", nxt):
+            rec["delivered_at"] = nxt
+            rec["status"] = "Delivered"
+        if l.upper() == "CITY" and nxt:
+            rec["location"] = nxt
+        m = re.match(r"(\d{1,2}/\d{1,2}/\d{2,4}) at ", l)
+        if m and not rec["as_of"]:
+            rec["as_of"] = l
+    if rec["status"] and rec["status"].lower() == "delivered" and not rec["delivered_at"]:
+        rec["delivered_at"] = rec["as_of"]
+    return rec
+
+
+def parse_fedex(text: str, nums: list[str]) -> list[dict]:
+    # The summary table is tab-delimited *within* lines, so flatten to tokens:
+    #   TRACKING  SHIP DATE  SHIPPER  RECIPIENT  STATUS  DELIVERED  SCHEDULED  SERVICE
+    tokens = [t.strip() for line in text.splitlines() for t in line.split("\t") if t.strip()]
+    out = []
+    for num in nums:
+        rec = {"tracking": num, "carrier": "fedex", "status": None, "delivered_at": None, "eta": None}
+        if num in tokens:
+            # Scope the window to THIS row only. 2026-09-24: a fixed +10 window
+            # spilled from one row into the next when several numbers were
+            # batched, so two parcels swapped ETAs between runs and the batched
+            # result disagreed with the single lookup. Stop at the next tracking
+            # id instead of counting tokens.
+            start = tokens.index(num)
+            rest = tokens[start + 1:]
+            others = [i for i, t in enumerate(rest)
+                      if re.fullmatch(r"\d{12,15}", t) and t != num]
+            window = [num] + (rest[:others[0]] if others else rest[:12])
+            for w in window:
+                if re.fullmatch(r"(Delivered|In transit|Out for delivery|Pending|Label created|Exception|On the way)", w, re.I):
+                    rec["status"] = w
+                    break
+            dates = [w for w in window if re.fullmatch(r"\d{1,2}/\d{1,2}/\d{2,4}( \d{1,2}:\d{2} ?[AP]M)?", w)]
+            # Batched columns are: TRACKING, SHIP DATE, ..., DELIVERED DATE,
+            # SCHEDULED DELIVERY DATE, SERVICE. So the FIRST bare date is the
+            # SHIP date and the LAST is the scheduled delivery. Reporting
+            # dates[0] as the ETA is how "shipped 9/22" became a bogus
+            # "ETA 9/22, running late" told to the user on 2026-09-23.
+            stamped = [d for d in dates if ":" in d]
+            if stamped:
+                rec["delivered_at"] = stamped[0]
+            if len(dates) > 1:
+                rec["eta"] = dates[-1]
+                rec["ship_date"] = dates[0]
+            elif dates and not stamped:
+                # Single bare date on a row that has shipped is the ship date,
+                # NOT an ETA. Better to report no ETA than a wrong one.
+                rec["ship_date"] = dates[0]
+        out.append(rec)
+    return out
+
+
+def parse_fedex_single(text: str, num: str) -> dict:
+    """FedEx's ONE-package page (what you get for a single number) has no summary
+    table. Its header right under the number is the truth, e.g.
+        Today / By end of day / Currently in South San Francisco, CA
+        Thursday / by end of day / Currently in Cypress, TX
+        Thursday / 10/01/2026 at 10:10 am / Signed for by: ...      (delivered)
+        We're sorry. Your package wasn't sent out when expected ...  (delayed)
+    and BELOW it a progress-bar legend that always lists every stage ("Label created,
+    On the way, Out for delivery, Delivered"). 2026-10-01: parse_fedex matched the
+    legend's first word, so the morning digest said "Label created, no ETA yet" on
+    the day the parcel was out for delivery. Read the header only.
+    """
+    rec = {"tracking": num, "carrier": "fedex", "status": None, "delivered_at": None,
+           "eta": None, "location": None}
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if num not in lines:
+        return rec
+    head = []
+    for l in lines[lines.index(num) + 1:]:
+        if l in ("FROM", "Label created", "View more details") or l.startswith("How was your"):
+            break
+        head.append(l)
+    blob = " ".join(head)
+    m = re.search(r"(\d{1,2}/\d{1,2}/\d{2,4}) at (\d{1,2}:\d{2} ?[ap]m)", blob, re.I)
+    if m or re.search(r"Signed for by|Delivered", blob):
+        rec["status"] = "Delivered"
+        if m:
+            rec["delivered_at"] = f"{m.group(1)} {m.group(2)}"
+        return rec
+    if re.search(r"wasn.t sent out when expected|delay|new delivery date", blob, re.I):
+        rec["status"] = "Delayed"
+    loc = re.search(r"Currently in ([^\n]+?)(?:$| {2})", blob)
+    for l in head:
+        if l.startswith("Currently in "):
+            rec["location"] = l[len("Currently in "):]
+    day = next((l for l in head if re.fullmatch(r"(Today|Tomorrow|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday|\d{1,2}/\d{1,2}/\d{2,4})", l, re.I)), None)
+    window = next((l for l in head if re.search(r"end of day|between|by \d", l, re.I)), None)
+    if day:
+        today = datetime.now().date()
+        names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+        d = day.lower()
+        if d == "today":
+            eta = today
+        elif d == "tomorrow":
+            eta = today + timedelta(days=1)
+        elif d in names:
+            eta = today + timedelta(days=(names.index(d) - today.weekday()) % 7)
+        else:
+            eta = None
+        rec["eta"] = eta.strftime("%-m/%-d/%y") if eta else day
+        if window:
+            rec["delivery_window"] = window
+        if rec["status"] is None:
+            rec["status"] = "Arriving today" if d == "today" else "On the way"
+    if rec["status"] is None:
+        rec["status"] = "Label created" if not head else head[0][:80]
+    return rec
+
+
+def parse_generic(text: str, nums: list[str], carrier: str) -> list[dict]:
+    out = []
+    for num in nums:
+        rec = {"tracking": num, "carrier": carrier, "status": None, "delivered_at": None, "eta": None, "as_of": None}
+        # CAREFUL: the USPS page renders a progress-bar LEGEND that always contains
+        # every status label ("Delivered", "Out for Delivery", "Preparing for
+        # Delivery", "In Transit"), regardless of the real state. Matching those
+        # bare labels reports a delivery that hasn't happened. The truth is in the
+        # prose blurb, so only consider full sentences.
+        prose = [l.strip() for l in text.splitlines() if len(l.strip()) > 40]
+        blob = " ".join(prose)
+        if re.search(r"your item was delivered|was delivered (to|at|in)", blob, re.I):
+            rec["status"] = "Delivered"
+        elif re.search(r"out for delivery|arriving (today|by end of day)", blob, re.I):
+            rec["status"] = "Out for delivery"
+        elif re.search(r"in transit|moving within the USPS network|on its way|has arrived at", blob, re.I):
+            rec["status"] = "In transit"
+        elif re.search(r"label.{0,20}created|label has been prepared|awaiting item|pre-shipment", blob, re.I):
+            rec["status"] = "Label created"
+        m = re.search(r"As of ([A-Z][a-z]+ \d{1,2}, 20\d{2}(?: at [\d:]+ ?[ap]m)?)", blob)
+        if m:
+            rec["as_of"] = m.group(1)
+        m = re.search(r"Expected Delivery (?:by|on)\s*\n?\s*([A-Z]+)?\s*\n?\s*(\d{1,2})\s*\n?\s*([A-Za-z]+)\s*\n?\s*(20\d{2})", text)
+        if m:
+            rec["eta"] = f"{m.group(2)} {m.group(3)} {m.group(4)}"
+        out.append(rec)
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Track packages via USPS/FedEx/UPS.")
+    ap.add_argument("numbers", nargs="+", help="tracking number(s)")
+    ap.add_argument("--carrier", choices=["usps", "fedex", "ups", "ontrac"], help="force carrier")
+    ap.add_argument("--json", action="store_true", help="emit JSON")
+    ap.add_argument("--timeout", type=int, default=45)
+    ap.add_argument("--raw", action="store_true", help="dump the page text (for debugging parsers)")
+    args = ap.parse_args()
+
+    groups: dict[str, list[str]] = {}
+    for n in args.numbers:
+        groups.setdefault(args.carrier or detect_carrier(n), []).append(n)
+
+    results = []
+    for carrier, nums in groups.items():
+        # FedEx has a real summary TABLE, so many numbers can share one fetch.
+        # USPS/UPS render one narrative per page and the parser reads the whole
+        # page, so batching them would smear one package's status across all of
+        # them. Fetch those one at a time.
+        batches = [nums] if carrier == "fedex" else [[n] for n in nums]
+        for batch in batches:
+            if carrier == "ups":
+                text = fetch_ups(batch[0], args.timeout)
+            elif carrier == "ontrac":
+                text = fetch_ontrac(batch[0], args.timeout)
+            else:
+                text = fetch(url_for(carrier, batch), args.timeout, batch)
+            if args.raw:
+                print(f"===== {carrier}: {','.join(batch)} =====\n{text}")
+                continue
+            if not text.strip():
+                results += [{"tracking": n, "carrier": carrier, "status": "LOOKUP FAILED",
+                             "delivered_at": None, "eta": None, "as_of": None} for n in batch]
+                continue
+            if carrier == "ups":
+                results.append(parse_ups(text, batch[0]))
+            elif carrier == "ontrac":
+                results.append(parse_ontrac(text, batch[0]))
+            elif carrier == "fedex" and len(batch) == 1 and "SCHEDULED DELIVERY" not in text.upper():
+                results.append(parse_fedex_single(text, batch[0]))
+            else:
+                results += parse_fedex(text, batch) if carrier == "fedex" else parse_generic(text, batch, carrier)
+
+    if args.raw:
+        return 0
+    if args.json:
+        print(json.dumps(results, indent=2))
+        return 0
+    for r in results:
+        bits = [r["tracking"], r["carrier"].upper(), r["status"] or "unknown"]
+        if r["delivered_at"]:
+            bits.append(f"delivered {r['delivered_at']}")
+        elif r["eta"]:
+            bits.append(f"eta {r['eta']}")
+        print("  ".join(bits))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

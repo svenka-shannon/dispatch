@@ -1,0 +1,83 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = []
+# ///
+"""Search Reddit via the chrome-control CLI and print post URLs + created dates.
+
+Reddit blocks plain HTTP fetches and old.reddit now requires a login, so this
+drives the real Chrome session instead.
+
+Usage:
+  reddit-search "surround sound" [--sub simracing] [--sort relevance] [--time all]
+  reddit-search --post 1nfb0x0 [--sub simracing]   # dump one post's text + date
+"""
+import argparse
+import re
+import subprocess
+import os
+import urllib.parse
+
+CHROME = os.path.expanduser("~/.claude/skills/chrome-control/scripts/chrome")
+
+LINK_RE = re.compile(r"/r/([A-Za-z0-9_]+)/comments/([a-z0-9]+)/([a-z0-9_]*)")
+TS_RE = re.compile(r'created-timestamp="([^"]*)"')
+TITLE_RE = re.compile(r"<title>([^<]*)</title>")
+
+
+def chrome_fetch(url: str, html: bool = False) -> str:
+    cmd = [CHROME, "fetch"]
+    if html:
+        cmd.append("--html")
+    cmd.append(url)
+    return subprocess.run(cmd, capture_output=True, text=True).stdout
+
+
+def post_meta(sub: str, pid: str) -> tuple[str, str]:
+    html = chrome_fetch(f"https://www.reddit.com/r/{sub}/comments/{pid}/", html=True)
+    ts = TS_RE.search(html)
+    title = TITLE_RE.search(html)
+    return (ts.group(1) if ts else "?", title.group(1) if title else "?")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("query", nargs="?", default="")
+    ap.add_argument("--sub", default="")
+    ap.add_argument("--sort", default="relevance")
+    ap.add_argument("--time", default="all")
+    ap.add_argument("--post", help="post id: dump full text of this post instead")
+    ap.add_argument("--dates", action="store_true", help="also fetch created date of each hit (slow)")
+    args = ap.parse_args()
+
+    if args.post:
+        sub = args.sub or "simracing"
+        ts, title = post_meta(sub, args.post)
+        print(f"### {title} | {ts} | https://www.reddit.com/r/{sub}/comments/{args.post}/")
+        print(chrome_fetch(f"https://www.reddit.com/r/{sub}/comments/{args.post}/"))
+        return 0
+
+    q = urllib.parse.quote_plus(args.query)
+    if args.sub:
+        url = f"https://www.reddit.com/r/{args.sub}/search/?q={q}&restrict_sr=1&sort={args.sort}&t={args.time}"
+    else:
+        url = f"https://www.reddit.com/search/?q={q}&sort={args.sort}&t={args.time}"
+    html = chrome_fetch(url, html=True)
+    seen = []
+    for sub, pid, slug in LINK_RE.findall(html):
+        key = (sub, pid)
+        if key in seen:
+            continue
+        seen.append(key)
+        line = f"https://www.reddit.com/r/{sub}/comments/{pid}/{slug}"
+        if args.dates:
+            ts, title = post_meta(sub, pid)
+            line = f"{ts}  {line}\n    {title}"
+        print(line)
+    if not seen:
+        print("(no results — Chrome may have returned a login wall; try `chrome reset`)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,82 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["beautifulsoup4", "lxml"]
+# ///
+"""Extract posts (author, date, body) from a XenForo thread page.
+
+Usage:
+  xenforo-thread <url-or-html-file> [--min-len N] [--grep WORD]
+
+Fetches via the webfetch CLI (tier 1 raw HTML) unless given a local .html file.
+Prints every post in full — no truncation.
+"""
+import argparse
+import os
+import subprocess
+import sys
+
+from bs4 import BeautifulSoup
+
+WEBFETCH = os.path.expanduser("~/.claude/skills/webfetch/scripts/webfetch")
+
+
+def get_html(target: str, tier: str) -> str:
+    if os.path.exists(target):
+        with open(target, encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    proc = subprocess.run(
+        [WEBFETCH, "--raw", "--tier", tier, target],
+        capture_output=True, text=True,
+    )
+    return proc.stdout
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("target", help="thread URL or local HTML file")
+    ap.add_argument("--tier", default="1")
+    ap.add_argument("--grep", help="only print posts containing this substring (case-insensitive)")
+    args = ap.parse_args()
+
+    html = get_html(args.target, args.tier)
+    if not html.strip():
+        print("ERROR: empty HTML", file=sys.stderr)
+        return 1
+    soup = BeautifulSoup(html, "lxml")
+
+    title = soup.find("h1")
+    if title:
+        print(f"=== {title.get_text(' ', strip=True)} ===\n")
+
+    # XenForo 2 uses <article class="message">, XenForo 1 uses <li class="message">
+    articles = soup.select("article.message") or soup.select("li.message") or soup.select("article")
+    for art in articles:
+        author = art.get("data-author") or ""
+        if not author:
+            a = art.select_one(".messageUserInfo a.username, a.username")
+            author = a.get_text(strip=True) if a else ""
+        time_el = art.find("time")
+        when = ""
+        if time_el is not None:
+            when = time_el.get("datetime") or time_el.get("title") or time_el.get_text(strip=True)
+        if not when:
+            sp = art.select_one("span.DateTime, abbr.DateTime")
+            if sp is not None:
+                when = sp.get("title") or sp.get_text(strip=True)
+        link_el = art.select_one("a[href*='/post-'], a[href*='#post-']")
+        permalink = link_el.get("href") if link_el else ""
+        body_el = (art.select_one(".message-body .bbWrapper")
+                   or art.select_one(".message-body")
+                   or art.select_one(".messageText"))
+        body = body_el.get_text("\n", strip=True) if body_el else ""
+        if args.grep and args.grep.lower() not in body.lower():
+            continue
+        print(f"--- {author} | {when} | {permalink}")
+        print(body)
+        print()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

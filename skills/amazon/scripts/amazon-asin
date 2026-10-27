@@ -1,0 +1,120 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["click>=8.0"]
+# ///
+"""Verify Amazon ASINs against live /dp/ pages: exact title, price, availability.
+
+Why this exists: amazon-search truncates many titles to just the brand name and
+sponsored rows can misreport price. This wraps the webfetch CLI (scrapling, with
+browser fallback) and parses the real product page.
+
+Usage:
+    amazon-asin B003CTNFPS B00LDYRDT8
+    amazon-asin --json B003CTNFPS
+    amazon-asin --file /tmp/asins.txt
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+
+import click
+
+WEBFETCH = os.path.expanduser("~/.claude/skills/webfetch/scripts/webfetch")
+
+
+def parse_page(md: str) -> dict:
+    out = {}
+    GENERIC = ("related items", "products related", "customers who", "similar items",
+               "frequently bought", "more items", "compare with", "looking for",
+               "brands in this", "top picks", "what other items")
+    # Best source: Amazon's "This item: <title>" line in the bundle widget
+    m = re.search(r"This item:\s*(.+)", md)
+    if m:
+        t = m.group(1).strip().strip("*")
+        if len(t) > 20:
+            out["title"] = t
+    if not out.get("title"):
+        cands = []
+        for m in re.finditer(r"^#+ (.+)$", md, re.M):
+            t = m.group(1).strip()
+            if t.lower().startswith("product summary:"):
+                t = t.split(":", 1)[1].strip()
+            if len(t) > 20 and not any(g in t.lower() for g in GENERIC):
+                cands.append(t)
+        if cands:
+            out["title"] = max(cands, key=len)
+    prices = re.findall(r"\$[\d,]+\.\d{2}", md)
+    if prices:
+        out["price"] = prices[0]
+        uniq = []
+        for pr in prices[:12]:
+            if pr not in uniq:
+                uniq.append(pr)
+        out["prices_seen_on_page"] = uniq
+    for pat in ("In Stock", "Currently unavailable", r"Only \d+ left in stock",
+                "Temporarily out of stock", "Out of Stock"):
+        m = re.search(pat, md)
+        if m:
+            out["availability"] = m.group(0)
+            break
+    m = re.search(r"([\d.]+) out of 5 stars", md)
+    if m:
+        out["rating"] = m.group(1)
+    return out
+
+
+def verify(asin: str) -> dict:
+    res = {"asin": asin, "url": f"https://www.amazon.com/dp/{asin}"}
+    try:
+        p = subprocess.run([WEBFETCH, res["url"]], capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        res["error"] = "webfetch timed out"
+        return res
+    md = p.stdout
+    if len(md) < 500:
+        res["error"] = "page empty/blocked - COULD NOT VERIFY"
+        return res
+    if "Enter the characters you see below" in md:
+        res["error"] = "captcha wall - COULD NOT VERIFY"
+        return res
+    res.update(parse_page(md))
+    if not res.get("title"):
+        res["error"] = "no title parsed - COULD NOT VERIFY"
+    return res
+
+
+@click.command()
+@click.argument("asins", nargs=-1)
+@click.option("--file", "asin_file", type=click.Path(exists=True), help="File with one ASIN per line")
+@click.option("--json", "as_json", is_flag=True, help="JSON output")
+def main(asins, asin_file, as_json):
+    """Verify Amazon ASINs against live product pages."""
+    todo = list(asins)
+    if asin_file:
+        with open(asin_file) as f:
+            todo += [l.strip() for l in f if l.strip() and not l.startswith("#")]
+    if not todo:
+        click.echo("No ASINs given.", err=True)
+        sys.exit(1)
+    results = []
+    for asin in todo:
+        r = verify(asin)
+        results.append(r)
+        if not as_json:
+            click.echo("-" * 70)
+            click.echo(f"ASIN:  {r['asin']}")
+            if r.get("error"):
+                click.echo(f"  !! {r['error']}")
+            click.echo(f"  TITLE: {r.get('title')}")
+            click.echo(f"  PRICE: {r.get('price')}   seen: {r.get('prices_seen_on_page')}")
+            click.echo(f"  AVAIL: {r.get('availability')}  RATING: {r.get('rating')}")
+    if as_json:
+        click.echo(json.dumps(results, indent=2))
+
+
+if __name__ == "__main__":
+    main()

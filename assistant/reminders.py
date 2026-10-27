@@ -452,33 +452,61 @@ def list_reminders_cli(contact: Optional[str] = None,
         return reminders
 
 
-def cancel_reminder_cli(reminder_id: Optional[str] = None,
-                        title: Optional[str] = None,
-                        force: bool = False) -> int:
+def cancel_reminders_cli(reminder_id: Optional[str] = None,
+                         title: Optional[str] = None,
+                         match: Optional[str] = None,
+                         force: bool = False) -> List[Dict[str, Any]]:
     """
-    Cancel reminder(s) by ID or title.
+    Cancel reminder(s) by ID, exact title, or case-insensitive substring match.
 
-    Returns number of reminders cancelled.
+    - reminder_id: exact id
+    - title: exact title (raises ValueError if multiple match and not force)
+    - match: case-insensitive substring of the FULL title; cancels all matches
+
+    Returns the list of cancelled reminder records (empty if nothing matched).
     """
     with reminders_lock():
         data = load_reminders()
-        original_count = len(data["reminders"])
 
         if reminder_id:
-            data["reminders"] = [r for r in data["reminders"] if r["id"] != reminder_id]
+            def is_target(r):
+                return r["id"] == reminder_id
+        elif match is not None:
+            if not match.strip():
+                raise ValueError("--match must be a non-empty string")
+            needle = match.casefold()
+
+            def is_target(r):
+                return needle in (r.get("title") or "").casefold()
         elif title:
             matches = [r for r in data["reminders"] if r["title"] == title]
             if len(matches) > 1 and not force:
                 raise ValueError(f"Multiple reminders match title '{title}'. Use --force or specify ID.")
-            data["reminders"] = [r for r in data["reminders"] if r["title"] != title]
-        else:
-            raise ValueError("Must specify reminder ID or --title")
 
-        cancelled = original_count - len(data["reminders"])
-        if cancelled > 0:
+            def is_target(r):
+                return r["title"] == title
+        else:
+            raise ValueError("Must specify reminder ID, --title, or --match")
+
+        cancelled = [r for r in data["reminders"] if is_target(r)]
+        if cancelled:
+            data["reminders"] = [r for r in data["reminders"] if not is_target(r)]
             save_reminders(data)
 
         return cancelled
+
+
+def cancel_reminder_cli(reminder_id: Optional[str] = None,
+                        title: Optional[str] = None,
+                        force: bool = False,
+                        match: Optional[str] = None) -> int:
+    """
+    Cancel reminder(s) by ID, title, or substring match.
+
+    Returns number of reminders cancelled.
+    """
+    return len(cancel_reminders_cli(reminder_id=reminder_id, title=title,
+                                    match=match, force=force))
 
 
 def retry_reminder_cli(reminder_id: str) -> bool:

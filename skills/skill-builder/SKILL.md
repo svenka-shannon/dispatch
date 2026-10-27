@@ -193,6 +193,42 @@ Before writing queries, consult `references/api-patterns.md` for:
 - Error codes and handling
 ```
 
+## Recording a Lesson (Self-Healing Edits)
+
+When a task fails or a skill was misleading, fix the skill, but **edit it like documentation, not like a diary.** Skills are git-tracked and upstreamed to other installs, so every line has to be true, general, and free of personal data.
+
+1. **Edit the relevant section in place.** Find where the wrong or missing guidance lives (the step, the troubleshooting entry, the flag table) and change it there. Never `cat >> SKILL.md` a new block at the bottom.
+2. **Delete or fix whatever the lesson contradicts.** If the old text says "use X" and you learned "X breaks, use Y", rewrite the old text. Two sections that disagree are worse than none, because the next session can't tell which one wins.
+3. **State the general rule, not the incident.** Write "Walmart checkout needs the card iframe filled via `fill-card-iframe`", not "On Tuesday the Walmart order failed because...". Keep a one-line *why* if it helps future judgment.
+4. **No dates as headings.** No `## Lessons (YYYY-MM-DD)`, no `### Fix from the <date> call`. The rule should hold no matter when it was learned, and git history already records the when. ("as of" freshness notes on prices are fine.)
+5. **Keep personal and one-off data out of skills.** That covers names, phone numbers, emails, home addresses, order or confirmation numbers, license plates, card digits, LAN IPs, chat ids, and `/Users/<name>/` paths. Where it goes instead:
+   - Facts about a person (preferences, vehicle, address) go in **memory**, meaning Contacts notes or facts (see the `memory` / `contacts` skills).
+   - What went wrong and why goes in **`~/dispatch/POSTMORTEMS.md`**.
+   - When the skill must refer to a person or account, use a runtime lookup such as ``!`identity owner.name` ``, `identity owner.phone`, `identity assistant.email`, or "the admin" / "the owner". Use `~` for paths and placeholders like `192.168.x.x` and `you@example.com` in examples.
+   - Live state (an active watch, a booked table) belongs in the skill's state file or reminders, not in SKILL.md.
+
+**Bad** (appended at the bottom):
+```markdown
+## Lessons (YYYY-MM-DD, <owner>)
+- <owner>'s order #XXXXXXX failed because the 10.0.x.x printer was asleep. Wake it first!
+```
+
+**Good** (edited into the existing Troubleshooting section):
+```markdown
+### Print job hangs
+The printer sleeps and drops the first job. Wake it with `printer wake` and retry once.
+```
+
+### Lint before you finish
+
+```bash
+~/.claude/skills/skill-builder/scripts/skill-lint --changed      # lines you added/changed vs git HEAD
+~/.claude/skills/skill-builder/scripts/skill-lint path/to/SKILL.md  # one file, every line
+~/.claude/skills/skill-builder/scripts/skill-lint --summary       # whole repo + counts by rule
+```
+
+Output is `file:line:rule:snippet`. The rules are `dated-heading`, `private-ip`, `owner-name`/`partner-name` (resolved at runtime via `identity`), `abs-user-path`, `phone`, `email`, and `order-number`. The test suite runs `skill-lint --changed --strict`, so new hits fail tests. Hits that predate the linter are stored as hashes in `lint-baseline.txt` (the cleanup backlog). When you clean one up, its baseline line goes stale and is harmless; regenerate it with `skill-lint --write-baseline`. To keep a reviewed false positive, add `skill-lint: ignore` on that line (e.g. in an HTML comment).
+
 ## Common Skill Categories
 
 ### Category 1: Document & Asset Creation
@@ -274,6 +310,7 @@ Workflow guidance to enhance MCP tool access.
 - [ ] Instructions are clear and actionable
 - [ ] Error handling included
 - [ ] Examples provided
+- [ ] No personal data or dated diary headings (`skill-lint` is clean)
 
 **Testing:**
 - [ ] Triggers on obvious tasks

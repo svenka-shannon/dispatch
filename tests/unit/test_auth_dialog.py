@@ -1133,3 +1133,94 @@ class TestQueueConcurrency:
 
         assert len(handled) == 1
         assert enqueue_result[0] is True  # Was able to enqueue during processing
+
+
+# ---------------------------------------------------------------------------
+# Permission (TCC) prompts owned by non-SecurityAgent processes
+# ---------------------------------------------------------------------------
+
+from assistant.auth_dialog import PERMISSION_PROMPT_TYPE, parse_permission_prompt  # noqa: E402
+
+# Real `axctl tree UserNotificationCenter` output (2026-10-19), default 80-col wrap.
+FIXTURE_TCC_SCREEN = """AXApplication AXTitle='UserNotificationCenter'
+ AXWindow AXTitle=''
+  AXImage 
+  AXStaticText AXValue='“python3.14” is requesting to bypass the system private 
+window picker and directly access your screen and audio.'
+  AXStaticText AXValue='This will allow python3.14 to record your screen and 
+system audio, including personal or sensitive information that may be visible or
+audible.'
+  AXButton AXTitle='Allow'
+  AXButton AXTitle='Open System Settings'
+ AXMenuBar 
+  AXMenuBarItem AXTitle='Apple'
+   AXMenu 
+    AXMenuItem AXTitle='About This Mac'
+"""
+
+
+class TestPermissionPromptParser:
+    def test_parses_tcc_prompt(self):
+        info = parse_permission_prompt(FIXTURE_TCC_SCREEN, "UserNotificationCenter")
+        assert info["requesting_app"] == "python3.14"
+        assert info["buttons"] == ["Allow", "Open System Settings"]
+        assert "bypass the system private window picker" in info["prompt_text"]
+        assert "\n" not in info["prompt_text"]
+        assert "About This Mac" not in info["prompt_text"]
+
+    def test_no_window_returns_none(self):
+        tree = "AXApplication AXTitle='UserNotificationCenter'\n AXMenuBar \n"
+        assert parse_permission_prompt(tree, "UserNotificationCenter") is None
+
+    def test_window_without_text_returns_none(self):
+        tree = "AXApplication AXTitle='X'\n AXWindow AXTitle=''\n  AXImage \n"
+        assert parse_permission_prompt(tree, "X") is None
+
+
+@pytest.mark.asyncio
+class TestPermissionPromptMonitor:
+    async def test_poll_detects_and_never_approves(self):
+        async def mock_run(cmd):
+            if cmd.endswith(" apps"):
+                return "Finder (pid: 1)\nUserNotificationCenter (pid: 9135)\n"
+            if "tree" in cmd and "UserNotificationCenter" in cmd:
+                return FIXTURE_TCC_SCREEN
+            return ""
+
+        escalations = []
+
+        async def mock_escalate(msg, dialog_info=None):
+            escalations.append((msg, dialog_info))
+
+        cfg = AuthDialogConfig(enabled=True, dry_run=False)
+        # Even a catch-all approve rule must not approve a permission prompt
+        cfg.auto_approve = [Rule(name="everything", app_pattern=".*")]
+        monitor = AuthDialogMonitor(config=cfg, run_cmd=mock_run, escalate_fn=mock_escalate,
+                                    ax_backend=MockAXBackend())
+        await monitor.poll()
+        dialog = monitor.queue._queue.get_nowait()
+        assert dialog.dialog_type == PERMISSION_PROMPT_TYPE
+        assert dialog.owner == "UserNotificationCenter"
+        assert dialog.app_name == "python3.14"
+
+        decision = await monitor.classify(dialog, TraceResult(confidence=Confidence.HIGH))
+        assert decision.action == DecisionAction.ESCALATE
+
+        await monitor._handle_dialog(dialog)
+        assert len(escalations) == 1
+        msg, info = escalations[0]
+        assert "python3.14" in msg and "bypass the system private window picker" in msg
+        assert info["owner"] == "UserNotificationCenter"
+        assert info["dialog_type"] == PERMISSION_PROMPT_TYPE
+        assert not monitor._ax._pressed
+        # Long re-escalation suppression for a prompt that stays on screen
+        until = monitor.queue._suppress_until[f"overflow:{dialog.dialog_id}"]
+        assert until - time.monotonic() > 3600
+
+
+class TestPermissionPromptConfig:
+    def test_validate_rejects_auto_approve_permission_prompt(self):
+        cfg = AuthDialogConfig()
+        cfg.auto_approve = [Rule(name="bad", dialog_type=PERMISSION_PROMPT_TYPE)]
+        with pytest.raises(ValueError):
+            cfg.validate()

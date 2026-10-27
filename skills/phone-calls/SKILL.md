@@ -49,10 +49,9 @@ yet; pick lines that a human answers, or note the limitation to the user.
 ## Conducting a call — use `converse` (fast, default)
 
 `converse` is a real-time loop in ONE process: persistent audio streams,
-preloaded kokoro, whisper, and a no-tools Haiku turn via the Agent SDK
-(~1.6-1.7s from their last word to your voice — CLI-per-turn was way too slow
-for a live call). YOU set the goal; the loop holds the conversation and
-hangs up when the goal is met.
+preloaded TTS, whisper, and a no-tools model turn via the Agent SDK
+(CLI-per-turn was way too slow for a live call). YOU set the goal; the loop
+holds the conversation and hangs up when the goal is met.
 
 ```bash
 CALL=~/.claude/skills/phone-calls/scripts/call
@@ -60,17 +59,22 @@ CALL=~/.claude/skills/phone-calls/scripts/call
 $CALL doctor                       # first time: verify setup
 $CALL start "+15551234567"         # dials via Phone app keypad (AX)
 $CALL converse \
-  --goal "Book a table for 2 at 7:30pm tonight under Maynard; if 7:30 unavailable take anything 7-8pm" \
-  --greeting "Hi! I'm Svenka, an AI assistant calling for Eric Maynard. I'd like to book a table." \
+  --goal "Book a table for 2 at 7:30pm tonight under <owner last name>, callback <owner phone>; if 7:30 unavailable take anything 7-8pm" \
+  --greeting "Hi! I'm calling for <owner name>, I'd like to book a table." \
   --transcript /tmp/phone-call/reservation.txt
 $CALL end                          # ALWAYS end — restores audio devices
 cat /tmp/phone-call/reservation.txt   # then report the outcome to the user
 ```
 
+`converse` prints a final machine-readable line (also appended to the
+transcript): `RESULT: reached` (a real two-way exchange with a person) or
+`RESULT: not-reached` (no answer, voicemail, IVR/menu, wrong number). Report
+not-reached calls as "couldn't reach them", never as done.
+
 Manual per-turn primitives (`say` / `listen`) still exist for special cases
-(leaving a voicemail, playing a pre-made recording), but do NOT drive a live
-conversation with them — each invocation pays process+model startup and the
-callee will hang up on the dead air.
+(playing a pre-made recording), but do NOT drive a live conversation with
+them — each invocation pays process+model startup and the callee will hang up
+on the dead air.
 
 `converse` handles the persona itself (see CONVERSE_SYSTEM in the script):
 it introduces itself as "{owner}'s assistant", sounds natural, does **not**
@@ -78,17 +82,56 @@ announce it's an AI on routine errands, but answers honestly and never
 denies being an AI if anyone asks. Set `--goal` with the concrete objective
 and any fallback (e.g. "if 7:30 is unavailable, take anything 7–8pm").
 
-Conversation rules (for the manual `say`/`listen` primitives):
+Writing a good `--goal` / `--greeting`:
+- **Put every detail the callee may ask for in `--goal`** (name, callback
+  number, email if it's OK to share). The prompt only lets the model share
+  details listed in the goal; anything else becomes "I'll have them follow up".
+- The prompt keeps the model in the **caller's** role: it confirms what the
+  callee will do in second person ("so you'll call back at that number?") and
+  never speaks as the business ("we'll reach out").
+- Emails and US phone numbers are rewritten into speakable form before TTS
+  ("jane dot doe at example dot com", digit groups), and the TTS sentence
+  splitter never cuts inside an email. Raw addresses get mangled otherwise.
+- The `--greeting` is pre-rendered while the phone rings. If the first
+  utterance is short (< 2s, a live "Hello?"), it plays **instantly** while
+  whisper transcribes in parallel. Longer openings are transcribed first and
+  checked for voicemail/IVR cues, so a recording never gets the opener.
+
+Not reached (no answer, voicemail, IVR/menu, wrong number):
+- Default `--voicemail hangup`: hang up silently. **No voicemail on errands
+  unless the user asked for one** — an errand greeting is usually a question
+  and makes no sense as a message.
+- `--voicemail leave` (personal calls): waits out the outgoing greeting and
+  beep, then speaks `--greeting` as the message. Write the greeting so it
+  works as a message.
+- Detection: the first utterance is checked for voicemail/IVR cues (beep,
+  "leave a message", "not available", "press N", "mailbox", "voicemail")
+  before greeting; mid-call, the model outputs `[UNREACHED]` on a recording,
+  a menu it can't navigate, or a wrong number. A `[HANGUP]` only logs
+  "goal met" after a real two-way exchange; otherwise "ended".
+
+Conversation rules (also for the manual `say`/`listen` primitives):
 - Keep each `say` short (1–3 sentences) — long monologues feel robotic and
   the callee will start talking over you.
 - Empty/garbled transcript? Just `listen` again once, then ask them to repeat.
-- No speech for 45s after start → likely voicemail or no answer: leave a short
-  message with `say`, then `end`. (Ringback tones can trigger a brief false
-  "speech" — an empty transcript from it is normal; keep listening.)
+- No speech for 45s after start, or a voicemail/menu → not reached: `end`
+  without a message (unless the user asked for a voicemail or it's a personal
+  call). (Ringback tones can trigger a brief false "speech" — an empty
+  transcript from it is normal; keep listening.)
 - **ALWAYS run `call end`** when done (even on errors) — it restores the Mac's
   audio devices. If a call crashed mid-way: `call devices --restore`.
 - Only call people when asked to, or admin/partner tier for things they'd
   clearly want a call about. Mind the hour in the callee's timezone.
+
+## Rehearsing a call
+
+Rehearse over the **same transport as the real call**: if the real call is
+to a phone number, rehearse to a phone number via the cellular path (plain
+`call start "+1..."`), never `--facetime` — FaceTime Audio has different
+audio, latency and answer behavior, so it doesn't validate the real call.
+Only rehearse over FaceTime when the real call will be FaceTime. Use the same
+`converse` flags (`--model`, `--effort`, `--voicemail`, goal, greeting) as the
+real call.
 
 ## Commands
 
@@ -96,8 +139,8 @@ Conversation rules (for the manual `say`/`listen` primitives):
 |---|---|
 | `call doctor` | Check all prerequisites (BlackHole, whisper, TTS, AX) |
 | `call start <tel-or-email> [--facetime] [--video]` | Place call (numbers → cellular via iPhone; emails → FaceTime) |
-| `call converse --goal "..." [--greeting "..."] [--voice af_heart]` | **Real-time conversation loop (the main path)** |
-| `call say "text" [--voice af_heart] [--engine qwen --style "..."]` | Speak one line (voicemail / pre-made audio) |
+| `call converse --goal "..." [--greeting "..."] [--voicemail hangup\|leave] [--model M] [--effort low]` | **Real-time conversation loop (the main path)** |
+| `call say "text" [--voice af_heart] [--engine qwen --style "..."]` | Speak one line (pre-made audio, special cases) |
 | `call listen [--wait-for-speech] [--max N] [--json] [--raw f.wav]` | Hear + transcribe |
 | `call status` | In-call state + audio routing |
 | `call end` | Hang up + restore audio |
@@ -155,3 +198,21 @@ comparison with measured RTF: `/tmp/phone-call/tts-research.md`.
 - Mac audio stuck weird after a crash: `call devices --restore`.
 - state lives in `/tmp/phone-call/state.json`; last capture:
   `/tmp/phone-call/listen-last.wav`.
+
+## Latency and brain model
+
+A turn costs roughly 1.2-2.5s from the callee's last word to our voice:
+0.6s end-of-speech silence + whisper + model first token + TTS first chunk.
+The next levers are a smaller whisper model or streaming STT.
+
+Brain options (`--model`, thinking always off; `--effort low|medium|high`).
+Approximate time to first text token via the Agent SDK:
+
+| Model | First token | Notes |
+|---|---|---|
+| `claude-haiku-5-5` (default, `--effort low`) | 1.0-2.4s | smarter than Haiku 4.5; default |
+| `claude-haiku-4-5-20251001` | ~0.8s | use when raw speed matters more |
+| `claude-sonnet-5-5` | 1.2-3.1s | better conversation, more lag |
+| `claude-opus-5-5` | 1.7-3.5s | slowest |
+
+Add ~1s for end-of-speech detection plus whisper on top of these.

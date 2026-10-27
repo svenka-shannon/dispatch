@@ -12,6 +12,11 @@ Usage:
   auth-dialog-approve always <dialog_id>    # Approve + add auto_approve rule to config
   auth-dialog-approve list                  # List pending escalated dialogs
   auth-dialog-approve info <dialog_id>      # Show dialog details
+  auth-dialog-approve press <dialog_id> "<button>"  # Click a named button (permission prompts)
+  auth-dialog-approve scan                  # One-shot, read-only: show auth/permission dialogs on screen now
+
+Permission (TCC) prompts (dialog_type=permission_prompt, owned by e.g.
+UserNotificationCenter) are never auto-approved and `always` refuses them.
 
 Pending dialogs are stored in ~/dispatch/state/auth_dialog_pending.json.
 Resolution happens directly via PyObjC — no daemon IPC needed.
@@ -111,6 +116,50 @@ def find_security_agent_pid() -> int | None:
         if w.get("kCGWindowOwnerName") == "SecurityAgent":
             return w.get("kCGWindowOwnerPID")
     return None
+
+
+PERMISSION_PROMPT_TYPE = "permission_prompt"
+DENY_TITLES = ("Don\u2019t Allow", "Don't Allow", "Deny", "Cancel")
+
+
+def find_owner_pid(owner: str) -> int | None:
+    """Find the PID of an on-screen window owner via Quartz."""
+    from Quartz import (CGWindowListCopyWindowInfo, kCGWindowListOptionOnScreenOnly,
+                        kCGNullWindowID)
+    for w in CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, kCGNullWindowID) or []:
+        if w.get("kCGWindowOwnerName") == owner:
+            return w.get("kCGWindowOwnerPID")
+    return None
+
+
+def click_owner_button(owner: str, titles: tuple[str, ...]) -> bool:
+    """Click the first matching button in any window of `owner` (permission prompts)."""
+    import ApplicationServices as AS
+
+    pid = find_owner_pid(owner)
+    if not pid:
+        print(f"No {owner} window on screen (prompt already gone?)")
+        return False
+    app = AS.AXUIElementCreateApplication(pid)
+    err, windows = AS.AXUIElementCopyAttributeValue(app, "AXWindows", None)
+    if err != 0 or not windows:
+        print(f"Could not access {owner} windows")
+        return False
+    seen = []
+    for window in windows:
+        err, kids = AS.AXUIElementCopyAttributeValue(window, "AXChildren", None)
+        for child in (kids or []) if err == 0 else []:
+            err, role = AS.AXUIElementCopyAttributeValue(child, "AXRole", None)
+            if err != 0 or role != "AXButton":
+                continue
+            err, btn_title = AS.AXUIElementCopyAttributeValue(child, "AXTitle", None)
+            seen.append(btn_title)
+            if err == 0 and btn_title in titles:
+                AS.AXUIElementPerformAction(child, "AXPress")
+                print(f"Clicked '{btn_title}' on {owner}")
+                return True
+    print(f"None of {list(titles)} found on {owner}; buttons there: {seen}")
+    return False
 
 
 def click_button(title: str) -> bool:
@@ -300,7 +349,10 @@ def cmd_approve(args):
     dialog_info = load_pending().get(args.dialog_id, {})
     dialog_type = dialog_info.get("dialog_type", "unknown")
 
-    if dialog_type == "password_auth":
+    if dialog_type == PERMISSION_PROMPT_TYPE:
+        success = click_owner_button(dialog_info.get("owner", "UserNotificationCenter"),
+                                     ("Allow", "OK"))
+    elif dialog_type == "password_auth":
         success = enter_password_and_click_ok()
     else:
         success = click_button("OK") or click_button("Allow")
@@ -317,7 +369,14 @@ def cmd_approve(args):
 
 def cmd_deny(args):
     dialog_info = load_pending().get(args.dialog_id, {})
-    success = click_button("Cancel")
+    if dialog_info.get("dialog_type") == PERMISSION_PROMPT_TYPE:
+        success = click_owner_button(dialog_info.get("owner", "UserNotificationCenter"), DENY_TITLES)
+        if not success:
+            print("This prompt has no deny button. Leave it, or use: "
+                  f'auth-dialog-approve press {args.dialog_id} "Open System Settings" '
+                  "(dismisses it without granting; opens the Settings pane).")
+    else:
+        success = click_button("Cancel")
 
     _log_resolution("denied", args.dialog_id, dialog_info, success)
 
@@ -338,6 +397,10 @@ def cmd_always(args):
 
     # First approve
     dialog_type = dialog_info.get("dialog_type", "unknown")
+    if dialog_type == PERMISSION_PROMPT_TYPE:
+        print("Refusing: permission (TCC) prompts are never auto-approved, so no 'always' rule. "
+              f"Use: auth-dialog-approve approve {args.dialog_id}")
+        sys.exit(2)
     if dialog_type == "password_auth":
         success = enter_password_and_click_ok()
     else:
@@ -364,6 +427,50 @@ def cmd_list(args):
         print(f"  {did[:12]}  {info.get('app_name', '?')} — {info.get('action', '?')} [{info.get('dialog_type', '?')}]")
 
 
+def cmd_press(args):
+    dialog_info = load_pending().get(args.dialog_id)
+    if not dialog_info:
+        print(f"Error: dialog {args.dialog_id} not found in pending")
+        sys.exit(1)
+    owner = dialog_info.get("owner", "SecurityAgent")
+    success = click_owner_button(owner, (args.button,))
+    _log_resolution("pressed", args.dialog_id, dialog_info, success)
+    if success:
+        remove_pending(args.dialog_id)
+    else:
+        sys.exit(1)
+
+
+def cmd_scan(args):
+    """One-shot, read-only: list SecurityAgent + permission prompt windows on screen now."""
+    sys.path.insert(0, str(Path.home() / "dispatch"))
+    from assistant.auth_dialog import (AXCTL, PERMISSION_PROMPT_OWNERS, axctl_tree_cmd,
+                                       parse_permission_prompt)
+    from Quartz import (CGWindowListCopyWindowInfo, kCGWindowListOptionOnScreenOnly,
+                        kCGNullWindowID)
+    owners = {w.get("kCGWindowOwnerName") for w in
+              CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, kCGNullWindowID) or []}
+    found = 0
+    if "SecurityAgent" in owners:
+        found += 1
+        print("SecurityAgent dialog on screen (auth prompt). Details: "
+              f"{AXCTL} tree SecurityAgent")
+    for owner in PERMISSION_PROMPT_OWNERS:
+        if owner not in owners:
+            continue
+        tree = subprocess.run(axctl_tree_cmd(owner), shell=True, capture_output=True,
+                              text=True, timeout=15).stdout
+        info = parse_permission_prompt(tree, owner)
+        if not info:
+            continue
+        found += 1
+        print(f"PERMISSION PROMPT (owner {owner}) from {info['requesting_app']}:")
+        print(f"  {info['prompt_text']}")
+        print(f"  buttons: {info['buttons']}")
+    if not found:
+        print("No auth or permission dialogs on screen")
+
+
 def cmd_info(args):
     info = load_pending().get(args.dialog_id)
     if not info:
@@ -383,6 +490,10 @@ def main():
     sub.add_parser("list")
     p_info = sub.add_parser("info")
     p_info.add_argument("dialog_id")
+    p_press = sub.add_parser("press", help="click a named button on the dialog's owner window")
+    p_press.add_argument("dialog_id")
+    p_press.add_argument("button")
+    sub.add_parser("scan", help="one-shot read-only check for dialogs on screen now")
 
     args = parser.parse_args()
     if not args.command:
@@ -390,7 +501,8 @@ def main():
         sys.exit(1)
 
     {"approve": cmd_approve, "deny": cmd_deny, "always": cmd_always,
-     "list": cmd_list, "info": cmd_info}[args.command](args)
+     "list": cmd_list, "info": cmd_info, "press": cmd_press,
+     "scan": cmd_scan}[args.command](args)
 
 
 if __name__ == "__main__":

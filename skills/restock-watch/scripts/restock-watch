@@ -1,0 +1,299 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# ///
+"""restock-watch: detect when a product becomes buyable, then wake the owning SDK session to buy it.
+
+  restock-watch add <name> --store https://shop.example.com --query "riftbound radiance" \
+        --include radiance --exclude event,pre-rift --max-price 150 --session imessage/_15555550100 \
+        [--gmail-query 'from:(gamersguild) newer_than:2d radiance'] [--raw-query] [--gmail-allow-orders] \
+        --instructions "buy 1, ship to ..."
+  restock-watch check [<name>]      # one pass over all (or one) watches; fires once per new hit
+  restock-watch set-query <name> '<gmail query>'   # change gmail_query AND reset the Gmail baseline (keeps 'fired')
+  restock-watch list | rm <name> | reset <name>
+
+Sources per watch:
+  store  Shopify /search/suggest.json (plain HTTP, no browser). Hit = product title contains all --include terms,
+         none of --exclude, available=true, price <= --max-price. Polled every run unless "store_poll": false.
+  gmail  optional. Sven's Gmail searched in Chrome (chrome djs on a mail.google.com tab). Each visible row is parsed
+         into {from, subject, snippet}. A NEW row (not in the baseline) is a lead unless:
+           - from+subject are both empty  -> logged "gmail: empty row skipped", never fires
+           - subject/snippet look like order/shipping/receipt/reply mail (NOT_RESTOCK_RE) -> logged "suppressed",
+             never fires (override per watch with "gmail_allow_orders": true / add --gmail-allow-orders)
+         `add` appends " -order -receipt -shipped -tracking" to --gmail-query unless --raw-query.
+On a store hit:  inject "RESTOCK HIT ... Act NOW" into the owning session.
+On a gmail lead: run ONE storefront check (even if store_poll is false), then inject "GMAIL HIT (unverified lead) ..."
+                 with From/Subject/Snippet + storefront result, telling the session to verify the email before buying.
+Each hit fires once. State: ~/dispatch/state/restock-watch.json   Log: ~/dispatch/logs/restock-watch.log
+"""
+import argparse, fcntl, hashlib, json, os, re, subprocess, sys, tempfile, time, urllib.parse, urllib.request
+from contextlib import contextmanager
+from pathlib import Path
+
+STATE = Path.home() / "dispatch/state/restock-watch.json"
+LOCK = Path.home() / "dispatch/state/restock-watch.lock"
+LOG = Path.home() / "dispatch/logs/restock-watch.log"
+CA = str(Path.home() / "dispatch/bin/claude-assistant")
+CHROME = str(Path.home() / ".claude/skills/chrome-control/scripts/chrome")
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0 Safari/537.36"
+DEFAULT_QUERY_SUFFIX = " -order -receipt -shipped -tracking"
+
+# Mail that is about an existing order / a reply / a forward -- never a restock notice.
+NOT_RESTOCK_RE = re.compile(
+    r"order\s+confirm(ed|ation)?"
+    r"|\byour\s+(\w+\s+)?order\b"          # "your order", "your delivery order"
+    r"|\border\s*(#|no\.?\s|number)"
+    r"|\bshipped\b|\bhas\s+shipped\b|shipping\s+confirmation"
+    r"|\bdelivered\b|\breceipt\b|\btracking\b|\binvoice\b"
+    r"|thanks\s+for\s+your\s+(\w+\s+)?order"
+    r"|\byour\s+package\b|\bpackage\s+(is|has|was)\b|\bout\s+for\s+delivery\b|^\s*arrived\s*:|\bdelayed\b"  # 2026-10-24: Walmart shipping-status false fires
+    r"|^\s*fwd?\s*:|^\s*re\s*:",
+    re.I)
+
+# Gmail row -> {id, from, subject, snippet}. textContent (not innerText) so hidden/background rendering can't blank it.
+# .yW [email] = sender spans (name/email attrs), .bog = subject, .y2 = snippet (" - ..." prefix).
+GMAIL_ROWS_JS = r"""
+const t = e => e ? e.textContent.replace(/\s+/g, ' ').trim() : '';
+return [...document.querySelectorAll('tr.zA')].filter(r => r.offsetParent).slice(0, 10).map(r => {
+  const tid = r.querySelector('[data-legacy-thread-id]') || r.querySelector('[data-thread-id]');
+  const senders = [...r.querySelectorAll('.yW [email]')].map(e => {
+    const n = (e.getAttribute('name') || e.textContent || '').trim(), m = e.getAttribute('email') || '';
+    return m && m !== n ? (n ? n + ' <' + m + '>' : m) : n;
+  }).filter(Boolean);
+  return {
+    id: tid ? (tid.getAttribute('data-legacy-thread-id') || tid.getAttribute('data-thread-id') || '') : '',
+    from: senders.join(', ') || t(r.querySelector('.yW')),
+    subject: t(r.querySelector('.bog')),
+    snippet: t(r.querySelector('.y2')).replace(/^-\s*/, ''),
+  };
+});
+"""
+
+
+def log(msg):
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    with LOG.open("a") as f:
+        f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+
+
+@contextmanager
+def locked():
+    """Serialize state mutations (LaunchAgent check vs. manual set-query/add/rm) so none clobbers another."""
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK.open("w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def load():
+    return json.loads(STATE.read_text()) if STATE.exists() else {"watches": {}}
+
+
+def save(st):
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=STATE.parent, prefix=".restock-watch.", suffix=".json")
+    with os.fdopen(fd, "w") as f:
+        f.write(json.dumps(st, indent=2))
+    os.replace(tmp, STATE)
+
+
+def store_hits(w):
+    q = urllib.parse.quote(w["query"])
+    url = f"{w['store'].rstrip('/')}/search/suggest.json?q={q}&resources%5Btype%5D=product&resources%5Blimit%5D=10"
+    data = json.loads(urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": UA}), timeout=20).read())
+    hits = []
+    for p in data["resources"]["results"]["products"]:
+        t = p["title"].lower()
+        if not all(i.lower() in t for i in w["include"]):
+            continue
+        if any(e.lower() in t for e in w["exclude"]):
+            continue
+        price = float(p.get("price") or 0)
+        if not p.get("available"):
+            continue
+        if w.get("max_price") and price > w["max_price"]:
+            log(f"[{w['name']}] available but over max price: {p['title']} ${price}")
+            continue
+        hits.append({"source": "store", "id": "store:" + str(p.get("id") or p["url"]), "title": p["title"],
+                     "price": price, "url": w["store"].rstrip("/") + p["url"].split("?")[0]})
+    return hits
+
+
+def storefront_summary(w):
+    """One-shot storefront check used to annotate Gmail leads (does not fire anything)."""
+    if not (w.get("store") and w.get("query")):
+        return "no storefront configured"
+    try:
+        hits = store_hits(w)
+    except Exception as e:
+        return f"storefront check failed ({e})"
+    if not hits:
+        return "no matching available product"
+    return "; ".join(f"{h['title']} ${h['price']:.2f} {h['url']}" for h in hits)
+
+
+def is_not_restock(row):
+    return bool(NOT_RESTOCK_RE.search(row.get("subject") or "") or NOT_RESTOCK_RE.search(row.get("snippet") or ""))
+
+
+def parse_gmail_rows(rows):
+    out = []
+    for r in rows:
+        frm, subj, snip = (str(r.get(k) or "").strip() for k in ("from", "subject", "snippet"))
+        rid = str(r.get("id") or "").strip()
+        if not rid:   # no thread id in the DOM: stable id from content
+            rid = "row-" + hashlib.sha1(f"{frm}|{subj}".encode()).hexdigest()[:16]
+        out.append({"source": "gmail", "id": "gmail:" + rid, "from": frm, "subject": subj, "snippet": snip})
+    return out
+
+
+def gmail_hits(w):
+    """Return ALL visible Gmail rows for the watch's query, parsed. Filtering happens in check()."""
+    if not w.get("gmail_query"):
+        return []
+    tabs = subprocess.run([CHROME, "tabs"], capture_output=True, text=True, timeout=30).stdout
+    tab, cur = None, None
+    for l in tabs.splitlines():          # format: "<tabId>  <title>" then an indented URL line
+        m = re.match(r"^(\d{5,})\s", l)
+        if m:
+            cur = m.group(1)
+        if "mail.google.com" in l and cur:
+            tab = cur
+            break
+    if not tab:
+        out = subprocess.run([CHROME, "open", "https://mail.google.com/mail/u/0/#inbox"], capture_output=True, text=True, timeout=30).stdout
+        m = re.search(r"\d{5,}", out); tab = m.group(0) if m else None
+        time.sleep(6)
+    if not tab:
+        log("gmail: no tab"); return []
+    subprocess.run([CHROME, "navigate", tab, "https://mail.google.com/mail/u/0/#search/" + urllib.parse.quote(w["gmail_query"])],
+                   capture_output=True, text=True, timeout=30)
+    time.sleep(6)
+    out = subprocess.run([CHROME, "djs", tab, GMAIL_ROWS_JS], capture_output=True, text=True, timeout=30).stdout
+    try:
+        rows = json.loads(out).get("result") or []
+    except Exception:
+        log("gmail: parse fail " + out); return []
+    return parse_gmail_rows(rows)
+
+
+def wake_text(w, hit, storefront=None):
+    tail = (f"Instructions from the owner: {w['instructions']}\n"
+            f"After acting, text the result. Then run: restock-watch rm {w['name']} if done.")
+    if hit["source"] == "gmail":
+        return (f"GMAIL HIT (unverified lead) for watch '{w['name']}': From: {hit['from'] or '(blank)'} | "
+                f"Subject: {hit['subject'] or '(blank)'} | Snippet: {hit['snippet'] or '(blank)'}. "
+                f"Storefront check: {storefront}. Open the email and confirm it is a restock/availability notice for "
+                f"the target product before buying. If it's an order/shipping/receipt/newsletter, do NOT buy.\n" + tail)
+    return (f"RESTOCK HIT for watch '{w['name']}': {hit['title']} (${hit['price']}) {hit['url']}\n"
+            f"Act NOW (restocks sell out).\n" + tail)
+
+
+def fire(w, hit, storefront=None):
+    msg = wake_text(w, hit, storefront)
+    r = subprocess.run([CA, "inject-prompt", w["session"], "--admin", msg], capture_output=True, text=True, timeout=60)
+    desc = (f"from={hit['from']!r} subject={hit['subject']!r} storefront={storefront!r}" if hit["source"] == "gmail"
+            else f"{hit['title']} ${hit['price']} {hit['url']}")
+    log(f"[{w['name']}] FIRED {hit['id']} {desc} -> inject rc={r.returncode} {r.stdout.strip()} {r.stderr.strip()}")
+
+
+def check(st, only=None):
+    for name, w in list(st["watches"].items()):
+        if only and name != only:
+            continue
+        w["name"] = name
+        fired = set(w.get("fired", []))
+        hits = []
+        try:
+            if w.get("store_poll", True):
+                hits += store_hits(w)
+        except Exception as e:
+            log(f"[{name}] store error: {e}")
+        if w.get("gmail_query") and time.time() - w.get("gmail_last", 0) >= w.get("gmail_every", 300):
+            try:
+                found = gmail_hits(w)
+                w["gmail_last"] = time.time()
+                if w.get("gmail_baseline") is None:      # first run: existing threads are not hits
+                    w["gmail_baseline"] = [h["id"] for h in found]
+                    log(f"[{name}] gmail baseline set ({len(found)} rows)")
+                    found = []
+                base = set(w["gmail_baseline"])
+                suppressed = set(w.get("gmail_suppressed", []))
+                for h in found:
+                    if h["id"] in base or h["id"] in fired:
+                        continue
+                    if not (h["from"] or h["subject"]):
+                        log(f"[{name}] gmail: empty row skipped {h['id']} snippet={h['snippet']!r}")
+                        continue
+                    if not w.get("gmail_allow_orders") and is_not_restock(h):
+                        if h["id"] not in suppressed:   # log once, but re-check every run
+                            log(f"[{name}] gmail: suppressed {h['id']} (order/shipping/reply) "
+                                f"from={h['from']!r} subject={h['subject']!r} snippet={h['snippet']!r}")
+                            suppressed.add(h["id"])
+                        continue
+                    hits.append(h)
+                w["gmail_suppressed"] = sorted(suppressed)
+            except Exception as e:
+                log(f"[{name}] gmail error: {e}")
+        storefront = None
+        for h in hits:
+            if h["id"] in fired:
+                continue
+            if h["source"] == "gmail" and storefront is None:
+                storefront = storefront_summary(w)   # one storefront check per pass, only when a Gmail lead fires
+            fire(w, h, storefront)
+            fired.add(h["id"])
+        w["fired"] = sorted(fired)
+        w["last_check"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    save(st)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp = ap.add_subparsers(dest="cmd", required=True)
+    a = sp.add_parser("add"); a.add_argument("name"); a.add_argument("--store", required=True); a.add_argument("--query", required=True)
+    a.add_argument("--include", default=""); a.add_argument("--exclude", default=""); a.add_argument("--max-price", type=float)
+    a.add_argument("--session", required=True); a.add_argument("--gmail-query"); a.add_argument("--instructions", required=True)
+    a.add_argument("--raw-query", action="store_true", help=f"don't append '{DEFAULT_QUERY_SUFFIX.strip()}' to --gmail-query")
+    a.add_argument("--gmail-allow-orders", action="store_true", help="let order/shipping/receipt-looking Gmail rows fire")
+    c = sp.add_parser("check"); c.add_argument("name", nargs="?")
+    sq = sp.add_parser("set-query", help="set gmail_query and reset gmail_baseline/gmail_last (keeps 'fired')")
+    sq.add_argument("name"); sq.add_argument("query")
+    sp.add_parser("list"); r = sp.add_parser("rm"); r.add_argument("name"); rs = sp.add_parser("reset"); rs.add_argument("name")
+    args = ap.parse_args()
+    if args.cmd == "list":
+        print(json.dumps(load()["watches"], indent=1)); return
+    with locked():
+        st = load()
+        if args.cmd == "add":
+            gq = args.gmail_query
+            if gq and not args.raw_query:
+                gq += DEFAULT_QUERY_SUFFIX
+            st["watches"][args.name] = {"store": args.store, "query": args.query,
+                "include": [x for x in args.include.split(",") if x], "exclude": [x for x in args.exclude.split(",") if x],
+                "max_price": args.max_price, "session": args.session, "gmail_query": gq,
+                "gmail_allow_orders": args.gmail_allow_orders,
+                "instructions": args.instructions, "fired": [], "created": time.strftime("%Y-%m-%d %H:%M")}
+            save(st); print(f"added {args.name}" + (f" gmail_query={gq!r}" if gq else ""))
+        elif args.cmd == "check":
+            check(st, args.name); print(json.dumps({k: {"last_check": v.get("last_check"), "fired": v.get("fired")} for k, v in st["watches"].items()}, indent=1))
+        elif args.cmd == "set-query":
+            if args.name not in st["watches"]:
+                sys.exit(f"no such watch: {args.name}")
+            w = st["watches"][args.name]
+            old = w.get("gmail_query")
+            w["gmail_query"] = args.query; w["gmail_baseline"] = None; w["gmail_last"] = 0
+            save(st)
+            log(f"[{args.name}] set-query {old!r} -> {args.query!r} (baseline reset)")
+            print(f"{args.name}: gmail_query={args.query!r}; baseline reset, next check re-baselines (fired kept)")
+        elif args.cmd == "rm":
+            st["watches"].pop(args.name, None); save(st); print("removed")
+        elif args.cmd == "reset":
+            w = st["watches"][args.name]; w["fired"] = []; w["gmail_baseline"] = None; w["gmail_last"] = 0; save(st); print("reset")
+
+
+if __name__ == "__main__":
+    main()

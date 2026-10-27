@@ -1,0 +1,883 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["beautifulsoup4", "pillow"]
+# ///
+"""mpwatch: search / watch Facebook Marketplace + Craigslist listings near home.
+
+  mpwatch search "<query>" [--source fb,cl] [--max-price N] [--min-price N] [--json]
+  mpwatch add <name> --query "<q>" [--max-price N] [--min-price N] [--source fb,cl] [--note "taste notes"]
+  mpwatch set <name> [--max-price N] [--min-price N] [--note "..."] [--query "..."] [--fb-queries "q1,q2,..."]
+  mpwatch set <name> --chat <chat_id>  # where this watch's cards get posted
+  mpwatch set <name> --exclude "glass,round,desk"   # title words `new --brief` drops ('' clears); --thing "a coffee table"
+  mpwatch new <name> [--json]       # listings not seen before for this watch (marks them seen)
+  mpwatch new <name> --brief [--exclude w,w] [--save new.json] [--show-dropped] [--from new.json] [--no-mark]
+                                    # one line per listing: index source price title [dims] · location, title filter
+                                    # applied; --save writes the kept list so contact-sheet tile N = line N
+  mpwatch engaged <name> [--note "keep"]   # someone replied about this watch (lastcard notes count too)
+  mpwatch status <name> [--json]           # days since engagement, phase, sweep today?, check-in state
+  mpwatch sweep-due <name>                 # exit 0 = sweep today, 1 = skip silently, 2 = no such watch
+  mpwatch checkin-due <name> [--mark]      # exit 0 = send the ONE 7-day check-in now (prints text); --mark records it
+  mpwatch detail <url> [<url> ...] [--image-out f.jpg | --image-dir D]   # title, description, photo
+  mpwatch list                      # show watches
+  mpwatch rm <name>
+  mpwatch card <watch> --picks picks.json [--date YYYY-MM-DD] [--out-dir D]
+                                    # detail -> card yaml -> render -> crop -> lastcard push. Prints PNG path. Never sends.
+  mpwatch lastcard push <picks.json> [--watch W] [--date D]   # record picks (ids MMDD-N), keeps 14 days
+  mpwatch lastcard show [--date D] [--considered] [--json]
+  mpwatch lastcard find <id|number|text> [--url] [--json]     # "1020-1", "1" (newest first), "walnut oakland"
+  mpwatch lastcard note <id> "text"                           # record feedback on a pick
+  mpwatch lastcard migrate                                    # one-time v1 -> v2 (auto on first use; keeps a .v1.bak.json)
+
+Sources:
+  fb  Facebook Marketplace, browsed LOGGED OUT through the Chrome extension
+      (~45 results per query after closing the login modal + scrolling).
+  cl  Craigslist SF Bay, Peninsula + SF city subareas, from the static HTML results (no browser).
+
+State: ~/dispatch/state/marketplace-watch.json (watches + seen listing ids),
+       ~/dispatch/state/marketplace-watch-lastcard.json (v2: picks sent on cards + runners-up, 14 days).
+"""
+import argparse, datetime as dt, importlib.machinery, importlib.util, json, os, re, shutil, subprocess, sys, time, urllib.parse, urllib.request
+from pathlib import Path
+
+STATE = Path(os.environ.get("MPWATCH_STATE") or Path.home() / "dispatch/state/marketplace-watch.json")
+LASTCARD = Path(os.environ.get("MPWATCH_LASTCARD") or Path.home() / "dispatch/state/marketplace-watch-lastcard.json")
+RENDER = Path.home() / ".claude/skills/visual-cards/scripts/render"
+KEEP_DAYS = 14
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0 Safari/537.36"
+FB_CITY = "sanfrancisco"      # FB Marketplace city slug (covers Pacifica / Daly City with radius)
+FB_RADIUS_KM = 25
+CL_SUBAREAS = ["pen", "sfc"]  # Craigslist SF Bay: peninsula + SF city
+FB_BADGES = {"just listed"}   # FB tile badge line that otherwise gets parsed as the title
+IDLE_DAYS = 7                 # no reply/engagement for this long -> one check-in text
+SLOW_EVERY = 3                # after the check-in, sweep only every Nth day until engagement resumes
+
+
+def load():
+    if STATE.exists():
+        return json.loads(STATE.read_text())
+    return {"watches": {}}
+
+
+def save(st):
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(json.dumps(st, indent=2))
+
+
+def price_num(p):
+    if not p:
+        return None
+    if "free" in p.lower():
+        return 0.0
+    m = re.search(r"[\d,]+(?:\.\d+)?", p)
+    return float(m.group(0).replace(",", "")) if m else None
+
+
+# ── Craigslist ──────────────────────────────────────────────
+def search_cl(query):
+    from bs4 import BeautifulSoup
+    out = []
+    for sub in CL_SUBAREAS:
+        url = f"https://sfbay.craigslist.org/search/{sub}/fua?query={urllib.parse.quote_plus(query)}"
+        req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "text/html"})
+        try:
+            html = urllib.request.urlopen(req, timeout=30).read().decode("utf-8", "replace")
+        except Exception as e:
+            print(f"[cl] {sub}: {e}", file=sys.stderr)
+            continue
+        soup = BeautifulSoup(html, "html.parser")
+        for li in soup.select("li.cl-static-search-result"):
+            a = li.find("a")
+            if not a:
+                continue
+            href = a["href"]
+            pid = href.rstrip("/").split("/")[-1]
+            pr = li.select_one(".price")
+            loc = li.select_one(".location")
+            out.append({"source": "cl", "id": "cl:" + pid, "title": li.get("title") or a.get_text(" ", strip=True),
+                        "price": pr.get_text(strip=True) if pr else "", "location": loc.get_text(strip=True) if loc else sub,
+                        "url": href, "image": ""})
+    return out
+
+
+# ── Facebook Marketplace (logged out, via Chrome extension) ─
+def _chrome():
+    src = Path.home() / ".claude/skills/chrome-control/scripts/chrome"
+    ld = importlib.machinery.SourceFileLoader("chromecli", str(src))
+    spec = importlib.util.spec_from_loader("chromecli", ld)
+    m = importlib.util.module_from_spec(spec)
+    argv = sys.argv
+    sys.argv = ["chrome"]
+    ld.exec_module(m)
+    sys.argv = argv
+    return m, m.ChromeControl(m.find_profile_socket(None))
+
+
+def search_fb(query, max_price=None, min_price=None, _retry=True):
+    m, client = _chrome()
+    q = {"query": query, "radius": FB_RADIUS_KM}
+    if max_price:
+        q["maxPrice"] = int(max_price)
+    if min_price:
+        q["minPrice"] = int(min_price)
+    url = f"https://www.facebook.com/marketplace/{FB_CITY}/search?" + urllib.parse.urlencode(q)
+    r = client.send("open_tab", url=url)
+    tab = (r.get("result") or r).get("tabId") if isinstance(r, dict) else None
+    if not tab:
+        tab = r.get("id") if isinstance(r, dict) else None
+    if not tab:
+        print(f"[fb] could not open tab: {str(r)[:200]}", file=sys.stderr)
+        return []
+    try:
+        time.sleep(9)
+        # close the logged-out login modal and scroll: grows results from ~15 to ~45
+        for _ in range(3):
+            client.send("debugger_eval", tabId=tab, code=(
+                "document.querySelectorAll('[aria-label=Close]').forEach(b=>b.click());"
+                "window.scrollBy(0,4000);return 1;"))
+            time.sleep(3)
+        code = ("const out=[];for(const a of document.querySelectorAll('a[href*=\"/marketplace/item/\"]')){"
+                "const id=(a.href.match(/item\\/(\\d+)/)||[])[1];if(!id)continue;"
+                "const lines=a.innerText.split('\\n').map(s=>s.trim()).filter(Boolean);"
+                "const img=a.querySelector('img');"
+                "out.push({id,lines,img:img?img.src:''})}return out;")
+        res = client.send("debugger_eval", tabId=tab, code=code)
+        items = res.get("result") if isinstance(res, dict) else None
+        if isinstance(items, dict) and "result" in items:
+            items = items["result"]
+        if not isinstance(items, list):
+            # e.g. "No current window" when Chrome is running with zero windows; don't crash the whole sweep
+            print(f"[fb] eval failed for {query!r}: {res}", file=sys.stderr)
+            items = None
+    finally:
+        try:
+            client.send("close_tab", tabId=tab)
+        except Exception:
+            pass
+    if items is None:
+        if _retry:
+            # Chrome running with zero windows -> "No current window". Open one (not AppleScript) and retry once.
+            subprocess.run(["open", "-a", "Google Chrome", "about:blank"], check=False)
+            time.sleep(4)
+            return search_fb(query, max_price, min_price, _retry=False)
+        return []
+    out, seen = [], set()
+    for it in items:
+        if it["id"] in seen:
+            continue
+        seen.add(it["id"])
+        lines = [l for l in (it.get("lines") or []) if l.lower() not in FB_BADGES]
+        price = next((l for l in lines if l.startswith("$") or l.lower() == "free"), "")
+        rest = [l for l in lines if l != price and not l.startswith("$")]
+        title = rest[0] if rest else ""
+        loc = rest[1] if len(rest) > 1 else ""
+        out.append({"source": "fb", "id": "fb:" + it["id"], "title": title, "price": price, "location": loc,
+                    "url": f"https://www.facebook.com/marketplace/item/{it['id']}/", "image": it.get("img", "")})
+    return out
+
+
+def detail(url, image_out=None):
+    """Listing title/description/photo. FB via Chrome (og: tags), Craigslist via plain HTTP."""
+    info = {"url": url, "title": "", "description": "", "image": ""}
+    if "facebook.com" in url:
+        m, client = _chrome()
+        r = client.send("open_tab", url=url)
+        tab = (r.get("result") or r).get("tabId") if isinstance(r, dict) else None
+        try:
+            time.sleep(8)
+            code = ("const g=p=>document.querySelector('meta[property=\"og:'+p+'\"]')?.content||'';"
+                    "return {title:g('title'),description:g('description'),image:g('image')};")
+            res = client.send("debugger_eval", tabId=tab, code=code)
+            d = res.get("result") if isinstance(res, dict) else {}
+            if isinstance(d, dict) and "result" in d:
+                d = d["result"]
+            info.update(d or {})
+            # og:description is cut off at ~200 chars ("..."), which often drops the dimensions. Close the login
+            # modal, click "See more", and take the full text of the listing's Details section.
+            client.send("debugger_eval", tabId=tab, code=(
+                "document.querySelectorAll('[aria-label=Close]').forEach(b=>b.click());"
+                "for(const e of document.querySelectorAll('[role=button],span,div')){"
+                "if(e.childElementCount===0&&e.innerText.trim()==='See more'){e.click();}}return 1;"))
+            time.sleep(1.5)
+            res = client.send("debugger_eval", tabId=tab, code="return document.body.innerText;")
+            txt = res.get("result") if isinstance(res, dict) else ""
+            if isinstance(txt, dict):
+                txt = txt.get("result", "")
+            mm = re.search(r"\nDetails\n(.*?)\n(?:See less|Seller information|Seller details|Location is approximate)",
+                           txt or "", re.S)
+            if mm and len(mm.group(1).strip()) > len(info.get("description", "").rstrip(". ")):
+                info["description"] = mm.group(1).strip()
+        finally:
+            client.send("close_tab", tabId=tab)
+    else:
+        from bs4 import BeautifulSoup
+        html = urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": UA}), timeout=30).read().decode("utf-8", "replace")
+        soup = BeautifulSoup(html, "html.parser")
+        t = soup.select_one("#titletextonly"); b = soup.select_one("#postingbody")
+        info["title"] = t.get_text(strip=True) if t else ""
+        info["description"] = b.get_text(" ", strip=True).replace("QR Code Link to This Post", "").strip() if b else ""
+        pr = soup.select_one(".postingtitletext .price") or soup.select_one(".price")
+        info["price"] = pr.get_text(strip=True) if pr else ""
+        mm = re.search(r"https://images\.craigslist\.org/[^\"]+_600x450\.jpg", html)
+        info["image"] = mm.group(0) if mm else ""
+    if image_out and info.get("image"):
+        urllib.request.urlretrieve(info["image"], image_out)
+        info["image_path"] = image_out
+    return info
+
+
+# ── lastcard: picks sent on cards (v2) ──────────────────────
+# {"version": 2,
+#  "cards":      [{"id": "1020-1", "date": "2026-10-20", "watch", "title", "price", "url", "source",
+#                  "meta", "why", "note"}],          # id = MMDD-N, printed on the card's badge
+#  "considered": [{"date", "watch", "url", "title", "price", "note"}]}   # runners-up not sent
+CARD_FIELDS = ("id", "date", "watch", "title", "price", "url", "source", "meta", "why", "note")
+
+
+def _today():
+    return dt.date.today().isoformat()
+
+
+def _norm_date(d):
+    """'2026-10-20', '10-20', '1020' -> '2026-10-20' (current year)."""
+    if not d:
+        return _today()
+    d = d.strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
+        return d
+    m = re.fullmatch(r"(\d{1,2})-?(\d{2})", d)
+    if not m:
+        sys.exit(f"bad date {d!r} (use YYYY-MM-DD, MM-DD or MMDD)")
+    return f"{dt.date.today().year}-{int(m.group(1)):02d}-{m.group(2)}"
+
+
+def _source_of(url):
+    return "fb" if "facebook.com" in url else "cl" if "craigslist" in url else ""
+
+
+def _atomic_write(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    tmp.replace(path)
+
+
+def _split_v1_link(v):
+    """v1 value: 'https://... (desc)' or '(desc; URL not recorded)' -> (url, desc)."""
+    v = (v or "").strip()
+    m = re.match(r"(https?://\S+)\s*(?:\((.*)\))?\s*$", v, re.S)
+    if m:
+        return m.group(1), (m.group(2) or "").strip()
+    desc = v.strip("()").strip()
+    desc = re.sub(r";?\s*URL not recorded\s*$", "", desc).strip()
+    return "", desc
+
+
+def _price_in(text):
+    m = re.search(r"\bFREE\b|\$\d[\d,]*(?:\s*(?:OBO|firm))?", text or "", re.I)
+    return m.group(0) if m else ""
+
+
+def migrate_v1(old, watch_default="coffee-table"):
+    """Convert the hand-rotated v1 file (links/previous/older/oldest/archive + dated ad-hoc keys) to v2."""
+    watch = old.get("watch") or watch_default
+    cards, considered, notes = [], [], {}
+    blocks = list(old.get("archive", []))
+    for k in ("oldest", "older", "previous"):
+        if isinstance(old.get(k), dict):
+            blocks.append(old[k])
+    if old.get("links"):
+        blocks.append({"date": old.get("date"), "links": old["links"]})
+    for k, v in old.items():
+        if k.startswith("discussion_"):
+            notes[k.split("_", 1)[1]] = v
+    for b in sorted(blocks, key=lambda b: b.get("date") or ""):
+        d = b.get("date")
+        for n, v in sorted((b.get("links") or {}).items(), key=lambda kv: int(kv[0]) if str(kv[0]).isdigit() else 0):
+            url, desc = _split_v1_link(v)
+            cid = f"{d[5:7]}{d[8:10]}-{n}"
+            if any(c["id"] == cid for c in cards):
+                continue
+            cards.append({"id": cid, "date": d, "watch": watch, "title": desc, "price": _price_in(desc),
+                          "url": url, "source": _source_of(url), "meta": "", "why": "", "note": ""})
+    for d, txt in notes.items():   # attach dated discussion notes to that day's first card (or the nearest earlier)
+        tgt = [c for c in cards if c["date"] == d] or [c for c in cards if c["date"] < d][-1:]
+        if tgt:
+            tgt[0]["note"] = (tgt[0]["note"] + " | " if tgt[0]["note"] else "") + f"{d}: {txt}"
+    for k, v in old.items():
+        if k.startswith("considered_not_sent_") and isinstance(v, dict):
+            d = k.rsplit("_", 1)[1]
+            for url, desc in v.items():
+                considered.append({"date": d, "watch": watch, "url": url, "title": desc, "price": _price_in(desc),
+                                   "note": ""})
+    return {"version": 2, "cards": cards, "considered": considered}
+
+
+def lc_load(path=None):
+    path = path or LASTCARD
+    if not path.exists():
+        return {"version": 2, "cards": [], "considered": []}
+    data = json.loads(path.read_text())
+    if data.get("version") == 2:
+        return data
+    bak = path.with_name(path.stem + ".v1.bak.json")
+    if not bak.exists():
+        shutil.copy2(path, bak)
+    new = migrate_v1(data)
+    _atomic_write(path, new)
+    print(f"[lastcard] migrated v1 -> v2 ({len(new['cards'])} cards, {len(new['considered'])} considered); "
+          f"backup: {bak}", file=sys.stderr)
+    return new
+
+
+def lc_save(lc, path=None):
+    cutoff = (dt.date.today() - dt.timedelta(days=KEEP_DAYS)).isoformat()
+    lc["cards"] = [c for c in lc["cards"] if (c.get("date") or "") >= cutoff]
+    lc["considered"] = [c for c in lc["considered"] if (c.get("date") or "") >= cutoff]
+    _atomic_write(path or LASTCARD, lc)
+
+
+def _read_picks(path):
+    """picks.json: a list of picks, or {"title", "subtitle", "picks": [...], "considered": [...]}."""
+    data = json.loads(Path(path).read_text())
+    if isinstance(data, list):
+        data = {"picks": data}
+    for p in data.get("picks", []) + data.get("considered", []):
+        if not (p.get("url") or "").startswith("http"):
+            sys.exit(f"every pick/considered entry needs a full url: {p}")
+    return data
+
+
+def assign_ids(lc, picks, date):
+    """MMDD-N per pick. A url already on that date's card keeps its id (re-runs are idempotent)."""
+    mmdd = date[5:7] + date[8:10]
+    same = {c["url"]: c["id"] for c in lc["cards"] if c["date"] == date and c.get("url")}
+    n = max([int(c["id"].split("-")[1]) for c in lc["cards"] if c["date"] == date] or [0])
+    ids = []
+    for p in picks:
+        if p["url"] in same:
+            ids.append(same[p["url"]])
+        else:
+            n += 1
+            ids.append(f"{mmdd}-{n}")
+    return ids
+
+
+def lc_push(lc, data, watch, date):
+    picks = data.get("picks", [])
+    ids = assign_ids(lc, picks, date)
+    for cid, p in zip(ids, picks):
+        rec = {"id": cid, "date": date, "watch": watch, "title": p.get("title", ""), "price": p.get("price", ""),
+               "url": p["url"], "source": p.get("source") or _source_of(p["url"]), "meta": p.get("meta", ""),
+               "why": p.get("why", ""), "note": p.get("note", "")}
+        lc["cards"] = [c for c in lc["cards"] if c["id"] != cid] + [rec]
+    for p in data.get("considered", []):
+        lc["considered"] = [c for c in lc["considered"] if not (c["url"] == p["url"] and c["date"] == date)]
+        lc["considered"].append({"date": date, "watch": watch, "url": p["url"], "title": p.get("title", ""),
+                                 "price": p.get("price", ""), "note": p.get("note", "")})
+    lc["cards"].sort(key=lambda c: (c["date"], int(c["id"].split("-")[1])))
+    lc["considered"].sort(key=lambda c: c["date"])
+    return ids
+
+
+def already_shown(lc, url, date):
+    """Earlier cards / runner-up lists that already have this url."""
+    out = [f"card {c['id']}" for c in lc["cards"] if c.get("url") == url and c["date"] != date]
+    out += [f"considered {c['date']}" for c in lc["considered"] if c.get("url") == url and c["date"] != date]
+    return out
+
+
+def _fmt(c):
+    extra = f"  [note: {c['note']}]" if c.get("note") else ""
+    return f"{c.get('id') or '-':>8}  {c['date']}  {c.get('price') or '?':>9}  {c.get('title', '')}\n" \
+           f"          {c.get('url') or '(url not recorded)'}{extra}"
+
+
+def lc_find(lc, q):
+    q = q.strip()
+    if re.fullmatch(r"\d{4}-\d+", q):
+        return [c for c in lc["cards"] if c["id"] == q], "id"
+    if re.fullmatch(r"#?\d+", q):   # bare "1": every card's #1, newest first
+        n = q.lstrip("#")
+        return sorted([c for c in lc["cards"] if c["id"].split("-")[1] == n], key=lambda c: c["date"],
+                      reverse=True), "number"
+    words = q.lower().split()
+    hay = lambda c: " ".join(str(c.get(k, "")) for k in ("id", "title", "price", "meta", "why", "note", "url")).lower()
+    hits = [c for c in lc["cards"] if all(w in hay(c) for w in words)]
+    hits += [dict(c, considered=True) for c in lc["considered"] if all(w in hay(c) for w in words)]
+    return sorted(hits, key=lambda c: c["date"], reverse=True), "text"
+
+
+# ── card: detail -> yaml -> render -> crop -> lastcard push ─
+NUM_WORDS = {1: "One", 2: "Two", 3: "Three", 4: "Four"}
+
+
+def _fetch_image(src, dest):
+    if not src:
+        return None
+    if src.startswith("http"):
+        urllib.request.urlretrieve(src, dest)
+        return str(dest)
+    if Path(src).expanduser().exists():
+        return str(Path(src).expanduser())
+    return None
+
+
+def crop_to_content(png, out, pad=50):
+    """listing-picks is a fixed 1080x1620 canvas; cut the empty blurred band under the last line of text."""
+    from PIL import Image, ImageFilter
+    im = Image.open(png)
+    w, h = im.size
+    edges = im.convert("L").filter(ImageFilter.FIND_EDGES).crop((4, 4, w - 4, h - 4)).point(lambda p: 255 if p > 40 else 0)
+    bb = edges.getbbox()
+    bottom = min(h, (bb[3] + 4 + pad) if bb else h)
+    im.crop((0, 0, w, bottom)).save(out, "PNG", dpi=(144, 144), pnginfo=_pnginfo(im), icc_profile=im.info.get("icc_profile"))
+    return bottom
+
+
+def _pnginfo(im):
+    from PIL import PngImagePlugin
+    info = PngImagePlugin.PngInfo()
+    info.add_text("description", im.info.get("description", "Screenshot"))
+    return info
+
+
+def make_card(watch_name, w, picks_path, date, out_dir, no_detail=False):
+    data = _read_picks(picks_path)
+    picks = data.get("picks", [])
+    if not 1 <= len(picks) <= 3:
+        sys.exit(f"a card holds 1-3 picks (got {len(picks)})")
+    out = Path(out_dir or f"/tmp/mpcard-{date[5:7]}{date[8:10]}")
+    out.mkdir(parents=True, exist_ok=True)
+    lc = lc_load()
+    ids = assign_ids(lc, picks, date)
+    listings = []
+    for cid, p in zip(ids, picks):
+        for where in already_shown(lc, p["url"], date):
+            print(f"[card] warning: {cid} {p['url']} was already on {where}", file=sys.stderr)
+        info = {}
+        if not no_detail:
+            try:
+                info = detail(p["url"], str(out / f"{cid}-detail.jpg"))
+            except Exception as e:  # noqa: BLE001
+                print(f"[card] {cid}: detail failed ({e}); using picks.json fields", file=sys.stderr)
+            if not info.get("description") and not info.get("title"):
+                print(f"[card] warning: {cid} detail returned no text; the listing may be gone", file=sys.stderr)
+        img = _fetch_image(p.get("image", ""), out / f"{cid}.jpg") or info.get("image_path")
+        if not img:
+            sys.exit(f"[card] no photo for {cid} {p['url']}: pass \"image\" (path or URL) in picks.json")
+        p["title"] = p.get("title") or info.get("title", "")
+        p["price"] = p.get("price") or info.get("price") or _price_in(info.get("title", ""))
+        if not p["title"] or not p["price"]:
+            print(f"[card] warning: {cid} has no {'title' if not p['title'] else 'price'}", file=sys.stderr)
+        p.setdefault("source", _source_of(p["url"]))
+        listings.append({"num": cid, "image": img, "price": p["price"], "title": p["title"],
+                         "meta": p.get("meta", ""), "why": p.get("why", "")})
+    d = dt.date.fromisoformat(date)
+    created = w.get("created")
+    day = (d - dt.date.fromisoformat(created)).days + 1 if created else None
+    label = watch_name.replace("-", " ").capitalize()
+    spec = {"template": "listing-picks", "hero_image": listings[0]["image"],
+            "eyebrow": f"{label} watch · {d.strftime('%b')} {d.day}",
+            "page_tag": f"Day {day}" if day else d.strftime("%b %d"),
+            "title": data.get("title") or f"{NUM_WORDS.get(len(picks), len(picks))} worth a look",
+            "subtitle": data.get("subtitle", ""),
+            "listings": listings,
+            "poetic": data.get("poetic") or f"Reply {' or '.join(ids) if len(ids) < 3 else ', '.join(ids)} for the link."}
+    yml = out / "card.yaml"
+    yml.write_text(json.dumps(spec, indent=2, ensure_ascii=False) + "\n")   # JSON is valid YAML
+    r = subprocess.run([str(RENDER), str(yml), "--out", str(out / "card.png")], capture_output=True, text=True)
+    png = Path((r.stdout.strip().splitlines() or [""])[-1])
+    if r.returncode != 0 or not png.exists():
+        sys.exit(f"[card] render failed: {r.stderr.strip() or r.stdout.strip()}")
+    final = out / "card-crop.png"
+    crop_to_content(png, final)
+    lc_push(lc, data, watch_name, date)
+    lc_save(lc)
+    print(f"[card] {', '.join(ids)} saved to {LASTCARD}", file=sys.stderr)
+    chat = w.get("chat")
+    print(f"[card] post to the watch's chat ({chat or 'not set: mpwatch set ' + watch_name + ' --chat <id>'}): "
+          f"cd ~/transcripts/imessage/{chat or '<chat>'} && ~/.claude/skills/sms-assistant/scripts/reply \"\" --image {final}",
+          file=sys.stderr)
+    print(final)
+
+
+def search(query, sources, max_price=None, min_price=None):
+    res = []
+    if "cl" in sources:
+        res += search_cl(query)
+    if "fb" in sources:
+        res += search_fb(query, max_price, min_price)
+    filt = []
+    for r in res:
+        p = price_num(r["price"])
+        if max_price is not None and p is not None and p > max_price:
+            continue
+        if min_price is not None and p is not None and p < min_price:
+            continue
+        filt.append(r)
+    return filt
+
+
+def show(items, as_json):
+    if as_json:
+        print(json.dumps(items, indent=2))
+        return
+    for r in items:
+        print(f"[{r['source']}] {r['price'] or '?':>7}  {r['title']}  ({r['location']})\n          {r['url']}")
+    print(f"{len(items)} listings")
+
+
+# ── new --brief: title filter + one line per listing ───────
+def _fix_badge(r):
+    """Older saved results: FB 'Just listed' badge parsed as title, real title shifted into location."""
+    if (r.get("title") or "").strip().lower() in FB_BADGES:
+        r = dict(r, title=r.get("location", ""), location="")
+    return r
+
+
+def split_words(s):
+    return [w.strip().lower() for w in (s or "").split(",") if w.strip()]
+
+
+def excluded_by(title, words):
+    """First exclude word/phrase found in the title (whole word, plural ok), or None."""
+    t = (title or "").lower()
+    for w in words:
+        if re.search(r"(?<![a-z0-9])" + re.escape(w) + r"(?:s|es)?(?![a-z0-9])", t):
+            return w
+    return None
+
+
+_NUM = r"\d{1,3}(?:\.\d+)?"
+_UNIT = r"\s*(?:\"|”|''|in\.?|inch(?:es)?)?\s*"
+DIM_RE = re.compile(rf"(?<![\d.'])({_NUM}){_UNIT}[x×]\s*({_NUM})(?:{_UNIT}[x×]\s*({_NUM}))?", re.I)
+ONE_RE = re.compile(rf"(?<![\d.'])({_NUM})\s*(?:\"|”|''|-?inch(?:es)?\b|in\b)", re.I)
+FT_RE = re.compile(r"(?<![\d.])(\d(?:\.\d)?)\s*(?:ft\b|feet\b|foot\b|')(?!')", re.I)
+
+
+def dims_in(text):
+    """'53x27x18', '48" x 24"', '60in', '5ft' -> compact string; '' if no size in the text."""
+    m = DIM_RE.search(text or "")
+    if m:
+        return "x".join(g for g in m.groups() if g)
+    m = ONE_RE.search(text or "")
+    if m:
+        return m.group(1) + "in"
+    m = FT_RE.search(text or "")
+    return m.group(1) + "ft" if m else ""
+
+
+def brief(items, words, show_dropped=False):
+    """Print one line per kept listing; index = position in the kept list (= contact-sheet tile number
+    when the kept list is what gets --save'd and fed to contact-sheet). Returns the kept list."""
+    kept, dropped = [], []
+    for r in map(_fix_badge, items):
+        w = excluded_by(r.get("title"), words)
+        (dropped if w else kept).append((r, w))
+    for i, (r, _) in enumerate(kept):
+        dm = dims_in(r.get("title"))
+        loc = r.get("location") or ""
+        print(f"{i:>3}  {r['source']}  {r.get('price') or '?':>8}  {r.get('title') or '(no title)'}"
+              + (f"  [{dm}]" if dm else "") + (f"  · {loc}" if loc else ""))
+    by = {}
+    for _, w in dropped:
+        by[w] = by.get(w, 0) + 1
+    print(f"{len(kept)} kept, {len(dropped)} dropped by title filter"
+          + (" (" + ", ".join(f"{w}: {n}" for w, n in sorted(by.items(), key=lambda kv: -kv[1])) + ")" if by else "")
+          + ("" if words else "  [no exclude words: mpwatch set <w> --exclude a,b]"))
+    if show_dropped and dropped:
+        print("-- dropped --")
+        for r, w in dropped:
+            print(f"  x  {r['source']}  {r.get('price') or '?':>8}  {r.get('title')}  ({w})  {r['url']}")
+    return [r for r, _ in kept]
+
+
+# ── engagement-aware cadence ────────────────────────────────
+def _now():
+    return dt.datetime.now().replace(microsecond=0)
+
+
+def last_engagement(name, w):
+    """Newest of: dated `lastcard note`s on this watch's cards, `mpwatch engaged` stamps, watch creation.
+    Date-only notes count as the end of that day. Returns (datetime, where)."""
+    best = (None, "")
+    for c in lc_load()["cards"]:
+        if c.get("watch") != name:
+            continue
+        for d in re.findall(r"(?:^|\| )(\d{4}-\d{2}-\d{2}): ", c.get("note") or ""):
+            t = dt.datetime.fromisoformat(d) + dt.timedelta(hours=23, minutes=59, seconds=59)
+            if best[0] is None or t > best[0]:
+                best = (t, f"lastcard note on {c['id']}")
+    for e in w.get("engaged", []):
+        t = dt.datetime.fromisoformat(e["at"])
+        if best[0] is None or t > best[0]:
+            best = (t, "mpwatch engaged" + (f" ({e['note']})" if e.get("note") else ""))
+    if best[0] is None and w.get("created"):
+        best = (dt.datetime.fromisoformat(w["created"]), "watch created")
+    return best
+
+
+def cadence(name, w, now=None):
+    now = now or _now()
+    today = now.date()
+    eng, where = last_engagement(name, w)
+    idle = (today - eng.date()).days if eng else 0
+    sent = dt.datetime.fromisoformat(w["checkin_sent"]) if w.get("checkin_sent") else None
+    last_run = dt.datetime.strptime(w["last_run"], "%Y-%m-%d %H:%M") if w.get("last_run") else None
+    out = {"watch": name, "last_engaged": eng.isoformat() if eng else None, "engaged_via": where,
+           "days_since_engagement": idle, "checkin_sent": w.get("checkin_sent"), "last_sweep": w.get("last_run"),
+           "next_sweep": today.isoformat()}
+    if idle < IDLE_DAYS:
+        out.update(phase="active", sweep_due=True, checkin_due=False,
+                   reason=f"engaged {idle}d ago (< {IDLE_DAYS}): daily sweeps")
+    elif not sent or (eng and sent <= eng):
+        out.update(phase="checkin", sweep_due=True, checkin_due=True,
+                   reason=f"no engagement for {idle}d: send ONE check-in instead of a card today")
+    else:
+        anchor = max(d for d in (sent.date(), last_run.date() if last_run else None) if d)
+        nxt = anchor + dt.timedelta(days=SLOW_EVERY)
+        out.update(phase="slow", sweep_due=today >= nxt, checkin_due=False, next_sweep=max(nxt, today).isoformat(),
+                   reason=f"check-in sent {sent.date()}, no reply since: sweeping every {SLOW_EVERY}rd day "
+                          f"(last {anchor}, next {nxt})")
+    return out
+
+
+def checkin_text(name, w):
+    thing = w.get("thing") or "a " + name.replace("-", " ")
+    return f"Still want me searching for {thing}? Reply keep or stop."
+
+
+def lastcard_cmd(args):
+    lc = lc_load()
+    if args.lc_cmd == "migrate":
+        print(f"{LASTCARD}: version 2, {len(lc['cards'])} cards, {len(lc['considered'])} considered")
+    elif args.lc_cmd == "push":
+        date = _norm_date(args.date)
+        data = _read_picks(args.picks)
+        for p in data.get("picks", []):
+            for where in already_shown(lc, p["url"], date):
+                print(f"warning: {p['url']} was already on {where}", file=sys.stderr)
+        ids = lc_push(lc, data, args.watch, date)
+        lc_save(lc)
+        for c in lc["cards"]:
+            if c["id"] in ids and c["date"] == date:
+                print(_fmt(c))
+    elif args.lc_cmd == "show":
+        cards, cons = lc["cards"], lc["considered"]
+        if args.date:
+            d = _norm_date(args.date)
+            cards = [c for c in cards if c["date"] == d]
+            cons = [c for c in cons if c["date"] == d]
+        if args.json:
+            print(json.dumps({"cards": cards, "considered": cons if args.considered else []}, indent=2, ensure_ascii=False))
+            return
+        for c in sorted(cards, key=lambda c: (c["date"], int(c["id"].split("-")[1])), reverse=True):
+            print(_fmt(c))
+        if args.considered:
+            print("-- considered, not sent --")
+            for c in sorted(cons, key=lambda c: c["date"], reverse=True):
+                print(_fmt(c))
+    elif args.lc_cmd == "find":
+        hits, kind = lc_find(lc, " ".join(args.query))
+        if not hits:
+            sys.exit(f"no card pick matches {' '.join(args.query)!r} (mpwatch lastcard show --considered)")
+        if kind == "number" and len(hits) > 1:
+            print(f"note: {len(hits)} cards have #{hits[0]['id'].split('-')[1]}; newest first. A bare number "
+                  f"usually means the most recent card ({hits[0]['id']}) but confirm if the reply could be older.",
+                  file=sys.stderr)
+        if args.json:
+            print(json.dumps(hits, indent=2, ensure_ascii=False))
+        elif args.url:
+            print(hits[0].get("url") or "(url not recorded)")
+        else:
+            for c in hits:
+                print(("(considered, not sent) " if c.get("considered") else "") + _fmt(c))
+    elif args.lc_cmd == "note":
+        c = next((c for c in lc["cards"] if c["id"] == args.id), None)
+        if not c:
+            sys.exit(f"no card {args.id!r}")
+        stamp = _today()
+        c["note"] = (c["note"] + " | " if c.get("note") else "") + f"{stamp}: {args.text}"
+        lc_save(lc)
+        print(_fmt(c))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp = ap.add_subparsers(dest="cmd", required=True)
+    s = sp.add_parser("search"); s.add_argument("query"); s.add_argument("--source", default="fb,cl")
+    s.add_argument("--max-price", type=float); s.add_argument("--min-price", type=float); s.add_argument("--json", action="store_true")
+    a = sp.add_parser("add"); a.add_argument("name"); a.add_argument("--query", required=True); a.add_argument("--source", default="fb,cl")
+    a.add_argument("--max-price", type=float); a.add_argument("--min-price", type=float); a.add_argument("--note", default="")
+    st_ = sp.add_parser("set"); st_.add_argument("name"); st_.add_argument("--query"); st_.add_argument("--max-price", type=float)
+    st_.add_argument("--min-price", type=float); st_.add_argument("--note")
+    st_.add_argument("--fb-queries", help="comma-separated extra narrow FB queries that `new` also runs (FB shows ~45/query logged out)")
+    st_.add_argument("--chat", help="chat_id where this watch's cards are posted (the group's transcript dir name)")
+    st_.add_argument("--exclude", help="comma-separated title words/phrases `new --brief` drops (replaces the list; '' clears)")
+    st_.add_argument("--thing", help="what the check-in text asks about, e.g. 'a coffee table'")
+    n = sp.add_parser("new"); n.add_argument("name"); n.add_argument("--json", action="store_true")
+    n.add_argument("--no-mark", action="store_true", help="don't mark results as seen")
+    n.add_argument("--brief", action="store_true",
+                   help="one line per listing (index, source, price, title, dims), title filter applied")
+    n.add_argument("--exclude", help="extra comma-separated title words to drop this run (on top of the watch's list)")
+    n.add_argument("--save", help="with --brief: write the kept listings as JSON (feed it to contact-sheet; same indexes)")
+    n.add_argument("--from", dest="from_file", help="with --brief: re-print a saved JSON list instead of searching (no marking)")
+    n.add_argument("--show-dropped", action="store_true", help="with --brief: also list what the filter dropped")
+    e = sp.add_parser("engaged", help="record that someone replied about this watch (resumes daily sweeps)")
+    e.add_argument("name"); e.add_argument("--note", default="", help="what they said, e.g. 'keep'")
+    e.add_argument("--at", help="when (ISO date/datetime; default now)")
+    stt = sp.add_parser("status", help="days since last engagement, check-in state, whether today is a sweep day")
+    stt.add_argument("name"); stt.add_argument("--json", action="store_true")
+    cd = sp.add_parser("checkin-due", help=f"exit 0 if the one {IDLE_DAYS}-day check-in should be sent now, else 1")
+    cd.add_argument("name"); cd.add_argument("--mark", action="store_true", help="record that the check-in was sent")
+    sd = sp.add_parser("sweep-due", help="exit 0 if today is a sweep day for this watch, else 1")
+    sd.add_argument("name")
+    d = sp.add_parser("detail"); d.add_argument("url", nargs="+"); d.add_argument("--image-out")
+    d.add_argument("--image-dir", help="with several urls: save photos as <dir>/1.jpg, 2.jpg, ... (arg order)")
+    c = sp.add_parser("card", help="detail -> card yaml -> render -> crop -> lastcard push; prints the PNG path (never sends)")
+    c.add_argument("watch"); c.add_argument("--picks", required=True, help="picks.json (see SKILL.md)")
+    c.add_argument("--date", help="card date (default today)"); c.add_argument("--out-dir", help="default /tmp/mpcard-MMDD")
+    c.add_argument("--no-detail", action="store_true", help="skip the listing fetch (picks.json must have image/title/price)")
+    lc = sp.add_parser("lastcard", help="picks sent on cards: push | show | find | note | migrate")
+    lsp = lc.add_subparsers(dest="lc_cmd", required=True)
+    lp = lsp.add_parser("push"); lp.add_argument("picks"); lp.add_argument("--watch", default="coffee-table")
+    lp.add_argument("--date")
+    ls_ = lsp.add_parser("show"); ls_.add_argument("--date"); ls_.add_argument("--considered", action="store_true")
+    ls_.add_argument("--json", action="store_true")
+    lf = lsp.add_parser("find"); lf.add_argument("query", nargs="+"); lf.add_argument("--url", action="store_true")
+    lf.add_argument("--json", action="store_true")
+    ln = lsp.add_parser("note"); ln.add_argument("id"); ln.add_argument("text")
+    lsp.add_parser("migrate")
+    sp.add_parser("list")
+    r = sp.add_parser("rm"); r.add_argument("name")
+    args = ap.parse_args()
+
+    if args.cmd == "search":
+        show(search(args.query, args.source.split(","), args.max_price, args.min_price), args.json)
+        return
+    if args.cmd == "detail":
+        urls = [u.strip() for u in args.url]
+        if any(not u.startswith("http") for u in urls):
+            sys.exit(f"detail: every url must start with http (got {urls}). In zsh, `set -- $pair` does not "
+                     "word-split; pass several urls to one `mpwatch detail u1 u2 --image-dir D` instead.")
+        if len(urls) == 1 and not args.image_dir:
+            print(json.dumps(detail(urls[0], args.image_out), indent=2))
+            return
+        if args.image_out:
+            sys.exit("detail: use --image-dir with several urls")
+        if args.image_dir:
+            Path(args.image_dir).mkdir(parents=True, exist_ok=True)
+        out = []
+        for i, u in enumerate(urls, 1):
+            try:
+                out.append(detail(u, str(Path(args.image_dir) / f"{i}.jpg") if args.image_dir else None))
+            except Exception as e:  # noqa: BLE001  one bad listing must not kill the batch
+                out.append({"url": u, "error": str(e)})
+        print(json.dumps(out, indent=2))
+        return
+    if args.cmd == "lastcard":
+        return lastcard_cmd(args)
+    st = load()
+    W = st["watches"]
+    if args.cmd == "add":
+        W[args.name] = {"query": args.query, "source": args.source, "max_price": args.max_price,
+                        "min_price": args.min_price, "note": args.note, "seen": [], "created": time.strftime("%Y-%m-%d")}
+        save(st); print(f"watch '{args.name}' added")
+    elif args.cmd == "card":
+        if args.watch not in W:
+            sys.exit(f"no watch {args.watch!r} (mpwatch list)")
+        make_card(args.watch, W[args.watch], args.picks, _norm_date(args.date), args.out_dir, args.no_detail)
+    elif args.cmd == "set":
+        w = W[args.name]
+        for k in ("query", "max_price", "min_price", "note", "chat", "thing"):
+            v = getattr(args, k)
+            if v is not None:
+                w[k] = v
+        if args.fb_queries is not None:
+            w["fb_queries"] = [q.strip() for q in args.fb_queries.split(",") if q.strip()]
+        if args.exclude is not None:
+            w["exclude"] = split_words(args.exclude)
+        save(st); print(json.dumps({k: v for k, v in w.items() if k != "seen"}, indent=2))
+    elif args.cmd == "new":
+        if args.name not in W:
+            sys.exit(f"no watch {args.name!r} (mpwatch list)")
+        w = W[args.name]
+        if (args.save or args.from_file or args.show_dropped or args.exclude) and not args.brief:
+            sys.exit("new: --save/--from/--show-dropped/--exclude go with --brief")
+        if args.from_file:
+            data = json.loads(Path(args.from_file).read_text())
+            fresh = data if isinstance(data, list) else data.get("listings", [])
+        else:
+            items = search(w["query"], w["source"].split(","), w.get("max_price"), w.get("min_price"))
+            if "fb" in w["source"].split(","):
+                for q in w.get("fb_queries", []):
+                    items += search(q, ["fb"], w.get("max_price"), w.get("min_price"))
+            uniq = {}
+            for i in items:
+                uniq.setdefault(i["id"], i)
+            items = list(uniq.values())
+            seen = set(w["seen"])
+            fresh = [i for i in items if i["id"] not in seen]
+            if not args.no_mark:
+                w["seen"] = sorted(seen | {i["id"] for i in items})
+                w["last_run"] = time.strftime("%Y-%m-%d %H:%M")
+                save(st)
+        if not args.brief:
+            return show(fresh, args.json)
+        words = list(dict.fromkeys(w.get("exclude", []) + split_words(args.exclude)))
+        kept = brief(fresh, words, args.show_dropped)
+        if args.save:
+            Path(args.save).parent.mkdir(parents=True, exist_ok=True)
+            Path(args.save).write_text(json.dumps(kept, indent=2) + "\n")
+            print(f"saved {len(kept)} kept listings to {args.save} (contact-sheet tile N = line N)")
+    elif args.cmd in ("engaged", "status", "checkin-due", "sweep-due"):
+        if args.name not in W:
+            print(f"no watch {args.name!r} (mpwatch list)", file=sys.stderr)
+            sys.exit(2)   # 2, not 1: "not due" must not be confused with "no such watch"
+        w = W[args.name]
+        if args.cmd == "engaged":
+            at = dt.datetime.fromisoformat(args.at) if args.at else _now()
+            w.setdefault("engaged", []).append({"at": at.isoformat(), "note": args.note})
+            w["engaged"] = sorted(w["engaged"], key=lambda e: e["at"])[-50:]
+            save(st)
+        cad = cadence(args.name, w)
+        if args.cmd == "checkin-due":
+            if not cad["checkin_due"]:
+                print(f"no check-in: {cad['reason']}")
+                sys.exit(1)
+            text = checkin_text(args.name, w)
+            if args.mark:
+                w["checkin_sent"] = _now().isoformat()
+                save(st)
+                print(f"check-in recorded as sent {w['checkin_sent']}; next sweep in {SLOW_EVERY} days "
+                      f"unless someone replies (then: mpwatch engaged {args.name})")
+            else:
+                chat = w.get("chat")
+                print(f"check-in due: {cad['reason']}\ntext: {text}\nsend: cd ~/transcripts/imessage/"
+                      f"{chat or '<chat: mpwatch set ' + args.name + ' --chat <id>>'} && "
+                      f"~/.claude/skills/sms-assistant/scripts/reply \"{text}\"\nthen: mpwatch checkin-due {args.name} --mark")
+            return
+        if args.cmd == "sweep-due":
+            print(("sweep due: " if cad["sweep_due"] else "not a sweep day: ") + cad["reason"])
+            sys.exit(0 if cad["sweep_due"] else 1)
+        if getattr(args, "json", False):
+            print(json.dumps(cad, indent=2))
+            return
+        print(f"{args.name}: last engagement {cad['last_engaged'] or 'never'} via {cad['engaged_via'] or '-'}, "
+              f"{cad['days_since_engagement']} days ago\n"
+              f"  phase: {cad['phase']} ({cad['reason']})\n"
+              f"  sweep today: {'yes' if cad['sweep_due'] else 'no, next ' + cad['next_sweep']}\n"
+              f"  check-in: {'due now' if cad['checkin_due'] else 'sent ' + cad['checkin_sent'] if cad['phase'] == 'slow' else 'not needed'}\n"
+              f"  last sweep: {cad['last_sweep']}")
+    elif args.cmd == "list":
+        for k, w in W.items():
+            print(f"{k}: query={w['query']!r} source={w['source']} max={w.get('max_price')} min={w.get('min_price')} "
+                  f"seen={len(w['seen'])} last_run={w.get('last_run')} chat={w.get('chat')} fb_queries={w.get('fb_queries', [])} "
+                  f"exclude={w.get('exclude', [])} note={w.get('note')!r}")
+    elif args.cmd == "rm":
+        W.pop(args.name, None); save(st); print("removed")
+
+
+if __name__ == "__main__":
+    main()

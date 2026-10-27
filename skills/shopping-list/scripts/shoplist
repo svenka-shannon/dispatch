@@ -1,0 +1,175 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# ///
+"""shoplist: household shopping list with weekly staples.
+
+State: ~/dispatch/state/shopping-list.json (override with SHOPLIST_FILE).
+
+  shoplist add "eggs" "oat milk x2" [--staple] [--note "..."]
+  shoplist rm "eggs"                 # remove (fuzzy, case-insensitive)
+  shoplist got "eggs" "milk"         # mark bought
+  shoplist list [--all] [--json]     # grouped by store section
+  shoplist text                      # compact SMS-ready checklist
+  shoplist staples [add|rm NAME]     # recurring weekly items
+  shoplist week                      # weekly rollover: drop bought items, re-add staples
+  shoplist clear                     # empty the list (staples kept)
+  shoplist add --recipe "Lamb skewers" "2 lb lamb shoulder" cumin ...
+                                     # recipe mode: skips pantry items, notes the recipe
+  shoplist pantry [add|rm NAME]      # things always in the house; recipe mode never adds them
+"""
+from __future__ import annotations
+import argparse, json, os, re, sys
+from datetime import datetime
+from pathlib import Path
+
+FILE = Path(os.environ.get("SHOPLIST_FILE", Path.home() / "dispatch/state/shopping-list.json"))
+
+SECTIONS = [  # first keyword match wins; order = walking order through a typical store
+    ("produce", r"apple|banana|berr|lemon|lime|orange|avocado|tomato|potato|onion|garlic|lettuce|spinach|kale|salad|carrot|pepper|cucumber|broccoli|herb|cilantro|basil|ginger|fruit|veg|mushroom|zucchini|celery|grape"),
+    ("bakery", r"bread|bagel|tortilla|bun|roll|croissant|pita"),
+    ("meat & fish", r"chicken|beef|pork|lamb|turkey|bacon|sausage|salmon|fish|shrimp|tuna|steak|ground"),
+    ("dairy & eggs", r"milk|egg|cheese|yogurt|butter|cream|kefir"),
+    ("frozen", r"frozen|ice cream|ice\b"),
+    ("pantry", r"rice|pasta|noodle|flour|sugar|oil|vinegar|sauce|spice|cumin|salt|bean|lentil|cereal|oat|coffee|tea|honey|peanut|nut|chip|cracker|soup|broth|stock|can"),
+    ("drinks", r"water|soda|juice|beer|wine|seltzer|kombucha"),
+    ("household", r"paper|towel|toilet|tissue|soap|detergent|dish|trash|bag|foil|wrap|sponge|clean|battery|bulb"),
+    ("personal care", r"shampoo|conditioner|toothpaste|floss|deodorant|razor|lotion|sunscreen|vitamin|medicine"),
+    ("pet", r"cat|litter|dog|pet"),
+]
+
+
+def section(name: str) -> str:
+    n = name.lower()
+    for sec, pat in SECTIONS:
+        if re.search(pat, n):
+            return sec
+    return "other"
+
+
+def load() -> dict:
+    if FILE.exists():
+        return json.loads(FILE.read_text())
+    return {"items": [], "staples": [], "pantry": [], "last_week": None}
+
+
+def save(d: dict) -> None:
+    FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(d, indent=2) + "\n")
+    tmp.replace(FILE)
+
+
+def norm(s: str) -> str:
+    return re.sub(r"\s+", " ", s.strip().lower())
+
+
+def find(items: list[dict], q: str) -> list[dict]:
+    q = norm(q)
+    exact = [i for i in items if norm(i["name"]) == q]
+    return exact or [i for i in items if q in norm(i["name"])]
+
+
+def add_item(d: dict, name: str, note: str = "", source: str = "manual") -> str:
+    name = name.strip()
+    if not name:
+        return ""
+    for i in d["items"]:
+        if norm(i["name"]) == norm(name):
+            i["got"] = False
+            if note:
+                i["note"] = note
+            return f"already on list: {i['name']}"
+    d["items"].append({"name": name, "section": section(name), "note": note, "got": False,
+                       "added": datetime.now().isoformat(timespec="minutes"), "source": source})
+    return f"added: {name}"
+
+
+def render(d: dict, show_all: bool = False) -> str:
+    items = [i for i in d["items"] if show_all or not i["got"]]
+    if not items:
+        return "list is empty"
+    order = [s for s, _ in SECTIONS] + ["other"]
+    lines = []
+    for sec in order:
+        grp = [i for i in items if i["section"] == sec]
+        if not grp:
+            continue
+        lines.append(sec.upper())
+        for i in sorted(grp, key=lambda x: x["name"].lower()):
+            box = "☑" if i["got"] else "☐"
+            lines.append(f"{box} {i['name']}" + (f" ({i['note']})" if i["note"] else ""))
+    return "\n".join(lines)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="shoplist", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    a = sub.add_parser("add"); a.add_argument("names", nargs="+"); a.add_argument("--staple", action="store_true"); a.add_argument("--note", default=""); a.add_argument("--recipe", default="")
+    r = sub.add_parser("rm"); r.add_argument("names", nargs="+")
+    g = sub.add_parser("got"); g.add_argument("names", nargs="+")
+    l = sub.add_parser("list"); l.add_argument("--all", action="store_true"); l.add_argument("--json", action="store_true")
+    sub.add_parser("text")
+    pz = sub.add_parser("pantry"); pz.add_argument("action", nargs="?", choices=["add", "rm"]); pz.add_argument("names", nargs="*")
+    s = sub.add_parser("staples"); s.add_argument("action", nargs="?", choices=["add", "rm"]); s.add_argument("names", nargs="*")
+    sub.add_parser("week")
+    sub.add_parser("clear")
+    args = ap.parse_args()
+    d = load()
+
+    d.setdefault("pantry", [])
+    if args.cmd == "add":
+        for n in args.names:
+            if args.recipe and any(norm(pz) in norm(n) for pz in d["pantry"]):
+                print(f"skipped (pantry): {n}"); continue
+            note = args.note or (f"for {args.recipe}" if args.recipe else "")
+            print(add_item(d, n, note, source="recipe" if args.recipe else "manual"))
+            if args.staple and norm(n) not in map(norm, d["staples"]):
+                d["staples"].append(n.strip()); print(f"staple: {n.strip()}")
+    elif args.cmd == "rm":
+        for n in args.names:
+            hits = find(d["items"], n)
+            if len(hits) != 1:
+                print(f"'{n}': {'no match' if not hits else 'ambiguous: ' + ', '.join(h['name'] for h in hits)}"); continue
+            d["items"].remove(hits[0]); print(f"removed: {hits[0]['name']}")
+    elif args.cmd == "got":
+        for n in args.names:
+            hits = find(d["items"], n)
+            if len(hits) != 1:
+                print(f"'{n}': {'no match' if not hits else 'ambiguous: ' + ', '.join(h['name'] for h in hits)}"); continue
+            hits[0]["got"] = True; print(f"got: {hits[0]['name']}")
+    elif args.cmd == "list":
+        print(json.dumps(d, indent=2) if args.json else render(d, args.all)); return 0
+    elif args.cmd == "text":
+        open_n = sum(1 for i in d["items"] if not i["got"])
+        print(f"🛒 shopping list ({open_n})\n" + render(d)); return 0
+    elif args.cmd == "staples":
+        if args.action == "add":
+            for n in args.names:
+                if norm(n) not in map(norm, d["staples"]):
+                    d["staples"].append(n.strip())
+        elif args.action == "rm":
+            d["staples"] = [x for x in d["staples"] if norm(x) not in map(norm, args.names)]
+        print("staples: " + (", ".join(d["staples"]) or "(none)"))
+    elif args.cmd == "pantry":
+        if args.action == "add":
+            for n in args.names:
+                if norm(n) not in map(norm, d["pantry"]):
+                    d["pantry"].append(n.strip())
+        elif args.action == "rm":
+            d["pantry"] = [x for x in d["pantry"] if norm(x) not in map(norm, args.names)]
+        print("pantry: " + (", ".join(d["pantry"]) or "(none)"))
+    elif args.cmd == "week":
+        dropped = [i["name"] for i in d["items"] if i["got"]]
+        d["items"] = [i for i in d["items"] if not i["got"]]
+        added = [n for n in d["staples"] if add_item(d, n, source="staple").startswith("added")]
+        d["last_week"] = datetime.now().isoformat(timespec="minutes")
+        print(f"cleared {len(dropped)} bought, re-added {len(added)} staples")
+    elif args.cmd == "clear":
+        d["items"] = []; print("list cleared (staples kept)")
+    save(d)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,38 @@
+#!/bin/bash
+# Read per-variant prices from a Logitech G product page using chrome-control.
+# Usage: logi-variant-prices <product-slug> [more-slugs...]
+# Example: logi-variant-prices rs50-base pro-dd11-base
+CHROME="$HOME/.claude/skills/chrome-control/scripts/chrome"
+for slug in "$@"; do
+  url="https://www.logitechg.com/en-us/shop/p/$slug"
+  tab=$("$CHROME" open "$url" | grep -oE 'tab [0-9]+' | grep -oE '[0-9]+')
+  [ -z "$tab" ] && { echo "$slug: FAILED to open"; continue; }
+  sleep 6
+  echo "##### $slug  ($url)"
+  # enumerate platform variant buttons
+  labels=$("$CHROME" js "$tab" "
+    (function(){
+      const g=[...document.querySelectorAll('div[role=\"group\"][aria-label=\"Platform\"] button[aria-label]')];
+      return g.map(b=>b.getAttribute('aria-label')).join('\n');
+    })()" 2>/dev/null | grep -v '^$')
+  if [ -z "$labels" ]; then
+    "$CHROME" js "$tab" "
+      (function(){let r=document.querySelector('h1')?.closest('div');
+       for(let i=0;i<6&&r;i++){if(/\\\$[0-9]/.test(r.innerText))break;r=r.parentElement;}
+       return r?r.innerText.split('\n').map(s=>s.trim()).filter(Boolean).slice(0,8).join(' ~ '):'no price';})()" 2>/dev/null | tail -2
+  else
+    while IFS= read -r v; do
+      "$CHROME" js "$tab" "
+        (async function(){
+          const b=[...document.querySelectorAll('div[role=\"group\"][aria-label=\"Platform\"] button[aria-label]')].find(x=>x.getAttribute('aria-label')===\"$v\");
+          if(!b) return 'missing variant $v';
+          b.click(); await new Promise(r=>setTimeout(r,3000));
+          let r=document.querySelector('h1')?.closest('div');
+          for(let i=0;i<6&&r;i++){if(/\\\$[0-9]/.test(r.innerText))break;r=r.parentElement;}
+          const stock=[...document.querySelectorAll('.product-info *')].map(e=>e.textContent).find(t=>/in stock|out of stock|sold out|back ?order|ships/i.test(t)&&t.length<60)||'';
+          return '  [$v] '+(r?r.innerText.split('\n').map(s=>s.trim()).filter(Boolean).slice(0,8).join(' ~ '):'?')+'  || stock: '+stock.trim();
+        })()" 2>/dev/null | tail -2
+    done <<< "$labels"
+  fi
+  "$CHROME" close "$tab" >/dev/null 2>&1
+done

@@ -113,7 +113,11 @@ _COMMITMENT_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         r"\bi['’]?ll\s+(?:get|do|check|look|handle|take care|sort|fix|retry|try|run|send|update|report|let you know|circle back|follow up)\b",
         r"\bi will\s+(?:get|do|check|look|handle|take care|sort|fix|retry|try|run|send|update|report|let you know|circle back|follow up)\b",
         r"\bworking on (?:it|that|this)\b",
-        r"\bon it\b",
+        # "on it" must open a sentence (optionally "i'm on it"). Bare \bon it\b
+        # matched ordinary prose and was the direct cause of the 2026-08-26
+        # false-positive loop: "genuine scarcity on it." and "getting on it
+        # early is the move." both fired the watchdog with no marker set.
+        r"(?:^|[.!?]\s+|\n)\s*(?:i['’]?m\s+|i\s+am\s+)?on it\b",
         r"\bwill (?:report|update|let you know|follow up|circle back|check back)\b",
         r"\bgetting (?:back|to it)\b",
         r"\bwaiting (?:on|for) you\b",
@@ -161,6 +165,19 @@ def looks_like_commitment(text: str | None) -> str | None:
     # Only consider a reasonably small tail — commitments are short closing lines,
     # and scanning a giant message body invites false positives.
     tail = stripped[-600:]
+
+    # If the assistant's last message ends by asking the user something, it is
+    # the USER's turn — not an abandoned commitment. This is the cheap version
+    # of the "anchor to the unanswered message" fix: a trailing question mark is
+    # the strongest available signal that the session is legitimately waiting on
+    # a human rather than sitting on its own unfinished work.
+    #
+    # Scoped to the final sentence so that a mid-message question ("want me to
+    # book it? i'll get the links either way") still counts as a commitment.
+    final_sentence = re.split(r"[.!?]\s+", tail)[-1].strip() if tail else ""
+    if tail.rstrip().endswith("?") and len(final_sentence) <= 200:
+        return None
+
     for resolved in _RESOLVED_PATTERNS:
         if resolved.search(tail):
             return None

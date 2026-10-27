@@ -15,8 +15,28 @@ migrated checks registered:
                      consumer registry → restart the consumer thread.
   - disk           : APFS-aware disk usage; recovery = clean known temp dirs;
                      else escalate.
+  - imessage_app_nap : the two macOS `defaults` keys that stop App Nap from
+                     deferring Messages' inbound chat.db writes (18m23s hidden
+                     message, POSTMORTEMS.md 2026-09-07); recovery re-applies
+                     them via bin/setup-macos-defaults. Host state, so it decays
+                     across reinstalls and macOS updates — hence a live check.
+  - api_uplink     : degraded-uplink detector — 500KB control + 2MB test upload
+                     to speed.cloudflare.com/__up. Small-passes/large-chokes is
+                     the signature of the failure mode that silently kills
+                     big-context API calls; no auto-recovery (nothing local
+                     fixes an uplink) → escalate with the specific fix.
+  - tcp_clock      : macOS 49.7-day tcp_now freeze — TIME_WAIT > 1000 → DOWN,
+                     uptime ≥ 45d → DEGRADED; only a reboot fixes it → escalate.
   - fd_leak        : untracked FD growth via ResourceRegistry; no auto-recovery
                      (a real FD leak needs a code fix) → escalate.
+  - screen_lock    : the macOS lock screen (display sleep → "require password
+                     after N seconds") blinds every GUI-driven skill — chrome
+                     screenshots, AX walks, cliclick — and nothing said so.
+                     Probe `bin/screen-lock status` every minute; recovery types
+                     the login password from Keychain into loginwindow (and,
+                     with `screen_lock.harden: true`, turns the re-arming
+                     settings off); escalate with the exact Keychain one-liner
+                     when the password is not stored.
 
 The probe/recover callables capture the `Manager` instance via closures so they
 can reach `_send_sms`, the consumer thread, the resource registry, etc. — but
@@ -36,11 +56,12 @@ import time
 from pathlib import Path
 from typing import Any
 
-from assistant.common import AUTH_FAILURE_FLAG, SIGNAL_SOCKET
+from assistant.common import ASSISTANT_DIR, AUTH_FAILURE_FLAG, SIGNAL_SOCKET, UV
 from assistant.dependency_health import (
     DependencyCheck,
     DependencyHealthRunner,
     ProbeResult,
+    ProbeStatus,
     RecoverResult,
     make_sms_escalator,
 )
@@ -446,7 +467,20 @@ def _signal_recover(manager: Any) -> RecoverResult:
 # ──────────────────────────────────────────────────────────────
 
 def _bus_consumers_probe(manager: Any) -> ProbeResult:
-    """Healthy iff the ConsumerRunner thread is alive and no DEAD members in the registry."""
+    """Healthy iff the ConsumerRunner thread is alive and the LIVE runner's own
+    group members are registered, alive, and actually hold partitions.
+
+    Only members owned by the live runner (``manager._consumer_runner.members()``)
+    are judged. Members left behind by a previous daemon process / a crashed
+    runner / a one-shot CLI consumer are ignored: they are not ours to "recover",
+    and the old behaviour (DOWN on ANY dead member anywhere) fired a spurious
+    DOWN + runner rebuild ~5 min after every restart, when the previous daemon's
+    members' heartbeats aged out. The runner joins with exclusive=True, so such
+    leftovers are purged from our groups on join anyway.
+
+    Falls back to the legacy all-members check when the runner does not expose
+    members() (older runner / test doubles).
+    """
     thread = getattr(manager, "_consumer_thread", None)
     if thread is not None and not thread.is_alive():
         return ProbeResult.down("bus ConsumerRunner thread is not alive")
@@ -458,14 +492,65 @@ def _bus_consumers_probe(manager: Any) -> ProbeResult:
         groups = bus.list_consumer_groups()
     except Exception as e:  # noqa: BLE001
         return ProbeResult.degraded(f"could not inspect consumer registry: {e}", probe_error=str(e))
-    dead = []
-    for g in groups:
-        for m in g.get("members", []):
-            if not m.get("alive", True):
-                dead.append(f"{g['group_id']}:{m['consumer_id']}")
-    if dead:
-        return ProbeResult.down(f"DEAD consumer members: {', '.join(dead)}", dead_members=dead)
-    return ProbeResult.ok(f"bus consumers healthy ({len(groups)} groups)")
+
+    owned = None
+    runner = getattr(manager, "_consumer_runner", None)
+    members_fn = getattr(runner, "members", None)
+    if callable(members_fn):
+        try:
+            snap = members_fn()
+            if isinstance(snap, dict):
+                owned = snap
+        except Exception:  # noqa: BLE001
+            owned = None
+
+    if owned is None:
+        # Legacy: any DEAD member anywhere is DOWN.
+        dead = []
+        for g in groups:
+            for m in g.get("members", []):
+                if not m.get("alive", True):
+                    dead.append(f"{g['group_id']}:{m['consumer_id']}")
+        if dead:
+            return ProbeResult.down(f"DEAD consumer members: {', '.join(dead)}", dead_members=dead)
+        return ProbeResult.ok(f"bus consumers healthy ({len(groups)} groups)")
+
+    rows = {
+        g.get("group_id"): {m.get("consumer_id"): m for m in g.get("members", [])}
+        for g in groups
+    }
+    dead: list[str] = []
+    starved: list[str] = []
+    ignored = 0
+    for group, info in owned.items():
+        cid = info.get("consumer_id")
+        group_rows = rows.get(group, {})
+        ignored += sum(1 for other in group_rows if other != cid)
+        m = group_rows.get(cid)
+        if m is None or not m.get("alive", True):
+            dead.append(f"{group}:{cid}")
+            continue
+        if not info.get("assigned"):
+            # 0 partitions is only a problem if the topic actually has some
+            # (e.g. 'tweets' may not exist → 0 partitions is correct).
+            try:
+                n_parts = bus.topic_partition_count(info.get("topic"))
+            except Exception:  # noqa: BLE001
+                n_parts = 0
+            if isinstance(n_parts, int) and n_parts > 0:
+                starved.append(f"{group}:{cid}")
+    ignored += sum(len(v) for k, v in rows.items() if k not in owned)
+    if dead or starved:
+        parts = []
+        if dead:
+            parts.append(f"DEAD consumer members: {', '.join(dead)}")
+        if starved:
+            parts.append(f"consumers holding 0 partitions: {', '.join(starved)}")
+        return ProbeResult.down("; ".join(parts), dead_members=dead,
+                                starved_members=starved, ignored_foreign_members=ignored)
+    return ProbeResult.ok(
+        f"bus consumers healthy ({len(owned)} runner groups; {ignored} foreign member(s) ignored)"
+    )
 
 
 def _bus_consumers_recover(manager: Any) -> RecoverResult:
@@ -580,6 +665,70 @@ def _fd_leak_probe(manager: Any) -> ProbeResult:
 
 
 # ──────────────────────────────────────────────────────────────
+# tcp_clock
+# ──────────────────────────────────────────────────────────────
+# macOS XNU bug: tcp_now is a 32-bit ms counter; at 2^32 ms of uptime
+# (49d 17h 02m 47s) a monotonicity guard freezes it instead of wrapping.
+# Frozen clock → TSval constant, time-based loss recovery never fires (big
+# uploads die with a server RST ~15s after one lost packet), and TIME_WAIT
+# never expires until ephemeral ports run out. Only a reboot clears it.
+# POSTMORTEMS.md #24–#26 (2026-09-24): 19.5k TIME_WAIT, API storm from 09-18.
+# Healthy TIME_WAIT is single/double digits; frozen crosses 1,000 in ~3h.
+
+TCP_CLOCK_FREEZE_S = (2**32) / 1000.0          # 4,294,967.296 s ≈ 49.71 days
+TCP_CLOCK_WARN_UPTIME_S = 45 * 86400           # nudge a reboot ~4.7 days early
+TCP_CLOCK_TIME_WAIT_DOWN = 1000
+
+
+def _boot_epoch() -> float | None:
+    out = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True,
+                         text=True, timeout=5).stdout
+    # "{ sec = 1790284064, usec = 572082 } Thu Sep 24 14:07:44 2026"
+    try:
+        return float(out.split("sec =", 1)[1].split(",", 1)[0])
+    except (IndexError, ValueError):
+        return None
+
+
+def _time_wait_count() -> int:
+    out = subprocess.run(["netstat", "-an", "-p", "tcp"], capture_output=True,
+                         text=True, timeout=20).stdout
+    return sum(1 for line in out.splitlines() if line.rstrip().endswith("TIME_WAIT"))
+
+
+def _tcp_clock_verdict(uptime_s: float, time_wait: int) -> ProbeResult:
+    days = uptime_s / 86400
+    freeze_in_d = (TCP_CLOCK_FREEZE_S - uptime_s) / 86400
+    if time_wait > TCP_CLOCK_TIME_WAIT_DOWN:
+        return ProbeResult.down(
+            f"Mac TCP clock looks frozen (macOS 49.7-day bug): {time_wait} stuck "
+            f"connections, up {days:.0f}d. Big uploads fail and ports run out. "
+            f"Reboot while at the Mac (auto-login is off).",
+            time_wait=time_wait, uptime_days=round(days, 2),
+        )
+    if uptime_s >= TCP_CLOCK_WARN_UPTIME_S:
+        when = "is past" if freeze_in_d <= 0 else f"hits in {freeze_in_d:.1f}d"
+        return ProbeResult.degraded(
+            f"Mac up {days:.0f}d; macOS 49.7-day TCP clock freeze {when}. "
+            f"Reboot soon while at the Mac (auto-login is off).",
+            time_wait=time_wait, uptime_days=round(days, 2),
+        )
+    return ProbeResult.ok(
+        f"tcp clock ok (up {days:.1f}d, {time_wait} TIME_WAIT, freeze in {freeze_in_d:.1f}d)",
+        time_wait=time_wait, uptime_days=round(days, 2),
+    )
+
+
+def _tcp_clock_probe() -> ProbeResult:
+    try:
+        boot = _boot_epoch()
+        tw = _time_wait_count()
+    except Exception as e:  # noqa: BLE001
+        return ProbeResult.skip(f"could not read uptime/netstat: {e}")
+    if boot is None:
+        return ProbeResult.skip("could not parse kern.boottime")
+    return _tcp_clock_verdict(time.time() - boot, tw)
+# ──────────────────────────────────────────────────────────────
 # oauth_token
 # ──────────────────────────────────────────────────────────────
 
@@ -637,6 +786,444 @@ def _oauth_probe() -> ProbeResult:
         error_detail=flag.get("detail"),
         token_expires_at_ms=expires_ms,
     )
+
+
+# ──────────────────────────────────────────────────────────────
+# imessage_app_nap
+# ──────────────────────────────────────────────────────────────
+
+# Host state, not code: App Nap suspends IMDPersistenceAgent when Messages.app is
+# deep-backgrounded and macOS then DEFERS Messages' inbound chat.db writes. The
+# poller sees nothing because the row genuinely is not in the database yet — on
+# 2026-09-07 that hid one inbound message for 18m23s (POSTMORTEMS.md → "2026-09-07:
+# Deferred chat.db inbound writes (App Nap)"). Two `defaults` keys turn it off.
+#
+# It lives here rather than install-only because machine state decays: a fresh
+# install on a new Mac never had the keys, and a macOS update can reset them. The
+# probe/recover both shell out to bin/setup-macos-defaults (single source of truth
+# for the domains, keys and the relaunch caveat) rather than re-implementing the
+# `defaults` calls.
+SETUP_MACOS_DEFAULTS = ASSISTANT_DIR / "bin" / "setup-macos-defaults"
+SETUP_MACOS_DEFAULTS_TIMEOUT = 60
+
+
+def _run_setup_macos_defaults(check_only: bool) -> tuple[int, dict, str]:
+    """Run bin/setup-macos-defaults --json. Returns (rc, parsed_payload, raw_stderr)."""
+    cmd = [UV, "run", "--script", str(SETUP_MACOS_DEFAULTS), "--json"]
+    if check_only:
+        cmd.append("--check")
+    p = subprocess.run(cmd, capture_output=True, text=True,
+                       timeout=SETUP_MACOS_DEFAULTS_TIMEOUT)
+    try:
+        payload = json.loads(p.stdout)
+    except ValueError:
+        payload = {}
+    return p.returncode, payload, (p.stderr or "").strip()
+
+
+def _unset_keys(payload: dict) -> list[str]:
+    return [f"{d['domain']} {d['key']}"
+            for d in payload.get("defaults", []) if d.get("status") != "OK"]
+
+
+def _app_nap_probe() -> ProbeResult:
+    """DOWN while either App Nap default is unset — inbound chat.db writes can stall."""
+    if not SETUP_MACOS_DEFAULTS.exists():
+        return ProbeResult.skip(f"{SETUP_MACOS_DEFAULTS} not present")
+    try:
+        rc, payload, err = _run_setup_macos_defaults(check_only=True)
+    except subprocess.TimeoutExpired:
+        return ProbeResult.down("setup-macos-defaults --check timed out", probe_timed_out=True)
+    except OSError as e:
+        return ProbeResult.skip(f"could not run setup-macos-defaults: {e}")
+    if rc == 0:
+        return ProbeResult.ok(
+            "App Nap disabled for Messages.app",
+            relaunch_required=payload.get("relaunch_required"),
+            messages_running=payload.get("messages_running"),
+        )
+    missing = _unset_keys(payload) or ["unknown (unparseable output)"]
+    return ProbeResult.down(
+        "App Nap is NOT disabled for Messages.app — inbound chat.db writes can be "
+        f"deferred for many minutes (see POSTMORTEMS.md 2026-09-07). Unset: {', '.join(missing)}",
+        probe_rc=rc, unset_keys=missing, probe_stderr=err,
+    )
+
+
+def _app_nap_recover() -> RecoverResult:
+    """Write the defaults back. They are read AT LAUNCH — warn if Messages must relaunch.
+
+    Deliberately does NOT quit Messages.app: killing the app the daemon reads
+    from, unattended, is worse than one WARNING line. The keys apply on the next
+    launch either way.
+    """
+    try:
+        rc, payload, err = _run_setup_macos_defaults(check_only=False)
+    except subprocess.TimeoutExpired:
+        return RecoverResult.fail("setup-macos-defaults timed out")
+    except OSError as e:
+        return RecoverResult.fail(f"could not run setup-macos-defaults: {e}")
+    if rc != 0:
+        return RecoverResult.fail(
+            f"setup-macos-defaults exited {rc}; still unset: {', '.join(_unset_keys(payload)) or 'unknown'}. "
+            "Fix by hand: defaults write com.apple.MobileSMS NSAppSleepDisabled -bool YES && "
+            "defaults write com.apple.messageshelper.MessageController SOAppNapDisabled -bool YES, "
+            "then relaunch Messages.app",
+            recover_rc=rc, recover_stderr=err,
+        )
+    changed = payload.get("changed", 0)
+    if payload.get("relaunch_required"):
+        log.warning(
+            "DEP_HEALTH | imessage_app_nap | wrote %s App Nap default(s) — Messages.app "
+            "(pid=%s) reads them AT LAUNCH, so they are NOT in effect yet. Quit and reopen "
+            "Messages.app (or run: bin/setup-macos-defaults --restart-messages)",
+            changed, payload.get("messages_pid"),
+        )
+    return RecoverResult.ok(
+        f"wrote {changed} App Nap default(s)"
+        + (" — Messages.app relaunch required for them to take effect"
+           if payload.get("relaunch_required") else ""),
+        changed=changed, relaunch_required=payload.get("relaunch_required"),
+    )
+
+
+# ──────────────────────────────────────────────────────────────
+# api_uplink
+# ──────────────────────────────────────────────────────────────
+
+# 2026-09-21 FINDING — this probe's escalation text blames the wrong layer.
+# It says "Fix: plug Ethernet into en0, or reboot modem/router; if it persists
+# it's an ISP upstream issue." Measured on this box while the probe was
+# ESCALATED, using `networkQuality -s -v`:
+#     Uplink capacity        45.0 Mbps     <- bandwidth is FINE
+#     Downlink capacity     423.6 Mbps
+#     Uplink responsiveness  714 ms / 84 RPM  ("Low")   <- the actual fault
+#     Idle latency            27 ms
+# 45 Mbps up should move 2MB in <0.5s; observed 44-270 KB/s, i.e. 3-100x under
+# capacity, timing out at 45s. That is textbook BUFFERBLOAT — latency collapses
+# under sustained upload (27ms idle -> 714ms loaded), connections stall, peer
+# resets (rc=56). Bufferbloat is the router's oversized buffers, so neither a
+# modem reboot nor an ISP call fixes it; SQM/QoS (fq_codel / cake) does.
+# TODO: have this probe run `networkQuality` on failure and branch its advice —
+# low capacity => ISP; adequate capacity + low responsiveness => router SQM.
+#
+# The network uplink has a failure mode where sustained uploads >~1.5MB collapse
+# to ~130KB/s and get RST ~15s in, while small uploads pass at ~3MB/s (verified
+# repeatedly against speed.cloudflare.com/__up, Sep 2026). That silently kills
+# Claude API calls from sessions with large contexts — the admin used to
+# discover it via dead sessions. The probe uploads a small control (500KB) and
+# a large test (2MB) to Cloudflare's upload endpoint:
+#   - small fails            → SKIP  (network fully down / endpoint unreachable —
+#                                     other checks cover total loss; don't page
+#                                     for a third-party outage)
+#   - small OK, large fails  → DEGRADED (the signature failure mode) → escalate
+#                                     (recover_on_degraded=True + recover=None)
+#   - both OK                → OK
+# Nothing local can fix an uplink, so there is no recover(); the DEGRADED detail
+# carries the specific admin ask.
+UPLINK_TEST_URL = "https://speed.cloudflare.com/__up"
+UPLINK_SMALL_BYTES = 500 * 1024        # control: passes even on the degraded uplink
+UPLINK_LARGE_BYTES = 2 * 1024 * 1024   # test: chokes when the uplink is degraded
+UPLINK_SMALL_MAX_TIME = 20
+UPLINK_LARGE_MAX_TIME = 45
+
+# 2026-09-21: this fault is INTERMITTENT, not binary. Root cause is a TCP flow
+# holding >~480KB unacked stalling and being RST 15s later; capping
+# net.inet.tcp.autosndbufmax to 393216 took 2MB uploads from 0/10 to 10/10, but a
+# residual ~1-in-10 remains at larger sizes. Paging on a SINGLE failed probe sent
+# the admin 16 wall-of-text SMS in two days for a condition that is already
+# mitigated and self-clears. Require consecutive failures before escalating.
+UPLINK_RETRIES = 2          # extra attempts after the first failure
+UPLINK_RETRY_PAUSE_S = 3
+
+# KEEP THIS SHORT. It is delivered to a human as an SMS. The long diagnostic
+# narrative that used to live here (686 chars, incl. "re-test a NON-Cloudflare
+# host", "Do NOT advise rebooting the router") was correct guidance aimed at the
+# WRONG AUDIENCE — it paged the admin 16 times in two days with a wall of text.
+# That guidance now lives in the comments above + the probe diagnostics, where
+# the next engineer reads it. The SMS says only what the human can act on.
+# NOTE: ethernet is NOT an option in this deployment — do not re-add it.
+# 2026-09-24: this used to end "Not an ISP or router fault: verified." It was
+# NOT verified. That conclusion rested on `netstat -s -p tcp` reporting zero
+# retransmissions -- and that counter is dead on macOS 26.2, reporting 0 packets
+# sent on a machine that is actively networking (confirmed on a second Mac, so
+# it is the OS, not this box). A sender holding unacked data MUST retransmit
+# after RTO, so "zero retransmits" was never a real observation.
+#
+# First rewrite kept "No router or ISP action needed", which is the SAME
+# unverified claim with the word "verified" deleted. If something on the path
+# is eating the burst -- the current leading hypothesis -- then router or ISP
+# action may be exactly what is needed. An alert must not tell the operator
+# where NOT to look while the cause is open.
+#
+# What survives is the actionable lever (the sysctl cap, measured) and the
+# honest state of the question. "reboot" and "ethernet" stay banned: those were
+# specific bad advice that wasted the admin's time, not a causal claim.
+_UPLINK_ESCALATION_FIX = (
+    "uplink degraded: 2MB upload failed 3x in a row (fault is intermittent and "
+    "usually self-clears). Check net.inet.tcp.autosndbufmax is still 393216 — "
+    "that cap is the known fix. Root cause not yet isolated — path vs local "
+    "stack, pending a packet capture."
+)
+
+
+def _run_curl_upload(nbytes: int, max_time: int) -> dict[str, Any]:
+    """POST `nbytes` zero bytes to UPLINK_TEST_URL via curl.
+
+    The payload is generated in memory and piped through stdin
+    (`--data-binary @-`) — no temp files. `-w` reports http_code + upload speed
+    on stdout; the response body is discarded.
+
+    Returns {rc, http_code, speed_bps, stderr, timed_out}. `rc is None` +
+    `timed_out=True` means the subprocess-level timeout fired (curl itself
+    wedged past --max-time).
+    """
+    cmd = [
+        "curl", "-sS", "-o", "/dev/null",
+        "--max-time", str(max_time),
+        "-H", "Content-Type: application/octet-stream",
+        "--data-binary", "@-",
+        "-w", "%{http_code} %{speed_upload}",
+        UPLINK_TEST_URL,
+    ]
+    try:
+        p = subprocess.run(
+            cmd, input=b"\x00" * nbytes, capture_output=True, timeout=max_time + 10,
+        )
+    except subprocess.TimeoutExpired:
+        return {"rc": None, "http_code": "", "speed_bps": None,
+                "stderr": f"curl wedged past --max-time (killed after {max_time + 10}s)",
+                "timed_out": True}
+    out = (p.stdout or b"").decode(errors="replace").strip()
+    parts = out.split()
+    http_code = parts[0] if parts else ""
+    speed: float | None = None
+    if len(parts) > 1:
+        try:
+            speed = float(parts[1].replace(",", "."))  # curl may emit locale decimals
+        except ValueError:
+            speed = None
+    # curl exits non-zero when --max-time cuts a transfer (rc 28) — that counts
+    # as the RST/stall failure mode, distinct from the subprocess-level timeout.
+    return {"rc": p.returncode, "http_code": http_code, "speed_bps": speed,
+            "stderr": (p.stderr or b"").decode(errors="replace").strip(),
+            "timed_out": p.returncode == 28}
+
+
+def _upload_ok(r: dict[str, Any]) -> bool:
+    return r["rc"] == 0 and str(r["http_code"]).startswith("2")
+
+
+def _fmt_speed(speed_bps: float | None) -> str:
+    return f"{speed_bps / 1024:.0f}KB/s" if speed_bps is not None else "unknown speed"
+
+
+def _api_uplink_probe() -> ProbeResult:
+    """Small control upload, then large test upload. See the block comment above."""
+    try:
+        small = _run_curl_upload(UPLINK_SMALL_BYTES, UPLINK_SMALL_MAX_TIME)
+    except OSError as e:
+        return ProbeResult.skip(f"could not run curl: {e}")
+    if not _upload_ok(small):
+        # Network fully down or Cloudflare unreachable — not the degraded-uplink
+        # signature, and not something to page the admin about (other checks
+        # cover total network loss).
+        return ProbeResult.skip(
+            "uplink control upload (500KB) failed — network fully down or "
+            f"speed.cloudflare.com unreachable (rc={small['rc']}, "
+            f"http={small['http_code'] or '?'}, {small['stderr'] or 'no stderr'}); "
+            "not paging for a possible third-party outage"
+        )
+
+    try:
+        large = _run_curl_upload(UPLINK_LARGE_BYTES, UPLINK_LARGE_MAX_TIME)
+    except OSError as e:
+        return ProbeResult.skip(f"could not run curl for the 2MB test: {e}")
+    # Intermittent-fault guard: a single failure is not newsworthy. Retry before
+    # we wake a human — the residual fault clears on its own roughly 9 times in 10.
+    attempts = 1
+    while not _upload_ok(large) and attempts <= UPLINK_RETRIES:
+        time.sleep(UPLINK_RETRY_PAUSE_S)
+        attempts += 1
+        try:
+            large = _run_curl_upload(UPLINK_LARGE_BYTES, UPLINK_LARGE_MAX_TIME)
+        except OSError:
+            break
+
+    small_txt = _fmt_speed(small["speed_bps"])
+    large_txt = _fmt_speed(large["speed_bps"])
+    if not _upload_ok(large):
+        return ProbeResult.degraded(
+            _UPLINK_ESCALATION_FIX
+            + f" [2MB test: rc={large['rc']}, http={large['http_code'] or '?'}, "
+            f"upload speed {large_txt}"
+            + (", hit --max-time (stalled/RST)" if large["timed_out"] else "")
+            + f"; 500KB control passed at {small_txt}]",
+            probe_rc=large["rc"],
+            probe_output=large["stderr"],
+            probe_timed_out=large["timed_out"],
+            http_code=large["http_code"],
+            speed_upload_bps=large["speed_bps"],
+            small_speed_upload_bps=small["speed_bps"],
+        )
+    return ProbeResult.ok(
+        f"uplink ok (2MB upload at {large_txt}; 500KB control at {small_txt})",
+        speed_upload_bps=large["speed_bps"],
+        small_speed_upload_bps=small["speed_bps"],
+    )
+
+
+# ──────────────────────────────────────────────────────────────
+# screen_lock
+# ──────────────────────────────────────────────────────────────
+
+# Host state again: `pmset displaysleep` (10 min here) darkens the display and
+# "require password after N seconds" (`sysadminctl -screenLock status`, 300s
+# here) then hands the screen to loginwindow. From that moment every GUI-driven
+# skill is blind — chrome-control screenshots come back black, Accessibility
+# walks find loginwindow instead of Chrome, cliclick types into the password
+# field — and until this check existed nothing detected it, so the agent just
+# looked broken. bin/screen-lock is the single source of truth (detect via
+# CGSSessionScreenIsLocked, unlock by typing the Keychain-stored login password
+# through a CGEvent HID tap, harden by turning the two re-arming settings off).
+#
+# Hardening is a security trade-off (the Mac stops asking for a password after
+# sleep), so it is opt-in via `screen_lock.harden: true` in config.local.yaml.
+# Without it the check still detects, unlocks and alerts.
+SCREEN_LOCK_CLI = ASSISTANT_DIR / "bin" / "screen-lock"
+SCREEN_LOCK_TIMEOUT = 30          # status / harden: a few subprocess calls
+SCREEN_LOCK_UNLOCK_TIMEOUT = 60   # wake + type + up to 2 attempts × 6s verify
+SCREEN_LOCK_KEYCHAIN_HINT = 'security add-generic-password -a "$USER" -s mac-login-password -w -U'
+_SCREEN_LOCK_STORE_ASK = (
+    "Auto-unlock needs the Mac login password in Keychain and it is not there. "
+    "Unlock the Mac yourself (Chrome Remote Desktop or keyboard), then run once on it: "
+    + SCREEN_LOCK_KEYCHAIN_HINT
+    + " — after that it self-unlocks."
+)
+
+
+def _run_screen_lock(*args: str, timeout: int = SCREEN_LOCK_TIMEOUT) -> tuple[int, dict, str]:
+    """Run bin/screen-lock <args> --json. Returns (rc, parsed_payload, raw_stderr)."""
+    cmd = [UV, "run", "--script", str(SCREEN_LOCK_CLI), *args, "--json"]
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    try:
+        payload = json.loads(p.stdout)
+    except ValueError:
+        payload = {}
+    return p.returncode, payload, (p.stderr or "").strip()
+
+
+def _screen_lock_harden_enabled() -> bool:
+    from assistant import config as _config
+    try:
+        return bool(_config.get("screen_lock.harden", False))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _screen_lock_diag(payload: dict) -> dict[str, Any]:
+    return {
+        "screenlock_setting": payload.get("screenlock_setting"),
+        "screensaver_idle_s": payload.get("screensaver_idle_s"),
+        "display_sleep_min": payload.get("display_sleep_min"),
+        "password_stored": payload.get("password_stored"),
+        "hardened": payload.get("hardened"),
+    }
+
+
+def _screen_lock_probe() -> ProbeResult:
+    """DOWN while loginwindow has the screen; DEGRADED (opt-in) while the lock can re-arm."""
+    if not SCREEN_LOCK_CLI.exists():
+        return ProbeResult.skip(f"{SCREEN_LOCK_CLI} not present")
+    try:
+        rc, payload, err = _run_screen_lock("status")
+    except subprocess.TimeoutExpired:
+        return ProbeResult.down("screen-lock status timed out", probe_timed_out=True)
+    except OSError as e:
+        return ProbeResult.skip(f"could not run screen-lock: {e}")
+    locked = payload.get("locked")
+    if locked is None:
+        return ProbeResult.skip(f"lock state unknown (rc={rc}): {err or 'no GUI session dictionary'}")
+    diag = _screen_lock_diag(payload)
+    stored = bool(payload.get("password_stored"))
+
+    if locked:
+        base = ("Mac screen is LOCKED — chrome-control, Messages.app and Accessibility "
+                "automation are blind until it is unlocked. ")
+        if not stored:
+            return ProbeResult.down(base + _SCREEN_LOCK_STORE_ASK, escalate_now=True, **diag)
+        return ProbeResult.down(base + "Typing the Keychain login password into loginwindow.", **diag)
+
+    setting = payload.get("screenlock_setting")
+    rearm = (f"require-password={setting}s, screensaver idle={payload.get('screensaver_idle_s') or 'never'}, "
+             f"display sleep={payload.get('display_sleep_min')}min")
+    if _screen_lock_harden_enabled() and not payload.get("hardened"):
+        detail = f"screen unlocked but the lock will re-arm ({rearm}); screen_lock.harden is on"
+        if not stored:
+            # sysadminctl needs the password — nothing to retry until it is stored.
+            return ProbeResult(ProbeStatus.DEGRADED, detail + ". " + _SCREEN_LOCK_STORE_ASK,
+                               diag, escalate_now=True)
+        return ProbeResult.degraded(detail, **diag)
+    return ProbeResult.ok(f"screen unlocked ({rearm}; harden={'on' if _screen_lock_harden_enabled() else 'off'})", **diag)
+
+
+def _screen_lock_recover() -> RecoverResult:
+    """Unlock if locked, then (opt-in) harden so it stays that way."""
+    try:
+        _, status, _ = _run_screen_lock("status")
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return RecoverResult.fail(f"screen-lock status failed before recovery: {e}")
+
+    parts: list[str] = []
+    diag: dict[str, Any] = {}
+    if status.get("locked"):
+        try:
+            rc, payload, err = _run_screen_lock("unlock", timeout=SCREEN_LOCK_UNLOCK_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            return RecoverResult.fail("screen-lock unlock timed out", recover_timed_out=True)
+        except OSError as e:
+            return RecoverResult.fail(f"could not run screen-lock unlock: {e}")
+        diag.update(recover_rc=rc, unlock_method=payload.get("method"),
+                    unlock_attempts=payload.get("attempts"))
+        if rc == 3:
+            return RecoverResult.fail(_SCREEN_LOCK_STORE_ASK, escalate_now=True, **diag)
+        if rc != 0:
+            return RecoverResult.fail(
+                "auto-unlock FAILED: " + (payload.get("detail") or err or f"rc={rc}")
+                + ". Unlock the Mac yourself (Chrome Remote Desktop or keyboard). If this repeats, "
+                "check that ~/dispatch/.venv/bin/python is allowed under System Settings → Privacy & "
+                "Security → Accessibility AND Input Monitoring, and that the Keychain password is current.",
+                recover_output=payload.get("detail") or err, **diag,
+            )
+        parts.append(payload.get("detail") or "unlocked")
+        log.warning("DEP_HEALTH | screen_lock | Mac was locked — %s", parts[-1])
+
+    if _screen_lock_harden_enabled():
+        try:
+            rc, payload, err = _run_screen_lock("harden")
+        except subprocess.TimeoutExpired:
+            return RecoverResult.fail("screen-lock harden timed out", recover_timed_out=True, **diag)
+        except OSError as e:
+            return RecoverResult.fail(f"could not run screen-lock harden: {e}", **diag)
+        diag["harden_rc"] = rc
+        if rc == 3:
+            return RecoverResult.fail(_SCREEN_LOCK_STORE_ASK, escalate_now=True, **diag)
+        if rc != 0:
+            bad = [f"{i['name']}={i.get('value')!r}" + (f" ({i['error']})" if i.get("error") else "")
+                   for i in payload.get("items", []) if i.get("status") == "FAIL"]
+            return RecoverResult.fail(
+                "could not disable the lock: " + (", ".join(bad) or err or f"rc={rc}")
+                + ". Fix by hand: System Settings → Lock Screen → 'Require password after screen "
+                "saver begins or display is turned off' = Never, and Screen Saver → Start = Never.",
+                recover_output=err, **diag,
+            )
+        changed = payload.get("changed", 0)
+        if changed:
+            parts.append(f"disabled require-password + idle screen saver ({changed} setting(s) changed)")
+            log.warning("DEP_HEALTH | screen_lock | hardened host: %s", parts[-1])
+        diag["harden_changed"] = changed
+
+    return RecoverResult.ok("; ".join(parts) or "screen already unlocked", **diag)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -736,6 +1323,38 @@ def build_default_registry(manager: Any) -> DependencyHealthRunner:
         reescalate_after_s=4 * 3600,
     ))
 
+    # ── imessage_app_nap ──────────────────────────────────────
+    runner.register(DependencyCheck(
+        name="imessage_app_nap",
+        probe=_app_nap_probe,
+        recover=_app_nap_recover,
+        # Host defaults only change at install time or across a macOS update, but
+        # the first tick runs seconds after daemon start — that's the install-time
+        # / fresh-Mac safety net. Hourly after that.
+        interval_s=3600,
+        max_attempts=2,
+        backoff_s=(0, 30),
+        probe_timeout_s=SETUP_MACOS_DEFAULTS_TIMEOUT + 5,
+        recover_timeout_s=SETUP_MACOS_DEFAULTS_TIMEOUT + 5,
+        # If macOS keeps resetting these, a human needs to know — a `defaults
+        # write` that has to be repeated is masking something worse.
+        recovery_alarm_k=2,
+        reescalate_after_s=6 * 3600,
+    ))
+
+    # ── api_uplink ────────────────────────────────────────────
+    runner.register(DependencyCheck(
+        name="api_uplink",
+        probe=_api_uplink_probe,
+        recover=None,                        # nothing local can fix an uplink
+        # DEGRADED (small passes, 2MB chokes) + no recover → escalate immediately
+        # with the specific fix carried in the probe detail.
+        recover_on_degraded=True,
+        interval_s=900,                      # costs real bandwidth — keep it infrequent
+        # Two sequential curls: 20s + 45s --max-time, plus subprocess slack.
+        probe_timeout_s=UPLINK_SMALL_MAX_TIME + UPLINK_LARGE_MAX_TIME + 25,
+    ))
+
     # ── fd_leak ───────────────────────────────────────────────
     runner.register(DependencyCheck(
         name="fd_leak",
@@ -744,6 +1363,36 @@ def build_default_registry(manager: Any) -> DependencyHealthRunner:
         interval_s=300,
         probe_timeout_s=10.0,
         reescalate_after_s=6 * 3600,
+    ))
+
+    # ── tcp_clock ─────────────────────────────────────────────
+    runner.register(DependencyCheck(
+        name="tcp_clock",
+        probe=_tcp_clock_probe,
+        recover=None,                        # only a reboot fixes it → escalate
+        recover_on_degraded=True,            # 45-day uptime nudge escalates too
+        interval_s=1800,
+        probe_timeout_s=30.0,
+        reescalate_after_s=12 * 3600,
+    ))
+
+    # ── screen_lock ───────────────────────────────────────────
+    runner.register(DependencyCheck(
+        name="screen_lock",
+        probe=_screen_lock_probe,
+        recover=_screen_lock_recover,
+        interval_s=60,                       # a locked screen blinds every GUI skill — find it fast
+        max_attempts=3,
+        backoff_s=(0, 20, 60),
+        retry_while_escalated_s=600,         # 2026-09-27: one transient failure left it locked 14h
+        recover_on_degraded=True,            # DEGRADED = "will re-arm" (opt-in harden) → apply it
+        probe_timeout_s=SCREEN_LOCK_TIMEOUT + 5,
+        recover_timeout_s=SCREEN_LOCK_UNLOCK_TIMEOUT + SCREEN_LOCK_TIMEOUT + 10,
+        # Unlocking 3×/hour means the lock keeps re-arming (harden is off or
+        # something resets it) — the admin should hear about that, not have it
+        # silently papered over.
+        recovery_alarm_k=3,
+        reescalate_after_s=2 * 3600,
     ))
 
     return runner

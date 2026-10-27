@@ -1,0 +1,26 @@
+<!doctype html><html><head><meta charset="utf-8">
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,700;1,400&family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
+<style>
+html{background:#0d0a08;margin:0;padding:0}
+body{width:1080px;height:1620px;margin:0;padding:0;background:#0d0a08;font-family:Inter,sans-serif;color:#fff;position:relative;overflow:hidden}
+.bg{position:absolute;inset:-40px;background:url('{{HERO_IMAGE}}') center/cover;filter:blur(28px) brightness(.45)}
+.wrap{position:relative;padding:64px 60px}
+.eyebrow{color:#f0883e;letter-spacing:.22em;text-transform:uppercase;font-size:24px;font-weight:600}
+.tag{position:absolute;top:58px;right:60px;border:1px solid rgba(255,255,255,.5);border-radius:40px;padding:8px 22px;font-size:22px}
+h1{font-family:'Playfair Display',serif;font-size:84px;margin:18px 0 6px;line-height:1}
+.sub{font-size:28px;color:#e8dccb;margin-bottom:34px}
+.l{display:flex;gap:30px;background:rgba(20,14,10,.72);border-radius:26px;padding:22px;margin-bottom:26px;box-shadow:0 10px 30px rgba(0,0,0,.4)}
+.l-img{width:440px;height:330px;border-radius:18px;background-size:cover;background-position:center;position:relative;flex:none}
+.l-num{position:absolute;top:14px;left:14px;background:#f0883e;color:#1a0f08;font-weight:800;font-size:30px;min-width:52px;height:52px;padding:0 14px;box-sizing:border-box;border-radius:26px;display:flex;align-items:center;justify-content:center}
+.l-txt{display:flex;flex-direction:column;justify-content:center;min-width:0}
+.l-price{font-family:'Playfair Display',serif;font-size:66px;color:#f0883e;line-height:1}
+.l-title{font-size:34px;font-weight:600;margin:12px 0 10px;line-height:1.2}
+.l-meta{font-size:25px;color:#cfc3b2}
+.l-why{font-family:'Playfair Display',serif;font-style:italic;font-size:26px;color:#f3e6d3;margin-top:12px}
+.poetic{font-family:'Playfair Display',serif;font-style:italic;font-size:30px;color:#f3e6d3;margin-top:10px}
+</style></head><body><div class="bg"></div><div class="wrap">
+<div class="eyebrow">{{EYEBROW}}</div><div class="tag">{{PAGE_TAG}}</div>
+<h1>{{TITLE}}</h1><div class="sub">{{SUBTITLE}}</div>
+{{LISTINGS_HTML}}
+<div class="poetic">{{POETIC}}</div>
+</div></body></html>

@@ -1,0 +1,121 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# ///
+"""Detect "dead rooms" — group chats we talk into that never talk back.
+
+WHY THIS EXISTS
+---------------
+On 2026-09-24 we found 17 messages sent into an SMS group between aug 19 and
+sep 22. Every one returned SENT. None arrived. Nothing caught it because:
+
+  * error was 0 on every row -- a correct error readback passes them.
+  * is_delivered is NEVER set for group chats (measured: 0/173 here,
+    0/2261 on a second machine), so chat.db can never confirm group delivery.
+    For 1:1 iMessage it is a perfect signal (2573/2573) -- but only there.
+
+So group delivery is structurally unverifiable per-send. The only available
+defense is a CONFIG smell, checked periodically rather than at send time:
+a group that routes over SMS when its members are iMessage-capable, and a
+group we monologue into.
+"""
+import argparse, sqlite3, sys
+from pathlib import Path
+
+DB = Path.home() / "Library" / "Messages" / "chat.db"
+APPLE_EPOCH = 978307200
+
+
+def connect():
+    if not DB.exists():
+        sys.exit(f"chat.db not found at {DB}")
+    try:
+        return sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error as e:
+        sys.exit(f"cannot open chat.db: {e}  (grant Full Disk Access?)")
+
+
+def scan(conn, days, min_out):
+    # NOTE: CAST is required. strftime() returns TEXT; comparing an INTEGER
+    # column expression to TEXT is ALWAYS FALSE in SQLite and silently
+    # returns zero rows. This exact bug produced a false all-clear today.
+    sql = """
+        SELECT c.guid,
+               COALESCE(NULLIF(c.display_name,''), c.chat_identifier) AS name,
+               COUNT(*)                                   AS total,
+               SUM(m.is_from_me)                          AS outbound,
+               SUM(CASE WHEN m.is_from_me=0 THEN 1 ELSE 0 END) AS inbound,
+               SUM(CASE WHEN m.service='SMS' AND m.is_from_me=1 THEN 1 ELSE 0 END) AS sms_out,
+               MAX(CASE WHEN m.is_from_me=0 THEN m.date ELSE 0 END) AS last_in,
+               MAX(m.date)                                AS last_any,
+               (SELECT COUNT(*) FROM chat_handle_join chj WHERE chj.chat_id=c.ROWID) AS members
+          FROM chat c
+          JOIN chat_message_join cmj ON cmj.chat_id = c.ROWID
+          JOIN message m             ON m.ROWID     = cmj.message_id
+         WHERE c.guid LIKE 'any;+;%'
+           AND m.date >= (CAST(strftime('%s','now',?) AS INTEGER) - ?) * 1000000000
+         GROUP BY c.ROWID
+        HAVING outbound >= ?
+    """
+    rows = conn.execute(sql, (f"-{days} days", APPLE_EPOCH, min_out)).fetchall()
+    out = []
+    for guid, name, total, outbound, inbound, sms_out, last_in, last_any, members in rows:
+        reasons = []
+        if inbound == 0:
+            reasons.append(f"monologue: {outbound} sent, 0 replies")
+        if sms_out and members > 1:
+            reasons.append(f"SMS-routed group ({sms_out}/{outbound} sent over SMS)")
+        if reasons:
+            out.append({
+                "guid": guid, "name": name, "outbound": outbound,
+                "inbound": inbound, "members": members, "reasons": reasons,
+                "last_in": last_in, "last_any": last_any,
+            })
+    return sorted(out, key=lambda r: -r["outbound"])
+
+
+def ts(v):
+    if not v:
+        return "never"
+    import datetime
+    return datetime.datetime.fromtimestamp(v / 1e9 + APPLE_EPOCH).strftime("%Y-%m-%d")
+
+
+def main():
+    p = argparse.ArgumentParser(description="Find group chats that never answer back.")
+    p.add_argument("--days", type=int, default=30, help="lookback window (default 30)")
+    p.add_argument("--min-out", type=int, default=3,
+                   help="min outbound messages to flag (default 3)")
+    p.add_argument("--quiet-ok", action="store_true",
+                   help="exit 0 even when dead rooms are found")
+    a = p.parse_args()
+
+    conn = connect()
+    try:
+        findings = scan(conn, a.days, a.min_out)
+        # Control: prove the query matches something, so "0 found" means
+        # healthy rather than broken. A silent zero is how this got missed.
+        total_groups = conn.execute(
+            "SELECT COUNT(*) FROM chat WHERE guid LIKE 'any;+;%'").fetchone()[0]
+    finally:
+        conn.close()
+
+    if not findings:
+        print(f"no dead rooms in the last {a.days}d "
+              f"(scanned {total_groups} group chats)")
+        return 0
+
+    print(f"{len(findings)} dead room(s) in the last {a.days}d "
+          f"(of {total_groups} group chats):\n")
+    for f in findings:
+        print(f"  {f['name']}  [{f['members']} members]")
+        print(f"    {f['guid']}")
+        for r in f["reasons"]:
+            print(f"    - {r}")
+        print(f"    last inbound: {ts(f['last_in'])}   last activity: {ts(f['last_any'])}")
+        print()
+    return 0 if a.quiet_ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -380,11 +380,19 @@ def resolve_imessage_handle(identifier: str) -> str:
         # contacts CLI to find the contact's email.
 
         # First, check if this phone maps to a known contact with an email
-        import yaml
+        # NOTE: pyyaml is not available under `uv run --script` (no PEP 723
+        # deps block), so degrade gracefully instead of aborting the whole
+        # remap -- the contacts-CLI fallback below still runs.
+        config = {}
         config_path = Path.home() / "dispatch" / "config.local.yaml"
         if config_path.exists():
-            with open(config_path) as f:
-                config = yaml.safe_load(f) or {}
+            try:
+                import yaml
+                with open(config_path) as f:
+                    config = yaml.safe_load(f) or {}
+            except ImportError:
+                config = {}
+        if config:
             owner = config.get("owner", {})
             owner_phone = owner.get("phone", "")
             # If the owner's phone field is an email (iMessage handle), and
@@ -439,6 +447,79 @@ def resolve_imessage_handle(identifier: str) -> str:
     return identifier
 
 
+def verify_delivery(handle: str, start_ts: float, is_group: bool = False,
+                    timeout: float = 6.0):
+    """Confirm Messages actually queued the send, via chat.db.
+
+    The AppleScript `send` returns "SENT|..." as soon as Messages ACCEPTS the
+    handoff. For an unroutable handle (e.g. a synthetic spawn chat_id) Messages
+    accepts it, writes a row with error=22 / is_sent=0, and never delivers --
+    so the CLI printed SENT on a hard failure. This closes that gap.
+
+    Returns (status, code, detail):
+      True  -> chat.db row found with error == 0  (confirmed OK)
+      False -> chat.db row found with error != 0  (confirmed FAILURE)
+      None  -> couldn't determine (db unreadable, or row not visible in time).
+               Callers MUST NOT treat None as failure: macOS defers chat.db
+               writes when Messages.app is deep-backgrounded.
+    """
+    import sqlite3
+    if os.environ.get("SEND_SMS_SKIP_VERIFY"):
+        return (None, 0, "verification skipped via SEND_SMS_SKIP_VERIFY")
+
+    chat_db = Path.home() / "Library" / "Messages" / "chat.db"
+    if not chat_db.exists():
+        return (None, 0, "chat.db not present")
+
+    # Apple epoch (2001-01-01) nanoseconds, minus 2s of clock slop.
+    apple_ns = int((start_ts - 978307200 - 2) * 1_000_000_000)
+
+    if is_group:
+        sql = """
+            SELECT m.error
+              FROM message m
+              JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
+              JOIN chat c ON c.ROWID = cmj.chat_id
+             WHERE m.is_from_me = 1 AND c.chat_identifier = ? AND m.date >= ?
+             ORDER BY m.date DESC LIMIT 1
+        """
+    else:
+        sql = """
+            SELECT m.error
+              FROM message m
+              JOIN handle h ON m.handle_id = h.ROWID
+             WHERE m.is_from_me = 1 AND h.id = ? AND m.date >= ?
+             ORDER BY m.date DESC LIMIT 1
+        """
+
+    deadline = time.time() + timeout
+    last_err = "no matching row appeared in chat.db"
+    while time.time() < deadline:
+        try:
+            conn = sqlite3.connect(f"file:{chat_db}?mode=ro", uri=True, timeout=5)
+            conn.execute("PRAGMA read_uncommitted=1")
+            row = conn.execute(sql, (handle, apple_ns)).fetchone()
+            conn.close()
+        except Exception as e:                      # unreadable / locked / perms
+            return (None, 0, f"chat.db unreadable: {e}")
+        if row is not None:
+            code = row[0] or 0
+            if code == 0:
+                return (True, 0, "")
+            return (False, code, _delivery_error_detail(code))
+        time.sleep(0.4)
+    return (None, 0, last_err)
+
+
+def _delivery_error_detail(code: int) -> str:
+    return {
+        22: "handle is not deliverable (not a real iMessage/SMS address). "
+            "If this is a synthetic chat_id such as '+1555...-spawn-XXXX', "
+            "send to the contact's REAL number instead.",
+        3:  "send failed -- recipient unreachable or not registered.",
+    }.get(code, f"Messages reported error={code}; message was not delivered.")
+
+
 def send_text_individual(phone: str, message: str) -> bool:
     """Send a text message to an individual."""
     # Resolve phone to iMessage handle if needed (prevents SMS routing on Mac Mini)
@@ -458,9 +539,17 @@ def send_text_individual(phone: str, message: str) -> bool:
     end timeout
     return "SENT|{resolved}"
     '''
+    start_ts = time.time()
     result = run_osascript(script, APPLESCRIPT_TEXT_TIMEOUT, "text_individual")
     if result.returncode == 0:
+        ok, code, detail = verify_delivery(resolved, start_ts)
+        if ok is False:
+            print(f"ERROR: NOT DELIVERED to {resolved} (chat.db error={code}). {detail}",
+                  file=sys.stderr)
+            return False
         print(result.stdout.strip())
+        if ok is None and detail:
+            print(f"WARN: delivery unconfirmed -- {detail}", file=sys.stderr)
         return True
     else:
         print(f"ERROR: {result.stderr.strip()}", file=sys.stderr)
@@ -484,9 +573,15 @@ def send_text_group(chat_id: str, message: str) -> bool:
         end tell
     end timeout
     '''
+    start_ts = time.time()
     result = run_osascript(script, APPLESCRIPT_TEXT_TIMEOUT, "text_group")
     output = result.stdout.strip()
     if result.returncode == 0 and "SENT_GROUP" in output:
+        ok, code, detail = verify_delivery(chat_id, start_ts, is_group=True)
+        if ok is False:
+            print(f"ERROR: NOT DELIVERED to group {chat_id} (chat.db error={code}). {detail}",
+                  file=sys.stderr)
+            return False
         print(output)
         return True
     else:
@@ -681,6 +776,41 @@ def send_file_group(chat_id: str, file_path: str) -> bool:
             temp_path.unlink()
 
 
+def record_third_party_watch(recipient: str) -> None:
+    """Remember that the session we're running in texted ``recipient``.
+
+    If ``recipient`` is not a known contact, their reply would otherwise be
+    dropped as an unknown sender. The daemon checks this 48h watch
+    (~/dispatch/state/third_party_watch.json, see
+    assistant/third_party_watch.py) and delivers the reply to the originating
+    session as untrusted third-party text. Best-effort: never fails a send.
+    """
+    try:
+        transcripts = Path.home() / "transcripts"
+        parts = Path.cwd().relative_to(transcripts).parts
+        if len(parts) < 2:
+            return
+        expected = str(transcripts / parts[0] / parts[1])
+        registry = json.loads((Path.home() / "dispatch" / "state" / "sessions.json").read_text())
+        entry = next((e for e in registry.values()
+                      if isinstance(e, dict) and e.get("transcript_dir") == expected), None)
+        if not entry or not entry.get("chat_id"):
+            return
+        dispatch_dir = str(Path.home() / "dispatch")
+        if dispatch_dir not in sys.path:
+            sys.path.insert(0, dispatch_dir)
+        from assistant.third_party_watch import record_watch
+        record_watch(
+            recipient, entry["chat_id"],
+            origin_session=entry.get("session_name"),
+            origin_contact=entry.get("contact_name") or entry.get("display_name"),
+            origin_tier=entry.get("tier"),
+            origin_source=entry.get("source"),
+        )
+    except Exception:
+        pass  # outside a session dir / registry unreadable — nothing to watch
+
+
 def main():
     start_time = time.perf_counter()
     parser = argparse.ArgumentParser(
@@ -704,6 +834,18 @@ Examples:
                         help="Allow sending filepath as text (normally rejected)")
 
     args = parser.parse_args()
+
+    # A spawn session's {{CHAT_ID}} looks like "+15555550100-spawn-e4683624".
+    # That is a synthetic session address, NOT a routable iMessage handle:
+    # Messages accepts it, writes error=22, and delivers nothing. Docs told
+    # agents to strip it by hand, which is exactly the kind of step that gets
+    # skipped -- so strip it here, where it cannot be forgotten.
+    spawn_match = re.match(r'^(.*?)-spawn-[0-9a-fA-F]+$', args.chat_id)
+    if spawn_match:
+        real_id = spawn_match.group(1)
+        print(f"NOTE: '{args.chat_id}' is a synthetic spawn id; "
+              f"routing to real handle '{real_id}'", file=sys.stderr)
+        args.chat_id = real_id
 
     # Validate inputs
     if not args.message and not args.image and not args.file:
@@ -771,6 +913,11 @@ Examples:
             success = send_file_group(args.chat_id, args.file)
         else:
             success = send_file_individual(args.chat_id, args.file)
+
+    # Third-party watch: replies from a non-contact we just texted get routed
+    # back to this session (as untrusted text) instead of being dropped.
+    if success and not is_group:
+        record_third_party_watch(args.chat_id)
 
     # Log perf metric
     elapsed_ms = (time.perf_counter() - start_time) * 1000

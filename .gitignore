@@ -8,7 +8,10 @@ secrets.env
 **/dispatch-apns-tokens.json
 
 # ── Runtime State ─────────────────────────────────────────────
-state/
+# Anchored: the unanchored `state/` also matched apps/dispatch-app/src/state/,
+# so the app's unreadAgents/unreadChats modules were never committed and got
+# lost — breaking `expo export` on every daemon restart (2026-09-18).
+/state/
 sessions/
 logs/
 
@@ -59,3 +62,8 @@ skills/vacation-house/
 # Sensitive financial data
 skills/personal-finances/
 services/dispatch-api/certs/
+
+# Runtime artifacts, not repo skills
+skills/synced/
+# Local config backups (contain secrets)
+config.local.yaml.bak-*

@@ -141,6 +141,7 @@ def cleanup_stale_profiles(registry: dict) -> dict:
 
 class ChromeControlHost:
     def __init__(self):
+        self.client_buffers: dict[int, bytes] = {}
         self.running = True
         self.pending_requests: dict[str, socket.socket] = {}
         self.request_id = 0
@@ -197,6 +198,10 @@ class ChromeControlHost:
 
     def cleanup_client(self, client: socket.socket):
         """Remove client and clean up any pending requests for it."""
+        try:
+            self.client_buffers.pop(client.fileno(), None)
+        except Exception:
+            pass
         if client in self.clients:
             self.clients.remove(client)
         # Remove pending requests for this client
@@ -453,7 +458,18 @@ class ChromeControlHost:
                             try:
                                 data = client.recv(65536)
                                 if data:
-                                    self.handle_client_message(client, data)
+                                    # 2026-09-29: requests larger than one recv() (e.g. `chrome
+                                    # upload` with base64 files) used to be parsed chunk-by-chunk
+                                    # and fail. Buffer per client until the JSON is complete.
+                                    buf = self.client_buffers.get(client.fileno(), b"") + data
+                                    try:
+                                        json.loads(buf.decode("utf-8"))
+                                    except (json.JSONDecodeError, UnicodeDecodeError):
+                                        if len(buf) < 64 * 1024 * 1024:
+                                            self.client_buffers[client.fileno()] = buf
+                                            continue
+                                    self.client_buffers.pop(client.fileno(), None)
+                                    self.handle_client_message(client, buf)
                                 else:
                                     self.cleanup_client(client)
                                     log("Client disconnected")

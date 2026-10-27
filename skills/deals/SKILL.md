@@ -49,6 +49,53 @@ node ~/.claude/skills/deals/scripts/deals.cjs health
 node ~/.claude/skills/deals/scripts/deals.cjs cron
 ```
 
+## Manufacturer / Retailer Price Verification CLIs
+
+For "what does X actually cost today" research, these fetch **live** prices with the
+exact URL to cite. Never answer pricing from memory.
+
+```bash
+# Logitech G — per-variant prices (PC vs PS vs Xbox) + stock.
+# logitechg.com shows only a range ("$999.99 - $1,199.99") until a variant is
+# clicked, so this drives Chrome to click each Platform button.
+scripts/logi-variant-prices pro-racing-wheel rs50-base g923-trueforce-sim-racing-wheel
+# slug = the tail of https://www.logitechg.com/en-us/shop/p/<slug>
+
+# Thrustmaster marketing site — MSRP + "Buy now" eShop link + stock.
+# Price lives in the #sticky-cart-price block, NOT in JSON-LD.
+scripts/tm-price t598 t818 t300rs t248 t-lcm-pedals
+
+# Thrustmaster official eShop (Magento) — real sale price, "was" price, SKU, stock.
+# This is the authoritative US store; a product missing here (404) is a strong
+# discontinuation signal even when the marketing page still lists an MSRP.
+scripts/tm-eshop-price "https://eshop.thrustmaster.com/en_us/t300-gt-edition.html"
+
+# Amazon — buybox price, list price, availability, seller (via Chrome).
+scripts/amazon-price B0DKG7D5RB B07PFB72NL
+
+# Best Buy — search listing (title | price | comp value | URL), and product pages.
+scripts/bestbuy-search "thrustmaster t248" "logitech g pro racing wheel"
+scripts/bestbuy-price "https://www.bestbuy.com/product/.../sku/6594092"
+```
+
+### Gotchas learned the hard way
+
+- **Best Buy blocks Chrome** ("Frame with ID 0 is showing error page") and returns
+  empty on `webfetch --tier 2`. Only plain `webfetch` (tier 1) works. On a BB
+  product page the real price is JS-rendered, so `bestbuy-price` anchors on the
+  **"Compare similar products"** block whose first entry is the current product.
+  BB search pages are flaky — re-run, and expect some queries to return nothing.
+- **Never grep a page for the first `$NN.NN`.** Both Logitech and Thrustmaster
+  product pages are full of accessory/upsell tiles and "customers also viewed"
+  prices. Always anchor on the product's own price container.
+- **Thrustmaster product sitemaps are the best new-release radar:**
+  `curl -s https://www.thrustmaster.com/product-sitemap{,2,3,4}.xml`, filter
+  `/en-us/`, sort by `<lastmod>` desc. Surfaces new SKUs before any press coverage.
+- **Amazon "Sold by Amazon Resale" / third-party sellers** wildly inflate EOL gear
+  (e.g. a $249.99-MSRP pedal set listed at $481 from Amazon Japan). Always report
+  the seller and distinguish it from MSRP.
+- Logitech `.html` category URLs 404; use `/en-us/shop/c/<cat>` and `/en-us/shop/p/<slug>`.
+
 ## Supported Stores
 
 | Store | Key | Method | Price Accuracy |

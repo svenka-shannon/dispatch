@@ -66,6 +66,10 @@ You are a bug discovery agent. Analyze {TARGET_DIR} for potential bugs, with rec
    git -C {TARGET_DIR} diff HEAD~5 --stat 2>/dev/null
    git -C {TARGET_DIR} diff HEAD~5 2>/dev/null
 
+   If HEAD is old (`git log -1 --format=%cd`), most recent work is probably UNCOMMITTED. In that case use
+   `git -C {TARGET_DIR} diff --stat` (working tree vs HEAD), `git status --porcelain | grep '^??'`,
+   and file mtimes (`find ... -mtime -7`) as the change signal instead of `git log`.
+
    If not a git repo, find recently modified files:
    find {TARGET_DIR} -name "*.py" -o -name "*.js" -o -name "*.ts" -o -name "*.sh" -mtime -1
 
@@ -112,6 +116,10 @@ You are a system health bug discovery agent for the Dispatch personal assistant.
 
 2. Check recent logs for errors:
    tail -100 ~/dispatch/logs/manager.log 2>/dev/null | grep -i "error\|exception\|traceback\|failed"
+   # Under launchd the daemon logs to stderr → ~/dispatch/logs/launchd.log (huge — grep/tail only).
+   # Check which file is actually live (newest mtime) before trusting either:
+   ls -la ~/dispatch/logs/manager.log ~/dispatch/logs/launchd.log
+   tail -2000 ~/dispatch/logs/launchd.log | grep -aiE "error|exception|traceback|failed"
    tail -50 ~/dispatch/logs/session_lifecycle.log 2>/dev/null
    tail -50 ~/dispatch/logs/watchdog.log 2>/dev/null
 
@@ -264,7 +272,11 @@ Collect all bug candidates from the 4 explorers. Deduplicate by file+line_range 
 
 For each unique bug candidate, spawn a **refinement subagent** in parallel. Use `subagent_type="general-purpose"` and `model="opus"` (these may need to run code or tests).
 
-**Cap at 15 refinement subagents.** If more than 15 candidates, prioritize by: severity_guess (critical first), then confidence (high first), then drop the rest with a note.
+**Cap at 15 refinement subagents.** If more than 15 candidates, prioritize by: severity_guess (critical first), then confidence (high first), then drop the rest with a note. Closely related candidates (same file or same root cause, e.g. several doc bugs or several stale tests) can share one refinement subagent that returns one verdict per ID. That lets more candidates fit under the cap.
+
+**Passing results between phases:** subagents may be blocked from writing files, so don't rely on a subagent to save its JSON for the next phase. As each refinement verdict arrives, append a condensed line (ID, verdict, severity, file:lines, root cause, fix) to `/tmp/bugfinder-<run>/verdicts.md` yourself. Write the Phase 3 proposals to a file yourself as well, and point the Phase 3/4 agents at those files.
+
+**Refinement/fix subagents are READ-ONLY.** Say so explicitly in every prompt: no edits, commits, restarts, or sends. Note that GNU `timeout` isn't installed on this machine.
 
 Prompt for each refinement subagent:
 
@@ -554,13 +566,21 @@ Explorers: 4 | Candidates: {N} | Accepted: {A} | Refuted: {R} | Needs Investigat
 
 **Interactive mode** (default): Print the report to the conversation.
 
-**Nightly mode** (prompt contains "--nightly"): Send the full report via SMS to admin. Do NOT truncate or summarize — the admin needs full details to triage when they see it. Look up the admin's chat ID dynamically:
+**Nightly mode** (prompt contains "--nightly"): Deliver the FULL report to the admin as an attachment, plus one short text. The sms-assistant length guard (max 4 lines / 220 chars of plain text, see sms-assistant SKILL.md "Message shape") rules out pasting a multi-page report into a text, and splitting it trips the burst guard. Attachments are exempt. So:
+
+1. Write the full, untruncated report to `~/Documents/bug-reports/bug-scan-<YYYY-MM-DD>.md`.
+2. Convert it to PDF: `~/.claude/skills/md2pdf/scripts/convert.py ~/Documents/bug-reports/bug-scan-<date>.md`. Check page 1 with the Read tool.
+3. Send ONE text of 220 chars or fewer (count, time-sensitive items first) with the PDF attached:
 
 ```bash
 # Get admin chat ID (phone or email)
-ADMIN_CHAT_ID=$(~/.claude/skills/contacts/scripts/contacts list --tier admin | head -1 | awk '{print $NF}')
-~/.claude/skills/sms-assistant/scripts/send-sms "$ADMIN_CHAT_ID" "{FULL_REPORT}"
+ADMIN_CHAT_ID=$(~/.claude/skills/contacts/scripts/contacts list --tier admin | head -1 | awk -F'|' '{gsub(/ /,"",$2); print "+1"$2}')
+~/.claude/skills/sms-assistant/scripts/send-sms "$ADMIN_CHAT_ID" "<=220-char summary, urgent items first" --file ~/Documents/bug-reports/bug-scan-<date>.pdf
 ```
+
+(`contacts list` prints `Name | 5551234567 | admin`, so `awk '{print $NF}'` returns the tier, not the number. Parse the middle column and check the result looks like a phone number before sending.)
+
+Put a "Do today / this week" section at the top of the report for anything with a deadline: live deliveries, reminders that fire soon, unbacked-up work.
 
 Only send if there are ACCEPT or REFINE verdicts. If everything was refuted, skip the SMS and log "bug-finder nightly: clean scan, no bugs found."
 

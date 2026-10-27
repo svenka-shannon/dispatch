@@ -30,6 +30,52 @@ from bs4 import BeautifulSoup
 from markdownify import markdownify as md
 
 
+def extracted_text_len(html: str) -> int:
+    """Length of real visible body text, ignoring scripts/styles/markup.
+
+    This is the honest measure of "did we get content". Markup length is not:
+    a JS-gated page returns a large, valid, completely textless shell.
+    """
+    if not html:
+        return 0
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup(["script", "style", "noscript", "template", "svg"]):
+            tag.decompose()
+        return len(" ".join(soup.get_text(" ", strip=True).split()))
+    except Exception:
+        return len(re.sub(r"<[^>]+>", " ", html).strip())
+
+
+def content_is_thin(html: str) -> bool:
+    """True when a fetch 'succeeded' but carries no real content — escalate.
+
+    booking.com's tier-1 shell is ~3.8KB of markup with ZERO text and no
+    challenge phrase, so a markup-length gate reports success and the higher
+    tiers never run. Gate on text instead.
+
+    Short pages are fine as long as they are mostly text: example.com is
+    ~180 chars of text in ~1.2KB of markup (high ratio) and still passes.
+    """
+    if not html:
+        return True
+    text_len = extracted_text_len(html)
+    if text_len == 0:
+        return True
+    if text_len < 200 and (text_len / max(len(html), 1)) < 0.05:
+        return True
+    return False
+
+
+# NOTE (2026-08-19): deliberately NOT gating or flagging on HTTP status.
+# A "202/403 = bot challenge, change transport" rule was proposed and then
+# retracted by its own author: booking.com returns 202 *and* real listings once
+# network_idle is on, so the status never explained the empty body. Measured
+# here: tier 2 + network-idle = 59KB of listings, and this CLI never looked at
+# the status at all. Do not add a status rule without measuring it first.
+# The signal that actually works is extracted body text (see content_is_thin).
+
+
 def fetch_with_scrapling_http(url: str, timeout: int = 30) -> tuple[str | None, str | None]:
     """Tier 1: Fast HTTP fetch with TLS fingerprint spoofing."""
     try:
@@ -72,6 +118,66 @@ def fetch_with_scrapling_stealthy(url: str, timeout: int = 30, network_idle: boo
             fetch_kwargs["wait_selector_state"] = "visible"
 
         page = fetcher.fetch(url, **fetch_kwargs)
+        html = page.html_content if hasattr(page, 'html_content') else None
+
+        if html and len(html) > 500:
+            return html, None
+        return None, "Empty or minimal content"
+    except Exception as e:
+        return None, str(e)
+
+
+def fetch_with_scrapling_dynamic(url: str, timeout: int = 60, network_idle: bool = True,
+                                  wait: int = 0, wait_selector: str = None) -> tuple[str | None, str | None]:
+    """Tier 3: DynamicFetcher driving a REAL Chrome (not Camoufox, not headless-shell).
+
+    Why this tier exists (measured 2026-08-19 against booking.com):
+      tier 1 curl_cffi   -> HTTP 202, 6763 bytes markup, 0 chars text
+      tier 2 camoufox    -> HTTP 202, 3720 bytes markup, 0 chars text
+      tier 3 real_chrome -> HTTP 200, 1,458,976 bytes, 14,418 chars, 36 listings
+
+    HTTP 202 is the tell that the site is issuing a *challenge* rather than
+    serving a slow page.
+
+    CORRECTION (measured on this box 2026-08-19, superseding the numbers above):
+    tier 2 is NOT stuck on booking.com, and "tiers 1 and 2 can poll forever" is
+    false here. Given `network_idle` + `wait`, Camoufox follows the challenge
+    redirect itself and lands 200:
+
+      [tier 1] Fetched (202) ... 3793 bytes, 0 chars text -> escalating
+      [tier 2] Fetched (200) <GET ...&chal_t=1787161971170
+               &force_referer=https%3A%2F%2Fwww.google.com%2F>
+      -> 58,782 bytes, 121 listing matches, [Fetched with tier 2]
+
+    So the `force_referer=google` redirect is NOT unique to real_chrome — tier 2
+    performs the same challenge round-trip. The earlier "tier 2 = 0 chars" result
+    came from calling tier 2 WITHOUT network_idle, which gives it no time to
+    follow the redirect. Challenge and render are not competing explanations:
+    clearing the challenge *requires* the wait.
+
+    Tier 3 is still worth keeping as a last resort for sites a real Chrome
+    fingerprint genuinely unlocks — but it should not be reached for booking.com,
+    and status alone must never route the decision (see the NOTE above).
+
+    Credit: diagnosed jointly with Sven Thorat (Nikhil's agent) 2026-08-19.
+    """
+    try:
+        from scrapling.fetchers import DynamicFetcher
+
+        fetch_kwargs = {
+            "headless": True,
+            "real_chrome": True,
+            "timeout": timeout * 1000,
+        }
+        if network_idle:
+            fetch_kwargs["network_idle"] = True
+        if wait > 0:
+            fetch_kwargs["wait"] = wait
+        if wait_selector:
+            fetch_kwargs["wait_selector"] = wait_selector
+            fetch_kwargs["wait_selector_state"] = "visible"
+
+        page = DynamicFetcher.fetch(url, **fetch_kwargs)
         html = page.html_content if hasattr(page, 'html_content') else None
 
         if html and len(html) > 500:
@@ -155,12 +261,18 @@ def main():
         "--raw", action="store_true", help="Output raw HTML instead of markdown"
     )
     parser.add_argument(
-        "--tier", type=int, choices=[1, 2], default=0,
-        help="Force specific tier (1=scrapling HTTP, 2=scrapling Stealthy)"
+        "--tier", type=int, choices=[1, 2, 3], default=0,
+        help="Force specific tier (1=scrapling HTTP, 2=scrapling Stealthy, "
+             "3=scrapling Dynamic/real Chrome — clears HTTP 202 challenges)"
     )
     parser.add_argument(
         "--network-idle", action="store_true",
-        help="Wait for network idle (no connections for 500ms) — good for JS-rendered pages"
+        help="Wait for network idle — now the DEFAULT for tiers 2/3; flag kept for compat"
+    )
+    parser.add_argument(
+        "--no-network-idle", action="store_true",
+        help="Deliberately run tiers 2/3 in their WEAK form (no network-idle, no wait). "
+             "Only for reproducing the empty-shell failure mode — not for real fetches."
     )
     parser.add_argument(
         "--wait", type=int, default=0,
@@ -185,34 +297,84 @@ def main():
     tier_used = None
 
     # Try tiers in order (or use forced tier)
-    tiers = [args.tier] if args.tier else [1, 2]
+    tiers = [args.tier] if args.tier else [1, 2, 3]
+
+    # Track the richest attempt so a thin-everywhere result still returns
+    # something instead of erroring out with nothing.
+    best_html, best_text_len, best_tier = None, -1, None
+    escalated_for_thin = False
 
     for tier in tiers:
         if tier == 1:
             print("[tier 1] scrapling HTTP (TLS fingerprint)...", file=sys.stderr)
             html, error = fetch_with_scrapling_http(url, args.timeout)
-            if html and not looks_like_antibot_page(html):
-                tier_used = 1
-                break
-            print(f"[tier 1] failed: {error or 'antibot detected'}", file=sys.stderr)
 
         elif tier == 2:
-            print("[tier 2] scrapling Stealthy (Camoufox)...", file=sys.stderr)
+            # Tier 2 ALWAYS runs in its strong form (network-idle + wait) unless
+            # the caller explicitly opts out with --no-network-idle.
+            #
+            # This used to be `args.network_idle or escalated_for_thin`, which
+            # meant forcing `--tier 2` ran the WEAK form — so anyone debugging
+            # tier 2 directly got an empty shell and concluded the tier was
+            # broken. The CLI manufactured false evidence at exactly the moment
+            # someone was trying to test it. Camoufox needs this time to follow
+            # booking.com's challenge redirect and land HTTP 200.
+            ni = not args.no_network_idle
+            wait_ms = args.wait or (0 if args.no_network_idle else 3000)
+            print("[tier 2] scrapling Stealthy (Camoufox)"
+                  f"{' (WEAK form — no network-idle)' if args.no_network_idle else ' +network-idle +wait'}...",
+                  file=sys.stderr)
             html, error = fetch_with_scrapling_stealthy(
                     url, args.timeout,
-                    network_idle=args.network_idle,
-                    wait=args.wait,
+                    network_idle=ni,
+                    wait=wait_ms,
                     wait_selector=args.wait_selector,
                 )
-            if html and not looks_like_antibot_page(html):
-                tier_used = 2
-                break
-            print(f"[tier 2] failed: {error or 'antibot detected'}", file=sys.stderr)
+        elif tier == 3:
+            # Last resort: a real Chrome. This is the only tier that clears an
+            # HTTP 202 challenge (booking.com et al). Slower (~10s) so it stays
+            # last, but it is the difference between listings and an empty shell.
+            print("[tier 3] scrapling Dynamic (real Chrome)...", file=sys.stderr)
+            html, error = fetch_with_scrapling_dynamic(
+                    url,
+                    max(args.timeout, 60),
+                    network_idle=True,
+                    wait=args.wait or 0,
+                    wait_selector=args.wait_selector,
+                )
+        else:
+            continue
 
-    if not html:
-        print(f"All tiers failed. Last error: {error}", file=sys.stderr)
-        print(f"Try chrome-control: ~/.claude/skills/chrome-control/scripts/chrome fetch \"{url}\"", file=sys.stderr)
-        sys.exit(1)
+        if html:
+            t_len = extracted_text_len(html)
+            if t_len > best_text_len:
+                best_html, best_text_len, best_tier = html, t_len, tier
+
+            if looks_like_antibot_page(html):
+                print(f"[tier {tier}] failed: antibot challenge", file=sys.stderr)
+            elif content_is_thin(html):
+                # The silent failure: valid markup, no text. Do NOT call this success.
+                print(f"[tier {tier}] thin content: {len(html)} bytes markup, "
+                      f"{t_len} chars text — escalating", file=sys.stderr)
+                escalated_for_thin = True
+            else:
+                tier_used = tier
+                break
+        else:
+            print(f"[tier {tier}] failed: {error or 'no content'}", file=sys.stderr)
+
+    if tier_used is None:
+        if best_html:
+            # Every tier was thin/blocked — return the best we got, loudly.
+            html, tier_used = best_html, best_tier
+            print(f"[WARNING] all tiers returned thin content; returning best "
+                  f"(tier {best_tier}, {best_text_len} chars of text).", file=sys.stderr)
+            print(f"[WARNING] this page likely needs a real browser session. Try: "
+                  f"~/.claude/skills/chrome-control/scripts/chrome fetch \"{url}\"", file=sys.stderr)
+        else:
+            print(f"All tiers failed. Last error: {error}", file=sys.stderr)
+            print(f"Try chrome-control: ~/.claude/skills/chrome-control/scripts/chrome fetch \"{url}\"", file=sys.stderr)
+            sys.exit(1)
 
     # Output
     if args.raw:

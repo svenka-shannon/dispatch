@@ -102,6 +102,81 @@ Notes are useful for remembering preferences, context, etc.
 - The Messages.app chat.db uses phone numbers as identifiers
 - When a message comes in, lookup the phone number to determine tier and routing
 
+## Troubleshooting: writes fail, reads work
+
+Symptoms: `contacts add` prints "Failed to create contact"; raw AppleScript
+returns **`-1712` (errAETimeout)** or **`-609` (Connection is invalid)** — while
+`contacts list` / `lookup` keep working fine.
+
+**This is an Automation (AppleEvents) permission problem, not a hung app.**
+Diagnosed 2026-08-19: `Contacts.app` was healthy (sampled — main thread idle in
+a normal event loop), yet every write timed out. The TCC database showed the
+denial:
+
+```bash
+sqlite3 ~/Library/Application\ Support/com.apple.TCC/TCC.db \
+  "SELECT client, indirect_object_identifier, auth_value FROM access WHERE service='kTCCServiceAppleEvents';"
+# python3.14 | com.apple.AddressBook | 0   <-- 0 = DENIED (2 = allowed)
+```
+
+Fix (**needs the human — an agent cannot grant this**):
+System Settings → Privacy & Security → Automation → enable **Contacts** for the
+python/uv binary. Then `killall Contacts AddressBookSourceSync` and retry.
+
+Notes:
+- `-609` typically follows a `pkill -9 Contacts` — a stale AppleEvent connection.
+  Quit cleanly (`osascript -e 'tell application "Contacts" to quit'`) instead.
+- Do NOT interpret the hang as "Contacts.app is wedged" and start force-killing.
+  Sample it first: `/usr/bin/sample <pid> 2 -file /tmp/c.txt`.
+- A *pending* (invisible) Automation prompt causes the same timeout on reads too.
+
+**Reads never need AppleEvents** — query SQLite directly:
+
+```bash
+sqlite3 "$HOME/Library/Application Support/AddressBook/Sources/"*/AddressBook-v22.abcddb \
+  "SELECT r.ZFIRSTNAME, r.ZLASTNAME, p.ZFULLNUMBER FROM ZABCDPHONENUMBER p
+   JOIN ZABCDRECORD r ON r.Z_PK=p.ZOWNER;"
+# emails: ZABCDEMAILADDRESS e ... e.ZADDRESS, JOIN on r.Z_PK=e.ZOWNER
+```
+
+Query **every** source dir, newest mtime first — iCloud can keep duplicate cards
+across containers, and a stale one will answer first if you let it.
+
+## Ask the code, not the filesystem
+
+When checking what this module reads, **call `_get_all_addressbook_dbs()`** — do
+not `ls` the `Sources/` directory or glob for `*.abcddb`.
+
+```python
+from contacts_core import _get_all_addressbook_dbs
+print(list(_get_all_addressbook_dbs()))   # the truth
+```
+
+It returns the per-source DBs **plus the root** `AddressBook-v22.abcddb`, so
+`ls Sources/ | wc -l` undercounts. On 2026-08-19 that proxy produced a wrong
+public claim ("only one source DB, so the bug was latent") when the real count
+was 2. A second agent independently made the same class of error by globbing
+instead of calling the function, and got the right answer only by luck.
+
+Note `Z_PK` is unique only **within one** database. Any structure keyed by pk
+across DBs will merge unrelated people. Scope per-DB, or derive state from a
+per-DB dict so the bad state cannot be represented at all.
+
+Useful follow-up when auditing: *structural* exposure and *empirical* firing are
+different questions. A machine can read N databases yet never collide because
+only one holds tier rows:
+
+```bash
+sqlite3 "$DB" "SELECT COUNT(DISTINCT pg.Z_22CONTACTS) FROM Z_22PARENTGROUPS pg
+  JOIN ZABCDRECORD g ON g.Z_PK=pg.Z_19PARENTGROUPS1 WHERE g.ZNAME LIKE 'Claude%';"
+```
+
+## Known gap: `contacts add` takes a phone only
+
+`add` has no `--email` option, so an email-only handle (common for Signal/iMessage
+via Apple ID) cannot be recorded with the CLI as-is. Writes are also gated on the
+Automation permission above.
+
 ## Technical Details
 
 **Hybrid read/write path:**

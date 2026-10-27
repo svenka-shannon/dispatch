@@ -1,0 +1,105 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = []
+# ///
+"""
+tcp-keepalive-check — prove whether this Mac's kernel actually sends TCP keepalive probes.
+
+WHY
+---
+Inbound iMessages stall for 5–16 minutes on this box because the Wi-Fi/NAT path
+silently drops apsd's idle TCP mapping to push.apple.com:5223 and apsd only notices
+at its own ~12-minute keepalive (POSTMORTEMS.md 2026-09-21 CORRECTION, 2026-09-25).
+The 2026-09-21 mitigation was `net.inet.tcp.always_keepalive=1` + `keepidle=180000`
+so the KERNEL would probe every 3 minutes and keep the NAT mapping fresh. But
+`netstat -s -p tcp` reports **0 keepalive probes ever sent** — even with an explicit
+per-socket 3-second keepalive — so either the counters are broken or the probes
+never leave the machine. Only a packet capture settles it, and that needs root.
+
+WHAT IT DOES
+------------
+Opens one TCP connection to 1.1.1.1:443, enables SO_KEEPALIVE with a 3s idle /
+2s interval on that socket, and sits idle for 20s. Run as root it also runs tcpdump
+on the socket and counts the zero-length ACKs the kernel sends as probes.
+
+    sudo scripts/tcp-keepalive-check          # definitive: prints probes seen
+    scripts/tcp-keepalive-check               # no root: prints netstat counters only
+
+Expected when keepalive works: ~5–8 probes in 20s. 0 probes → the kernel keepalive
+sysctls are inert here and the APNs stall needs a different lever (see POSTMORTEMS).
+"""
+from __future__ import annotations
+
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+
+HOST, PORT = "1.1.1.1", 443
+IDLE_S = 20
+TCP_KEEPALIVE, TCP_KEEPINTVL, TCP_KEEPCNT = 0x10, 0x101, 0x102  # macOS values
+
+
+def counters() -> dict[str, int]:
+    out = subprocess.run(["netstat", "-s", "-p", "tcp"], capture_output=True, text=True).stdout
+    found = {}
+    for line in out.splitlines():
+        m = re.match(r"\s*(\d+) (.*keepalive.*)", line)
+        if m:
+            found[m.group(2).strip()] = int(m.group(1))
+    return found
+
+
+def default_iface() -> str:
+    out = subprocess.run(["route", "-n", "get", "default"], capture_output=True, text=True).stdout
+    m = re.search(r"interface: (\S+)", out)
+    return m.group(1) if m else "en0"
+
+
+def main() -> int:
+    root = os.geteuid() == 0
+    iface = default_iface()
+    before = counters()
+    cap = None
+    if root:
+        cap = subprocess.Popen(
+            ["tcpdump", "-i", iface, "-nn", "-l", "-tt", f"host {HOST} and tcp port {PORT}"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+        time.sleep(1.5)
+    s = socket.create_connection((HOST, PORT), timeout=10)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    s.setsockopt(socket.IPPROTO_TCP, TCP_KEEPALIVE, 3)
+    s.setsockopt(socket.IPPROTO_TCP, TCP_KEEPINTVL, 2)
+    s.setsockopt(socket.IPPROTO_TCP, TCP_KEEPCNT, 3)
+    print(f"connected to {HOST}:{PORT} via {iface}; idle {IDLE_S}s with per-socket keepalive idle=3s intvl=2s")
+    time.sleep(IDLE_S)
+    s.close()
+    after = counters()
+
+    print("\nkernel counters (netstat -s -p tcp):")
+    for k in sorted(set(before) | set(after)):
+        print(f"  {k}: {before.get(k, 0)} -> {after.get(k, 0)}")
+
+    if cap is None:
+        print("\nNot root: no packet capture. For the definitive answer run:  sudo scripts/tcp-keepalive-check")
+        return 0
+
+    time.sleep(1)
+    cap.terminate()
+    lines = cap.stdout.read().splitlines() if cap.stdout else []
+    # A keepalive probe is a bare ACK with no payload from our side after the handshake.
+    probes = [l for l in lines if f"> {HOST}.{PORT}" in l and "Flags [.]" in l and "length 0" in l]
+    # The first bare ACK completes the handshake; anything after it is a probe.
+    n = max(0, len(probes) - 1)
+    print(f"\npackets captured: {len(lines)}; keepalive probes from this host: {n}")
+    verdict = "KEEPALIVE WORKS" if n >= 3 else "NO KEEPALIVE PROBES — the sysctl mitigation is inert on this Mac"
+    print(verdict)
+    return 0 if n >= 3 else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

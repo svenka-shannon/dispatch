@@ -65,6 +65,44 @@ def build_bullets_html(bullets: list[str]) -> str:
     return "\n".join(f"<div>{html_escape(b)}</div>" for b in bullets)
 
 
+def build_rows_html(rows: list[dict]) -> str:
+    """Rows for the option-rank template: name / note / price, optional pick+badge."""
+    parts = []
+    for r in rows:
+        cls = "row pick" if r.get("pick") else "row"
+        badge = r.get("badge", "")
+        badge_html = f'<div class="badge">{html_escape(badge)}</div>' if badge else ""
+        name = html_escape(str(r.get("name", "")))
+        note = html_escape(str(r.get("note", "")))
+        price = html_escape(str(r.get("price", "")))
+        note_html = f'<div class="row-note">{note}</div>' if note else ""
+        price_html = f'<div class="row-price">{price}</div>' if price else ""
+        parts.append(
+            f'<div class="{cls}"><div class="row-main">{badge_html}'
+            f'<div class="row-name">{name}</div>{note_html}</div>{price_html}</div>'
+        )
+    return "\n".join(parts)
+
+
+def build_listings_html(items: list[dict]) -> str:
+    """Listings for the listing-picks template: real listing photo + price/title/meta."""
+    parts = []
+    for i, it in enumerate(items, 1):
+        img = it.get("image", "")
+        num = html_escape(str(it.get("num", i)))  # optional badge text, e.g. a pick id "1020-1"
+        price = html_escape(str(it.get("price", "")))
+        title = html_escape(str(it.get("title", "")))
+        meta = html_escape(str(it.get("meta", "")))
+        why = html_escape(str(it.get("why", "")))
+        why_html = f'<div class="l-why">{why}</div>' if why else ""
+        parts.append(
+            f'<div class="l"><div class="l-img" style="background-image:url(\'{img}\')">'
+            f'<div class="l-num">{num}</div></div><div class="l-txt"><div class="l-price">{price}</div>'
+            f'<div class="l-title">{title}</div><div class="l-meta">{meta}</div>{why_html}</div></div>'
+        )
+    return "\n".join(parts)
+
+
 def render(spec_path: Path, out_path: Path):
     with open(spec_path) as f:
         spec = yaml.safe_load(f)
@@ -84,6 +122,9 @@ def render(spec_path: Path, out_path: Path):
         "{{POETIC}}": html_escape(spec.get("poetic", "")),
         "{{TILES_HTML}}": build_tiles_html(spec.get("tiles", [])),
         "{{BULLETS_HTML}}": build_bullets_html(spec.get("bullets", [])),
+        "{{ROWS_HTML}}": build_rows_html(spec.get("rows", [])),
+        "{{LISTINGS_HTML}}": build_listings_html(spec.get("listings", [])),
+        "{{TOTAL}}": spec.get("total", ""),
     }
     for k, v in substitutions.items():
         html = html.replace(k, v)

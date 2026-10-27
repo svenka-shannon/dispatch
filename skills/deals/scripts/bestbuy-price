@@ -1,0 +1,30 @@
+#!/bin/bash
+# Best Buy product price via webfetch. Anchors on the "Compare similar products"
+# block, whose FIRST entry is always the current product (BB's own price element
+# is JS-rendered and Chrome is blocked by BB bot detection).
+# Usage: bestbuy-price <bestbuy-product-url> [more...]
+WF="$HOME/.claude/skills/webfetch/scripts/webfetch"
+for url in "$@"; do
+  "$WF" "$url" 2>/dev/null > /tmp/.bbp.txt
+  python3 - "$url" <<'PY'
+import re,sys
+url=sys.argv[1]; t=open('/tmp/.bbp.txt').read()
+title=re.search(r'^#\s+(.+)$', t, re.M)
+name=title.group(1).strip() if title else '?'
+model=re.search(r'^Model:\s*(\S+)', t, re.M); sku=re.search(r'^SKU:\s*(\S+)', t, re.M)
+price=None; was=None
+cmp_=t.find('Compare similar products')
+if cmp_>0:
+    seg=t[cmp_:cmp_+4000]
+    m=re.search(r'\$([0-9,]+\.[0-9]{2})\$[0-9,]+\.[0-9]{2}', seg)
+    if m: price=m.group(1)
+if not price:
+    m=re.search(r'\$([0-9,]+\.[0-9]{2})\$[0-9,]+\.[0-9]{2}', t)
+    price=m.group(1) if m else None
+w=re.search(r'(?:The price was|Comp\. Value:|Was)\s*\$([0-9,]+\.[0-9]{2})', t[cmp_ if cmp_>0 else 0:][:2000])
+sold='SOLD OUT' if re.search(r'\bSold Out\b|currently unavailable|no longer available', t, re.I) else 'in stock'
+print(f'{name[:86]:86s}')
+print(f'   price=${price or "COULD NOT VERIFY"} | was=${w.group(1) if w else "-"} | {sold} | model {model.group(1) if model else "?"} sku {sku.group(1) if sku else "?"}')
+print(f'   {url}')
+PY
+done

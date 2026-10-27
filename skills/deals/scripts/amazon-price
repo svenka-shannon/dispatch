@@ -1,0 +1,23 @@
+#!/bin/bash
+# Exact buybox price + title + availability for Amazon ASINs, via Chrome (renders JS).
+# Usage: amazon-price <ASIN|url> [more...]
+CHROME="$HOME/.claude/skills/chrome-control/scripts/chrome"
+for a in "$@"; do
+  case "$a" in http*) url="$a";; *) url="https://www.amazon.com/dp/$a";; esac
+  tab=$("$CHROME" open "$url" | grep -oE 'tab [0-9]+' | grep -oE '[0-9]+')
+  [ -z "$tab" ] && { echo "$a: FAILED to open"; continue; }
+  sleep 5
+  "$CHROME" js "$tab" '
+  (function(){
+    const q=s=>document.querySelector(s);
+    const txt=s=>{const e=q(s);return e?e.innerText.replace(/\s+/g," ").trim():"";};
+    const title=txt("#productTitle");
+    let price=txt(".a-price.priceToPay .a-offscreen")||txt("#corePrice_feature_div .a-offscreen")||txt("#corePriceDisplay_desktop_feature_div .a-offscreen")||txt("span.a-price span.a-offscreen");
+    if(!price){const e=q("#corePrice_feature_div .a-price");price=e?e.innerText.replace(/\n/g,""):"";}
+    const list=txt("#corePriceDisplay_desktop_feature_div .basisPrice .a-offscreen")||txt("span.basisPrice .a-offscreen");
+    const avail=txt("#availability");
+    const seller=txt("#sellerProfileTriggerId")||txt("#merchant-info");
+    return JSON.stringify({title:title.slice(0,110),price,list,avail:avail.slice(0,60),seller:seller.slice(0,60),url:location.href.split("?")[0]},null,1);
+  })()' 2>/dev/null | sed -n '/{/,/}/p'
+  "$CHROME" close "$tab" >/dev/null 2>&1
+done

@@ -29,9 +29,43 @@ SEND_SIGNAL = Path.home() / ".claude/skills/signal/scripts/send-signal"
 SEND_SIGNAL_GROUP = Path.home() / ".claude/skills/signal/scripts/send-signal-group"
 SEND_DISCORD = Path.home() / ".claude/skills/discord/scripts/send-discord"
 
-# Length guard — see main(). Keep texts short; split or use a visual card.
-MAX_LINES = 8
-MAX_CHARS = 600
+# Length guard — see main(). Keep texts short; cut it down or use an image.
+# Tightened 2026-08-23 from 8/600 after Eric's FIFTH complaint ("holy shit cool
+# it with the wall of text"). Messages were sitting right at the old 600-char
+# ceiling and still reading as walls, so the ceiling was the problem.
+# Tightened 2026-08-28 after MEASURING the asymmetry. Over 24h on Eric's chat:
+#   Eric -> me: 91 msgs, mean 70 chars, median 56
+#   me -> Eric: 230 msgs, mean 200 chars, median 214
+# = 2.5x his message count, 3x his length, ~7x total volume. Seventh complaint.
+# 200 was the OLD mean, so it is the thing to beat, not the target.
+MAX_LINES = 4
+MAX_CHARS = 220
+# --- --long token bucket (Eric's design, 2026-09-23) ---------------------
+# A flat daily cap failed twice: at 4/day I spent one within the hour; at 1/day
+# it was just a wall. Eric's fix makes the override cost EFFORT and submits it to
+# an independent judge, which is the part I cannot rationalise past:
+#   * earn 1 token every 2h, accrue up to 4
+#   * to spend one, write >=200 words justifying THIS message
+#   * a grader agent returns PASS/FAIL; FAIL spends nothing and sends nothing
+LONG_REFILL_SEC = 2 * 3600
+LONG_MAX_TOKENS = 4
+LONG_MIN_JUSTIFY_WORDS = 200
+LONG_GRADER_MODEL = "haiku"
+
+# Burst guard — see main(). Several short texts in a row are STILL a wall of
+# text. On 2026-08-22 seven individually-legal messages went out in ~13 min and
+# Eric replied "Holy wall of text. Research more yap less. Use visuals, links,
+# images". The per-message guard passed all seven, so count is enforced too.
+#
+# 2026-10-20 (admin-approved): the window now RESETS on every inbound message.
+# Only sends made AFTER the newest `message.received` for this chat count, so
+# answering a NEW question is never blocked by replies to an earlier one. The
+# 15-min window stays as an upper bound. --burst sends are not counted, and
+# --burst requires --burst-why "<reason>" (logged).
+MAX_BURST_SENDS = 3
+BURST_WINDOW_SEC = 900
+_SPAWN_SUFFIX = re.compile(r"-spawn-[0-9a-f]+$")
+BURST_STATE_DIR = Path.home() / "dispatch/state/reply-burst"
 REPLY_APP = Path.home() / ".claude/skills/dispatch-app/scripts/reply-app"
 REPLY_DISPATCH_API = Path.home() / ".claude/skills/dispatch-app/scripts/reply-dispatch-api"
 REPLY_VOICE = Path.home() / ".claude/skills/pocket-sven/scripts/reply-voice"
@@ -128,6 +162,265 @@ def produce_tapback(chat_id: str, message_guid: str, reaction: str, backend: str
     finally:
         conn.close()
 
+def burst_chat_ids(chat_id: str) -> list[str]:
+    """chat_id forms that inbound `message.received` payloads may carry.
+
+    Payloads use the bare id (no registry prefix). Spawned sub-sessions
+    (`<chat>-spawn-<hex>`) reply into the parent chat, so the parent's inbound
+    messages reset them too.
+    """
+    ids = []
+    for c in (chat_id, strip_registry_prefix(chat_id)):
+        for v in (c, _SPAWN_SUFFIX.sub("", c)):
+            if v and v not in ids:
+                ids.append(v)
+    return ids
+
+
+def last_inbound_ms(chat_ids: list[str], since_ms: int,
+                    db_path: Path | None = None) -> int | None:
+    """Newest `message.received` record timestamp (unix ms) for these chat_ids.
+
+    Looks in both `records` and `records_archive`, only at rows newer than
+    `since_ms` (older inbounds can't matter — the window already excludes
+    them). Opens the bus read-only. Returns 0 when there is no inbound in
+    range; RAISES on any DB problem so the caller can fail open.
+    """
+    db_path = db_path or BUS_DB_PATH
+    if not chat_ids:
+        return 0
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
+    try:
+        conn.execute("PRAGMA busy_timeout=2000")
+        ph = ",".join("?" * len(chat_ids))
+        newest = 0
+        for table in ("records", "records_archive"):
+            row = conn.execute(
+                f"SELECT MAX(timestamp) FROM {table} "
+                f"WHERE topic = 'messages' AND type = 'message.received' "
+                f"AND timestamp >= ? AND json_extract(payload, '$.chat_id') IN ({ph})",
+                (since_ms, *chat_ids),
+            ).fetchone()
+            if row and row[0]:
+                newest = max(newest, int(row[0]))
+        return newest
+    finally:
+        conn.close()
+
+
+def count_burst_sends(stamps: list, now: float, inbound_ms: int) -> int:
+    """Sends inside the window AND after the newest inbound message."""
+    floor = max(now - BURST_WINDOW_SEC, inbound_ms / 1000.0)
+    return sum(1 for t in stamps if isinstance(t, (int, float)) and t > floor)
+
+
+def _log_burst_override(safe: str, why: str, message: str) -> None:
+    try:
+        with open(BURST_STATE_DIR / f"{safe}.burst-why.jsonl", "a") as fh:
+            fh.write(json.dumps({"ts": time.time(), "why": why,
+                                 "message": message}) + "\n")
+    except Exception:
+        pass
+
+
+def check_burst(session_key: str, allow: bool, chat_id: str = "",
+                why: str = "", message: str = "") -> None:
+    """Block a rapid run of separate texts since the user's last message.
+
+    Fails OPEN on any error — a broken state dir or unreadable bus.db must
+    never stop a send. Image/file sends are exempt: a visual card is the
+    behaviour we WANT, so it should never be the thing that trips the limit.
+    """
+    try:
+        BURST_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", session_key)
+        path = BURST_STATE_DIR / f"{safe}.json"
+        now = time.time()
+
+        try:
+            stamps = json.loads(path.read_text())
+            if not isinstance(stamps, list):
+                stamps = []
+        except Exception:
+            stamps = []
+
+        stamps = [t for t in stamps if isinstance(t, (int, float)) and now - t < BURST_WINDOW_SEC]
+
+        if allow:
+            # --burst: not counted, but the reason is logged. Record the
+            # override so the habit stays visible instead of silent.
+            _log_burst_override(safe, why, message)
+            ov_path = BURST_STATE_DIR / f"{safe}.override.json"
+            try:
+                ov = json.loads(ov_path.read_text())
+                if not isinstance(ov, list):
+                    ov = []
+            except Exception:
+                ov = []
+            ov = [t_ for t_ in ov if isinstance(t_, (int, float)) and now - t_ < 86400]
+            ov.append(now)
+            try:
+                ov_path.write_text(json.dumps(ov))
+            except Exception:
+                pass
+            if len(ov) >= 5:
+                print(
+                    f"NOTE: {len(ov)} --burst overrides in the last 24h. "
+                    "Consolidate into ONE message or send an image.",
+                    file=sys.stderr,
+                )
+            return
+
+        if len(stamps) >= MAX_BURST_SENDS:
+            try:
+                since_ms = int((now - BURST_WINDOW_SEC) * 1000)
+                inbound = last_inbound_ms(burst_chat_ids(chat_id), since_ms)
+            except Exception:
+                inbound = None  # bus unreadable -> fail open, don't block
+            if inbound is not None:
+                n = count_burst_sends(stamps, now, inbound)
+                if n >= MAX_BURST_SENDS:
+                    mins = BURST_WINDOW_SEC // 60
+                    print(
+                        f"BLOCKED: {n} separate texts already sent since the user's last "
+                        f"message (window {mins} min, limit {MAX_BURST_SENDS}).\n"
+                        "Several short texts in a row are still a wall of text "
+                        "('Holy wall of text. Research more yap less. Use visuals, "
+                        "links, images').\n"
+                        "Consolidate into ONE message, or render a visual card and attach "
+                        "it with --image (image sends are exempt). The counter resets "
+                        "when the user sends a new message.\n"
+                        "If this genuinely must go as another text: "
+                        "--burst --burst-why \"<reason>\".",
+                        file=sys.stderr,
+                    )
+                    sys.exit(3)
+
+        stamps.append(now)
+        path.write_text(json.dumps(stamps))
+    except SystemExit:
+        raise
+    except Exception:
+        # Never block a send because the guard itself failed.
+        return
+
+
+def _long_bucket(path: Path) -> dict:
+    now = time.time()
+    try:
+        b = json.loads(path.read_text())
+        tokens = float(b.get("tokens", LONG_MAX_TOKENS))
+        last = float(b.get("last_refill", now))
+    except Exception:
+        tokens, last = float(LONG_MAX_TOKENS), now
+    earned = max(0.0, (now - last)) / LONG_REFILL_SEC
+    tokens = min(float(LONG_MAX_TOKENS), tokens + earned)
+    return {"tokens": tokens, "last_refill": now}
+
+
+def _grade_justification(justification: str, message: str) -> tuple[bool, str]:
+    """Independent PASS/FAIL on whether this message earns --long.
+
+    Fails CLOSED: if the grader cannot be reached, the answer is no. Short is
+    the desired default, so an unavailable judge must not become a free pass.
+    """
+    rubric = (
+        "You are a strict editor deciding whether an assistant may send a LONG "
+        "SMS instead of a short one. The recipient has complained about long "
+        "messages repeatedly and finds them a real problem.\n\n"
+        "FAIL unless EVERY line is load-bearing for something the reader must DO. "
+        "FAIL if the content would work better as a visual card or a link. "
+        "FAIL if it answers more than was asked. FAIL if it is research detail, "
+        "reasoning, or self-narration the reader did not request. "
+        "FAIL if it could be 2-3 short texts with no loss. "
+        "PASS only for things like a verified shopping list with links, or "
+        "step-by-step instructions that are useless when split.\n\n"
+        "Be harsh. Most requests should FAIL.\n\n"
+        f"--- JUSTIFICATION ---\n{justification}\n\n"
+        f"--- THE MESSAGE ---\n{message}\n\n"
+        "Answer with PASS or FAIL on the first line, then one short sentence of "
+        "reason."
+    )
+    try:
+        p_ = subprocess.run(
+            ["claude", "-p", "--model", LONG_GRADER_MODEL],
+            input=rubric.encode(), capture_output=True, timeout=120,
+        )
+        out = (p_.stdout or b"").decode(errors="replace").strip()
+    except Exception as e:
+        return False, f"grader unavailable ({e}); failing closed — send it short"
+    if not out:
+        return False, "grader returned nothing; failing closed — send it short"
+    verdict = out.splitlines()[0].strip().upper()
+    reason = " ".join(out.splitlines()[1:]).strip() or out
+    return verdict.startswith("PASS"), reason
+
+
+def check_long(session_key: str, allow_long: bool, justification: str,
+               message: str) -> None:
+    """Gate --long behind a token bucket AND a graded written justification."""
+    if not allow_long:
+        return
+    try:
+        BURST_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", session_key)
+        path = BURST_STATE_DIR / f"{safe}.longbucket.json"
+        b = _long_bucket(path)
+
+        if b["tokens"] < 1.0:
+            need = (1.0 - b["tokens"]) * LONG_REFILL_SEC
+            print(
+                f"BLOCKED: no --long tokens (have {b['tokens']:.2f}). "
+                f"Next one in ~{int(need // 60)} min.\n"
+                "Cut it down, or render a card and use --image "
+                "(images are exempt from every guard here).",
+                file=sys.stderr,
+            )
+            sys.exit(4)
+
+        words = len(justification.split())
+        if words < LONG_MIN_JUSTIFY_WORDS:
+            print(
+                f"BLOCKED: --long needs --why with >={LONG_MIN_JUSTIFY_WORDS} words "
+                f"justifying THIS message (got {words}).\n"
+                "If it is not worth 200 words of defence, it is not worth the "
+                "reader's time either.",
+                file=sys.stderr,
+            )
+            sys.exit(4)
+
+        ok, reason = _grade_justification(justification, message)
+        if not ok:
+            print(
+                f"BLOCKED by grader: {reason}\n"
+                "No token spent. Cut it down, or render a visual card and "
+                "attach with --image.",
+                file=sys.stderr,
+            )
+            sys.exit(4)
+
+        b["tokens"] -= 1.0
+        try:
+            path.write_text(json.dumps(b))
+        except Exception:
+            pass
+        print(f"--long approved by grader ({reason[:80]}). "
+              f"{b['tokens']:.2f} tokens left.", file=sys.stderr)
+    except SystemExit:
+        raise
+    except Exception:
+        pass
+
+
+def clear_burst(session_key: str) -> None:
+    """Reset the burst counter — called when the user sends us something."""
+    try:
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", session_key)
+        (BURST_STATE_DIR / f"{safe}.json").unlink(missing_ok=True)
+    except Exception:
+        return
+
+
 def main():
     parser = argparse.ArgumentParser(description="Universal reply CLI")
     parser.add_argument("message", nargs="?", default="", help="Message text")
@@ -139,7 +432,19 @@ def main():
                         help="Allow sending filepath as text (normally rejected)")
     parser.add_argument("--long", action="store_true",
                         help="Acknowledge this message exceeds the length guard and send anyway")
+    parser.add_argument("--why", default="",
+                        help="Justification for --long (>=200 words, or @/path/to/file)")
+    parser.add_argument("--burst", action="store_true",
+                        help="Send past the burst guard (requires --burst-why; not counted)")
+    parser.add_argument("--burst-why", default="",
+                        help="Reason for --burst (required with --burst; logged)")
+    parser.add_argument("--clear-burst", action="store_true",
+                        help="Manually reset the burst counter (normally unneeded: "
+                             "it resets automatically on each inbound message)")
     args = parser.parse_args()
+
+    if args.burst and not args.burst_why.strip():
+        parser.error('--burst requires --burst-why "<reason>"')
 
     # --- Length guard -------------------------------------------------------
     # Eric has asked for short texts at least three times (2026-06-04,
@@ -153,9 +458,8 @@ def main():
             print(
                 f"BLOCKED: message is {n_lines} lines / {n_chars} chars "
                 f"(limit {MAX_LINES} lines / {MAX_CHARS} chars).\n"
-                "Lead with the answer. Split it into several short texts, or "
-                "render a visual card (see the visual-cards skill) for "
-                "comparisons and shortlists.\n"
+                "Lead with the answer. Cut it down or send an image (visual "
+                "card / md2img); don't split into several texts.\n"
                 "If it genuinely must go as one long message, re-run with --long.",
                 file=sys.stderr,
             )
@@ -168,7 +472,7 @@ def main():
     if args.react and not args.guid:
         parser.error("--react requires --guid <message-guid>")
 
-    if not args.message and not args.image and not args.file and not args.react:
+    if not args.message and not args.image and not args.file and not args.react and not args.clear_burst:
         parser.error("Must provide message, --image, --file, or --react")
 
     cwd = Path.cwd()
@@ -212,6 +516,27 @@ def main():
         effective_backend = backend if backend in ("signal", "discord", "dispatch-app", "sven-app", "dispatch-api", "pocket-sven") else "imessage"
         produce_tapback(bare_chat_id, args.guid, args.react, effective_backend)
         sys.exit(0)
+
+    session_key = f"{backend}__{folder}"
+
+    if args.clear_burst:
+        clear_burst(session_key)
+        print(f"Burst counter reset for {session_key}")
+        sys.exit(0)
+
+    # Burst guard — only for plain texts. Attaching a card/image is the
+    # behaviour we're steering toward, so it is deliberately exempt.
+    if not args.image and not args.file:
+        _why = args.why
+        if _why.startswith("@"):
+            try:
+                _why = Path(_why[1:]).expanduser().read_text()
+            except Exception as e:
+                print(f"could not read --why file: {e}", file=sys.stderr)
+                sys.exit(4)
+        check_long(session_key, args.long, _why, args.message or "")
+        check_burst(session_key, args.burst, chat_id=chat_id,
+                    why=args.burst_why, message=args.message or "")
 
     # Determine if group: prefer registry type field, fall back to heuristic
     # (heuristic can fail — some Signal group base64 IDs start with '+')

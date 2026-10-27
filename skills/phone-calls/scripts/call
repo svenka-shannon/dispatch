@@ -23,7 +23,7 @@ Subcommands:
 Typical conversation loop (driven by the agent):
   call start "+15551234567"
   call listen --wait-for-speech --max 45     # wait for "Hello?"
-  call say "Hi! This is Svenka, Eric's AI assistant..."
+  call say "Hi! This is <assistant>, <owner>'s assistant..."
   call listen --wait-for-speech
   ... repeat say/listen ...
   call end
@@ -641,21 +641,114 @@ Sound like a person, not a bot:
 - **BE BRIEF. Usually ONE short sentence; never more than two.** This is a real phone call — long turns get talked over. Ask ONE question at a time; don't recap everything.
 - Reply with ONLY the words to speak aloud — plain text. NEVER use asterisks, bullet points, markdown, emoji, or stage directions. It is read aloud verbatim.
 - Numbers/times: speak them naturally ("seven thirty" not "7:30", "two people" not "2 people").
+- Emails: say them the way a person reads one out: "jane dot doe at example dot com". Phone numbers: in groups ("five five five, one two three, four five six seven"). Offer to spell anything they didn't catch.
+- YOU ARE THE CALLER, never the business. Never say what "we" (the business) will do ("we'll reach out", "we'll hold your spot"). When wrapping up, confirm what THEY will do, in second person: "Great, so you'll call {owner_name} at that number if a spot opens up?"
+- Only share personal details that appear in the GOAL above. If they ask for something that isn't there (email, address, card), say you'll have {owner_name} follow up with it. Never guess or invent details.
 
 Mechanics:
 - You receive the other person's words via speech-to-text — it may contain errors; infer intent.
-- If the goal is achieved or the conversation is clearly over, end your reply with the exact token [HANGUP].
-- If you hear hold music, an automated menu, or ringing sounds (e.g. "(phone rings)"), output [WAIT] alone to keep listening.
+- If the goal is achieved or the conversation with a real person is clearly over, end your reply with the exact token [HANGUP].
+- If you reach voicemail, an automated menu/IVR you can't get through (you cannot press keys), a "not available"/"mailbox full" message, or a wrong number, output [UNREACHED] alone. (For a wrong number you may first say one short apology, then [UNREACHED].) Never leave a message and never say goodbye to a recording.
+- If you hear hold music, a "please hold" message, or ringing sounds (e.g. "(phone rings)"), output [WAIT] alone to keep listening.
 - Stay on-goal and brief. Phone people hate monologues."""
+
+
+# First-utterance voicemail / IVR detector. Whisper renders tones as "(beep)",
+# "[BEEP]", "*beep*" etc., and digits either as "2" or "two".
+_VOICEMAIL_CUES = [
+    r"\bbeep\b",
+    r"\b(?:leave|record)\s+(?:a|your|me\s+a|us\s+a)?\s*(?:brief\s+|short\s+)?(?:message|name)\b",
+    r"\bafter\s+the\s+(?:tone|beep)\b",
+    r"\b(?:not|un)\s*available\b",   # first utterance only (a clerk may say it mid-call)
+    r"\bpress\s+(?:\d|zero|one|two|three|four|five|six|seven|eight|nine|pound|star)\b",
+    r"\bmail\s*box\b",
+    r"\bvoice\s*-?\s*mail\b",
+    r"\bvoice\s+messaging\s+system\b",
+]
+
+
+_FIRST_ONLY_CUES = {r"\b(?:not|un)\s*available\b"}
+
+
+def _voicemail_cue(text: str, first: bool = True) -> str | None:
+    """Return the first voicemail/IVR cue found in `text` (a transcript), or None.
+    first=False (mid-call) skips cues a real person might say ("not available")."""
+    import re
+    if not text:
+        return None
+    low = text.lower()
+    for pat in _VOICEMAIL_CUES:
+        if not first and pat in _FIRST_ONLY_CUES:
+            continue
+        m = re.search(pat, low)
+        if m:
+            return m.group(0).strip()
+    return None
+
+
+_CONTROL_TOKENS = ("UNREACHED", "HANGUP", "WAIT")
+
+
+def _parse_control(sent: str) -> tuple[str, str | None]:
+    """Split a model sentence into (speakable_text, control_token).
+    control_token is "UNREACHED" > "HANGUP" > "WAIT" (highest priority wins) or None.
+    All [TOKEN] markers are stripped from the text, wherever they appear."""
+    import re
+    found = {t for t in _CONTROL_TOKENS if f"[{t}]" in sent.upper()}
+    text = re.sub(r"\[(?:%s)\]" % "|".join(_CONTROL_TOKENS), "", sent, flags=re.I)
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    token = next((t for t in _CONTROL_TOKENS if t in found), None)
+    return text, token
+
+
+def _end_label(token: str | None, two_way: bool) -> str:
+    """Transcript wording for how the call ended. 'goal met' only after a real
+    two-way exchange — a [HANGUP] after a menu/recording is just 'ended'."""
+    if token == "UNREACHED":
+        return "not reached — hanging up"
+    if token == "HANGUP" and two_way:
+        return "goal met — hanging up"
+    return "ended — hanging up"
+
+
+def _call_result(two_way: bool, unreached: bool) -> str:
+    """Value for the final `RESULT:` line."""
+    return "reached" if two_way and not unreached else "not-reached"
 
 
 _SENT_BOUNDARY = None  # compiled lazily in cmd_converse
 
 
+def _speak_email(m) -> str:
+    local, domain = m.group(1), m.group(2)
+    def part(x: str) -> str:
+        x = x.replace(".", " dot ").replace("-", " dash ").replace("_", " underscore ")
+        return " ".join(x.split())
+    return f"{part(local)} at {part(domain)}"
+
+
+def _speak_phone(m) -> str:
+    digits = __import__("re").sub(r"\D", "", m.group(0))
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    if len(digits) != 10:
+        return m.group(0)
+    words = "zero one two three four five six seven eight nine".split()
+    say = lambda ds: " ".join(words[int(d)] for d in ds)
+    return f"{say(digits[:3])}, {say(digits[3:6])}, {say(digits[6:])}"
+
+
 def _clean_for_speech(text: str) -> str:
     """Strip markdown/formatting the model may slip in — it would be spoken
-    literally ('asterisk asterisk two people'). Keep only speakable text."""
+    literally ('asterisk asterisk two people'). Keep only speakable text.
+    Emails and phone numbers are rewritten into spoken form, because TTS mangles
+    raw ones (a dotted gmail address came out with the dots and "g" dropped)."""
     import re
+    text = re.sub(r"([A-Za-z0-9._%+-]+)\s*@\s*([A-Za-z0-9-]+(?:\s*\.\s*[A-Za-z0-9-]+)+)",
+                  lambda m: _speak_email(type("M", (), {"group": lambda self, i: re.sub(r"\s+", "", m.group(i))})()),
+                  text)
+    text = re.sub(r"(?<!\d)(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}(?!\d)", _speak_phone, text)
+    text = text.replace("&", " and ")
     text = re.sub(r"[*_`#>]+", "", text)          # md emphasis / headers / code
     text = re.sub(r"^\s*[-•]\s+", "", text, flags=re.M)  # bullet markers
     text = re.sub(r"\s{2,}", " ", text)
@@ -671,6 +764,8 @@ def _find_sentence_cut(buf: str, min_len: int = 20) -> int | None:
         if len(cand.strip()) < min_len:
             continue
         if re.search(r"\b(?:Mr|Mrs|Ms|Dr|St|vs|etc)\.$", cand):
+            continue
+        if re.search(r"@[\w.-]*\.$", cand):   # mid-email ("gmail. com") — not a sentence end
             continue
         return m.end()
     return None
@@ -814,6 +909,22 @@ def cmd_converse(args) -> None:
         playq.join()
         tlog("ME", text)
 
+    # two_way: at least one live (non-recording) utterance got a spoken reply.
+    # unreached: no answer / voicemail / IVR / wrong number.
+    outcome = {"two_way": False, "unreached": False}
+
+    def leave_message() -> None:
+        """--voicemail leave: wait out the outgoing greeting and beep (~3s of
+        quiet, max 40s), then speak the greeting as the message."""
+        stop = time.time() + 40
+        while time.time() < stop:
+            audio, _ = record_vad(device=SPK_DEVICE, max_seconds=3,
+                                  wait_for_speech=True, silence_s=0.8,
+                                  min_speech_s=0.15, thresh_db=args.threshold_db)
+            if audio is None:
+                break
+        say_now(args.greeting)
+
     def hear(max_s: float, silence_s: float = 0.6) -> str:
         # 0.6s trailing-silence endpoint (was 1.0) — P4; LiveKit ships 0.5.
         audio, _ = record_vad(device=SPK_DEVICE, max_seconds=max_s,
@@ -830,10 +941,13 @@ def cmd_converse(args) -> None:
     system = CONVERSE_SYSTEM.format(goal=args.goal, owner_name=owner,
                                     assistant_name=assistant)
 
+    greeting_audio: dict = {}
+
     async def _loop():
         options = ClaudeAgentOptions(
             cli_path=HOME / ".local" / "bin" / "claude",  # system CLI for OAuth
-            model="claude-haiku-4-5-20251001",
+            model=args.model,
+            effort=args.effort,
             system_prompt=system,
             allowed_tools=[],
             max_turns=1,
@@ -863,25 +977,30 @@ def cmd_converse(args) -> None:
                 if buf.strip():
                     yield buf.strip()
 
-            async def respond(user_text: str, t0: float) -> tuple[str, bool, bool, float, float]:
+            async def respond(user_text: str, t0: float) -> tuple[str, str | None, bool, float, float]:
                 """Stream a reply: synth+enqueue sentence 1 while the rest
                 streams. Returns as soon as everything is ENQUEUED (NOT after
                 playback) so the brain-timeout never waits on the audio device.
-                Returns (text, hangup, wait, first_audio_s, audio_dur_s)."""
+                Returns (text, control, wait, first_audio_s, audio_dur_s);
+                control is "HANGUP", "UNREACHED" or None."""
                 spoken: list[str] = []
-                hangup = False
+                control = None
                 first_audio = None
                 audio_dur = 0.0
                 async for sent in brain_sentences(user_text):
-                    if sent.startswith("[WAIT]"):
-                        return "", False, True, 0.0, 0.0
-                    if "[HANGUP]" in sent:
-                        hangup = True
-                        sent = sent.replace("[HANGUP]", "").strip()
+                    if control:      # already ending — drain, speak nothing more
+                        continue
+                    sent, tok = _parse_control(sent)
+                    if tok == "WAIT":
+                        if not spoken:
+                            return "", None, True, 0.0, 0.0
+                        tok = None
+                    if tok:
+                        control = tok
                     # Hard guard: never read a document down the phone.
                     if len(sent) > 300:
                         sent = sent[:300]
-                        hangup = True
+                        control = control or "HANGUP"
                     sent = _clean_for_speech(sent)
                     if sent:
                         samples = await asyncio.to_thread(synth, sent)
@@ -893,7 +1012,7 @@ def cmd_converse(args) -> None:
                     if sum(len(s) for s in spoken) > 600:
                         log("reply length cap hit — truncating turn")
                         break
-                return (" ".join(spoken), hangup, False,
+                return (" ".join(spoken), control, False,
                         first_audio or 0.0, audio_dur)
 
             # Warm the pipelines while the phone is still ringing so turn 1
@@ -902,6 +1021,11 @@ def cmd_converse(args) -> None:
             # first token all have startup cost.
             try:
                 await asyncio.to_thread(synth, "Hello.")
+                if args.greeting:
+                    # Pre-render so it plays the instant they finish "Hello?"
+                    # (was synthesized after transcription: ~7s of dead air).
+                    greeting_audio["pcm"] = await asyncio.to_thread(
+                        synth, _clean_for_speech(args.greeting))
                 await asyncio.to_thread(
                     transcribe, np.zeros(RECORD_RATE // 2, dtype="float32"),
                     RECORD_RATE)
@@ -913,17 +1037,55 @@ def cmd_converse(args) -> None:
                 log(f"warmup skipped: {e}")
 
             deadline = time.time() + args.answer_timeout
-            heard = ""
-            while time.time() < deadline and not heard:
-                heard = hear(max_s=min(15, deadline - time.time()))
-            if not heard:
-                tlog("SYS", "no answer detected; leaving message then hanging up")
-                if args.greeting:
+            first_audio_in = None
+            while time.time() < deadline and first_audio_in is None:
+                first_audio_in, _ = record_vad(
+                    device=SPK_DEVICE, max_seconds=min(15, deadline - time.time()),
+                    wait_for_speech=True, silence_s=0.5, min_speech_s=0.25,
+                    thresh_db=args.threshold_db)
+            leave = args.voicemail == "leave" and bool(args.greeting)
+            if first_audio_in is None:
+                outcome["unreached"] = True
+                if leave:
+                    tlog("SYS", "no answer — not reached; leaving message (--voicemail leave)")
                     say_now(args.greeting)
+                else:
+                    tlog("SYS", "no answer — not reached; hanging up without a message")
                 return
-            tlog("THEM", heard)
+            # Fast path: a short first utterance (< 2s, e.g. "Hello?" / "Game
+            # Kastle, how can I help?") is a live person. Greet INSTANTLY and
+            # transcribe in parallel. Longer openings get transcribed first so a
+            # voicemail/IVR greeting never gets our opener.
+            first_s = len(first_audio_in) / RECORD_RATE
+            greeted_early = False
+            if args.greeting and first_s < 2.0:
+                pcm = greeting_audio.get("pcm")
+                playq.put(pcm if pcm is not None else synth(_clean_for_speech(args.greeting)))
+                greeted_early = True
+            heard = await asyncio.to_thread(transcribe, first_audio_in, RECORD_RATE)
+            tlog("THEM", heard or "(answered)")
+            cue = None if greeted_early else _voicemail_cue(heard, first=True)
+            if cue:
+                outcome["unreached"] = True
+                if leave:
+                    tlog("SYS", f"voicemail/menu cue {cue!r} — not reached; leaving message (--voicemail leave)")
+                    leave_message()
+                else:
+                    tlog("SYS", f"voicemail/menu cue {cue!r} — not reached; hanging up without a message")
+                return
             if args.greeting:
-                say_now(args.greeting)
+                if not greeted_early:
+                    pcm = greeting_audio.get("pcm")
+                    playq.put(pcm if pcm is not None else synth(_clean_for_speech(args.greeting)))
+                await asyncio.to_thread(playq.join)
+                tlog("ME", args.greeting)
+                # give the brain the opening exchange so it doesn't re-greet
+                try:
+                    await client.query(f"[Call answered. They said: \"{heard}\". You already said: \"{args.greeting}\". Do not reply to this message; reply only to their next turn.] Reply with exactly: [WAIT]")
+                    async for _m in client.receive_response():
+                        pass
+                except Exception as e:
+                    log(f"context prime skipped: {e}")
 
             silent_rounds = 0
             end_at = time.time() + args.max_minutes * 60
@@ -937,6 +1099,9 @@ def cmd_converse(args) -> None:
                     continue
                 silent_rounds = 0
                 tlog("THEM", heard)
+                # a turn only counts toward a real two-way exchange if it
+                # doesn't sound like a recording/menu
+                them_live = _voicemail_cue(heard, first=False) is None
                 t0 = time.time()
                 interrupt.clear()
                 speaking.set()  # arm barge-in for this reply's playback
@@ -944,7 +1109,7 @@ def cmd_converse(args) -> None:
                 # 30s) — never the audio device, so a stalled speaker can't
                 # hang the turn.
                 try:
-                    text, hangup, wait, first_audio, audio_dur = \
+                    text, control, wait, first_audio, audio_dur = \
                         await asyncio.wait_for(respond(heard, t0), timeout=30)
                 except asyncio.TimeoutError:
                     speaking.clear()
@@ -957,6 +1122,8 @@ def cmd_converse(args) -> None:
                     continue
                 if text:
                     tlog("ME", f"{text}  (reply started {first_audio:.1f}s after they finished)")
+                    if them_live and control != "UNREACHED":
+                        outcome["two_way"] = True
                 # Wait for playback to drain before listening again (avoid
                 # talking over ourselves), but BOUND it — a wedged device
                 # can't freeze the call. Slack = audio duration + 4s.
@@ -968,8 +1135,10 @@ def cmd_converse(args) -> None:
                 speaking.clear()
                 if interrupt.is_set():
                     tlog("SYS", "was interrupted — listening to the caller now")
-                if hangup:
-                    tlog("SYS", "goal met — hanging up")
+                if control:
+                    if control == "UNREACHED":
+                        outcome["unreached"] = True
+                    tlog("SYS", _end_label(control, outcome["two_way"]))
                     break
 
     try:
@@ -982,7 +1151,11 @@ def cmd_converse(args) -> None:
         player_thread.join(timeout=5)
         out_stream.stop()
         out_stream.close()
-    print(f"conversation finished. Transcript: {transcript_path}")
+        result = _call_result(outcome["two_way"], outcome["unreached"])
+        with transcript_path.open("a") as f:
+            f.write(f"RESULT: {result}\n")
+        print(f"conversation finished. Transcript: {transcript_path}")
+        print(f"RESULT: {result}", flush=True)  # final machine-readable line
 
 
 # ---------------------------------------------------------------- self test
@@ -1125,7 +1298,11 @@ def main() -> None:
 
     sp = sub.add_parser("converse", help="real-time conversation loop (run right after start)")
     sp.add_argument("--goal", required=True, help="what this call is trying to accomplish")
-    sp.add_argument("--greeting", help="opening line, spoken when they answer")
+    sp.add_argument("--greeting", help="opening line, spoken when a person answers")
+    sp.add_argument("--voicemail", choices=["hangup", "leave"], default="hangup",
+                    help="on no answer / voicemail / IVR: hangup = hang up silently "
+                         "(default, use for errands); leave = speak --greeting as a "
+                         "message after the beep (personal calls)")
     sp.add_argument("--tts-engine", choices=["pocket", "kokoro"], default="pocket",
                     help="pocket=Kyutai Pocket TTS (natural, default); kokoro=fallback")
     sp.add_argument("--voice", default="alba",
@@ -1135,6 +1312,11 @@ def main() -> None:
     sp.add_argument("--turn-timeout", type=float, default=20,
                     help="max seconds to wait for them to speak each turn")
     sp.add_argument("--max-minutes", type=float, default=8)
+    sp.add_argument("--effort", default="low", choices=["low", "medium", "high"],
+                    help="model effort (Haiku 5.5+ / Sonnet / Opus); low = fastest replies")
+    sp.add_argument("--model", default="claude-haiku-5-5",
+                    help="conversation brain (thinking off). Haiku = fastest first token; "
+                         "try claude-sonnet-4-5 / opus for better conversation at extra latency")
     sp.add_argument("--threshold-db", type=float, default=-55)
     sp.add_argument("--barge-in", action="store_true", default=True,
                     help="stop talking when the caller interrupts (default on)")

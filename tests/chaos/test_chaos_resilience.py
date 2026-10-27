@@ -637,6 +637,7 @@ async def test_stuck_session_with_commitment_gets_nudged_mocked(tmp_path, monkey
     m._shutdown_flag = False
     m._stuck_check_running = False
     m._last_stuck_nudge_at = {}
+    m._stuck_nudge_count = {}
     m.sessions = MagicMock()
     m.sessions.sessions = {"+15555550100": sess}
     m._stuck_session_idle_minutes = MagicMock(return_value=5.0)

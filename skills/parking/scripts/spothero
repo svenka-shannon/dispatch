@@ -1,0 +1,116 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["httpx"]
+# ///
+"""spothero: search SpotHero parking near a place, via Chrome (no login needed to search).
+
+  spothero "Sacramento Convention Center" --date 2026-10-24 --from 09:00 --to 18:00
+  spothero "38.5719,-121.4950" --date today --from 18:30 --to 22:00 --sort price --limit 5
+  spothero "Chase Center SF" --date 2026-11-02 --from 17:00 --to 23:30 --json
+
+Prints the cheapest/closest options with total price (fees included), walk time, rating and the
+SpotHero search URL so the user can book. NEVER books: booking needs the user's SpotHero account.
+"""
+from __future__ import annotations
+import argparse, json, re, subprocess, sys, time
+from datetime import date, datetime, timedelta
+from pathlib import Path
+import httpx
+
+CHROME = Path.home() / ".claude/skills/chrome-control/scripts/chrome"
+
+
+def geocode(q: str) -> tuple[float, float, str]:
+    m = re.fullmatch(r"\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*", q)
+    if m:
+        return float(m.group(1)), float(m.group(2)), q
+    r = httpx.get("https://nominatim.openstreetmap.org/search",
+                  params={"q": q, "format": "json", "limit": 1, "countrycodes": "us"},
+                  headers={"User-Agent": "dispatch-spothero/1.0"}, timeout=20)
+    r.raise_for_status()
+    hits = r.json()
+    if not hits:
+        sys.exit(f"could not geocode {q!r}; pass 'lat,lng' instead")
+    return float(hits[0]["lat"]), float(hits[0]["lon"]), hits[0]["display_name"]
+
+
+def parse(text: str) -> list[dict]:
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    out = []
+    for i, l in enumerate(lines):
+        if not re.fullmatch(r"\d+ min", l) or i == 0:
+            continue
+        name = lines[i - 1]
+        if name in ("Best Value", "Shortest Walk") and i >= 2:
+            name = lines[i - 2]
+        rec = {"name": name, "walk": l, "distance": None, "rating": None, "reviews": None, "total": None}
+        for w in lines[i + 1:i + 9]:
+            if re.fullmatch(r"\(([\d.]+ (?:ft|mi))\)", w) and not rec["distance"]:
+                rec["distance"] = w.strip("()")
+            elif re.fullmatch(r"\d\.\d", w) and not rec["rating"]:
+                rec["rating"] = float(w)
+            elif re.fullmatch(r"\(\d+\)", w) and not rec["reviews"]:
+                rec["reviews"] = int(w.strip("()"))
+            elif re.fullmatch(r"\d+(?:\.\d\d)?", w) and rec["total"] is None:
+                rec["total"] = float(w)
+            if w == "Book Now":
+                break
+        if rec["total"] is not None:
+            out.append(rec)
+    seen, uniq = set(), []
+    for r in out:
+        if r["name"] not in seen:
+            seen.add(r["name"]); uniq.append(r)
+    return uniq
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("place")
+    ap.add_argument("--date", default="today", help="YYYY-MM-DD, today or tomorrow")
+    ap.add_argument("--from", dest="start", required=True, help="HH:MM 24h")
+    ap.add_argument("--to", dest="end", required=True, help="HH:MM 24h (next day if earlier than --from)")
+    ap.add_argument("--sort", choices=["price", "walk", "rating"], default="price")
+    ap.add_argument("--limit", type=int, default=6)
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+
+    d = {"today": date.today(), "tomorrow": date.today() + timedelta(days=1)}.get(a.date) or date.fromisoformat(a.date)
+    s = datetime.combine(d, datetime.strptime(a.start, "%H:%M").time())
+    e = datetime.combine(d, datetime.strptime(a.end, "%H:%M").time())
+    if e <= s:
+        e += timedelta(days=1)
+    lat, lng, label = geocode(a.place)
+    url = (f"https://spothero.com/search?kind=address&latitude={lat:.5f}&longitude={lng:.5f}"
+           f"&starts={s:%Y-%m-%dT%H:%M}&ends={e:%Y-%m-%dT%H:%M}")
+    text = ""
+    for attempt in range(3):
+        r = subprocess.run([str(CHROME), "fetch", url, "--timeout", "25", "--min-chars", "800"],
+                           capture_output=True, text=True, timeout=120)
+        text = r.stdout
+        if "Book Now" in text:
+            break
+        time.sleep(3)
+    res = parse(text)
+    key = {"price": lambda r: r["total"],
+           "walk": lambda r: int(r["walk"].split()[0]),
+           "rating": lambda r: -(r["rating"] or 0)}[a.sort]
+    res.sort(key=key)
+    res = res[:a.limit]
+    if a.json:
+        print(json.dumps({"place": label, "start": s.isoformat(), "end": e.isoformat(), "url": url, "results": res}, indent=2))
+        return 0 if res else 1
+    print(f"{label}\n{s:%a %b %-d %-I:%M%p} → {e:%a %-I:%M%p}")
+    if not res:
+        print("no results parsed — open the URL:\n" + url)
+        return 1
+    for r in res:
+        stars = f" ★{r['rating']} ({r['reviews']})" if r["rating"] else ""
+        print(f"${r['total']:.2f}  {r['walk']} walk  {r['name']}{stars}")
+    print(url)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

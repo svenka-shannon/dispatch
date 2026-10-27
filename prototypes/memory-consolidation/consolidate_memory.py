@@ -216,6 +216,21 @@ def save_checkpoints(checkpoints: dict):
     CHECKPOINTS_FILE.write_text(json.dumps(checkpoints, indent=2) + "\n")
 
 
+def _phone_to_chat_id(phone: str) -> str:
+    """Contacts.app may store a number as '5555550100' or '(555) 555-0100', but
+    bus.db chat_ids are E.164 ('+15555550100'). Without this, those contacts
+    silently got '0 messages' every night (found 2026-10-15)."""
+    p = phone.strip()
+    digits = re.sub(r"\D", "", p)
+    if p.startswith("+"):
+        return "+" + digits
+    if len(digits) == 10:
+        return "+1" + digits
+    if len(digits) == 11 and digits.startswith("1"):
+        return "+" + digits
+    return p
+
+
 # ── Message fetching from bus.db ───────────────────────────────
 def fetch_messages_from_bus(
     chat_id: str,
@@ -1186,7 +1201,7 @@ def main():
         name = c["name"]
         tier = c.get("tier", "favorite")
         phone = c.get("phone", "")
-        chat_id = phone or name
+        chat_id = _phone_to_chat_id(phone) if phone else name
 
         # Skip partner contact for sensitive leak protection
         if is_partner_contact(name):

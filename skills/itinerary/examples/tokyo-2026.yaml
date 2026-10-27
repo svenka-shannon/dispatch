@@ -1,0 +1,148 @@
+# Tokyo, Aug–Sep 2026 — real trip plan.
+# Leg 1: Thu 2026-08-27 (lands HND 13:55) → Wed 2026-09-02 (departs NRT 18:05)
+# Leg 2: Mon 2026-09-07 → Wed 2026-09-09
+#
+# NOTE: always quote times ("16:00"). Unquoted 16:00 is a YAML 1.1 sexagesimal int.
+title: Tokyo 2026
+timezone: Asia/Tokyo
+
+days:
+  # ---------------------------------------------------------------- leg 1 ---
+  - date: 2026-08-27
+    label: Arrival
+    items:
+      - start: "13:55"
+        end: "15:00"
+        title: Land HND + immigration & baggage
+        location: "Haneda Airport (HND), Terminal 3, Ota-ku, Tokyo"
+        notes: "Scheduled touchdown 13:55. Buy a Suica/PASMO or top up before leaving the airport."
+      - start: "15:00"
+        end: "15:45"
+        title: HND → hotel
+        location: "Keikyu/Asakusa Line to Ginza Line, Suehirocho stn"
+        transit_min: 0
+        notes: "Roughly 45 min door to door with luggage."
+      - start: "15:45"
+        end: "16:15"
+        title: Hotel check-in — APA Hotel Akihabara Suehirocho Ekimae
+        location: "Sotokanda 3-15-7, Chiyoda-ku, Tokyo"
+        notes: "Suehirocho station, Ginza Line. Drop bags even if the room is not ready."
+      - start: "16:45"
+        end: "17:45"
+        title: Nissan Crossing
+        location: "Ginza Place, 5-8-1 Ginza, Chuo-ku, Tokyo"
+        url: "https://www.nissan.co.jp/crossing/"
+        notes: "Free, no reservation. Open 10:00-20:00."
+        cost: "free"
+        transit_min: 15
+      - start: "18:15"
+        end: "19:30"
+        title: Dinner in Ginza
+        location: "Ginza, Chuo-ku"
+        transit_min: 10
+
+  - date: 2026-08-28
+    label: Open day
+    items:
+      - start: "10:00"
+        end: "12:30"
+        title: Akihabara walk
+        location: "Akihabara, Chiyoda-ku"
+        notes: "Hotel is a 10 min walk away — no transit needed."
+        transit_min: 0
+
+  - date: 2026-08-29
+    label: Fuji Motorsports Museum (Saturday — shuttle runs)
+    items:
+      - start: "08:30"
+        end: "10:30"
+        title: Tokyo → Gotemba → Fuji Speedway shuttle
+        location: "Tokyo stn → Gotemba stn (JR/bus), then Fuji Speedway shuttle bus"
+        notes: >-
+          The Gotemba shuttle bus runs WEEKENDS ONLY, which is why this is on a
+          Saturday. On a weekday you need a taxi or rental car from Gotemba.
+        transit_min: 0
+      - start: "10:30"
+        end: "13:00"
+        title: Fuji Motorsports Museum
+        location: "Fuji Speedway, Nakahinata 694, Oyama-cho, Sunto-gun, Shizuoka"
+        url: "https://fuji-motorsports-museum.jp/"
+        notes: "Open daily 10:00-17:00 (last entry 16:30). Buy the ticket online in advance."
+        cost: "~¥1,600 online"
+        transit_min: 0
+        booking_deadline: 2026-08-28
+      - start: "13:30"
+        end: "15:30"
+        title: Fuji Speedway → Tokyo
+        location: "Shuttle to Gotemba, then bus/train back to Tokyo"
+        notes: "Round trip from central Tokyo is roughly 4 hours of travel."
+        transit_min: 30
+
+  - date: 2026-08-30
+    label: Free day (backup date for Fuji — shuttle also runs Sunday)
+    items: []
+
+  - date: 2026-08-31
+    label: Open day
+    items: []
+
+  - date: 2026-09-01
+    label: Open day
+    items: []
+
+  - date: 2026-09-02
+    label: Depart NRT 18:05
+    items:
+      - start: "10:00"
+        end: "11:00"
+        title: Hotel check-out
+        location: "APA Hotel Akihabara Suehirocho Ekimae, Sotokanda 3-15-7, Chiyoda-ku"
+      - start: "14:00"
+        end: "15:30"
+        title: Tokyo → Narita (NRT)
+        location: "Keisei Skyliner / N'EX to Narita Airport"
+        notes: "Allow 90 min of travel plus buffer; be at the gate well before 18:05."
+        transit_min: 0
+      - start: "15:30"
+        end: "18:05"
+        title: Check-in, security, depart NRT 18:05
+        location: "Narita International Airport (NRT)"
+        transit_min: 0
+
+  # ---------------------------------------------------------------- leg 2 ---
+  - date: 2026-09-07
+    label: Back in Tokyo (Monday)
+    items:
+      - title: Return to Tokyo — hotel re-check-in
+        all_day: true
+        location: "APA Hotel Akihabara Suehirocho Ekimae, Sotokanda 3-15-7, Chiyoda-ku"
+        notes: >-
+          Nissan Global HQ Gallery in Yokohama is CLOSED today (Mon 2026-09-07),
+          so it is scheduled for Tuesday instead.
+
+  - date: 2026-09-08
+    label: Yokohama
+    items:
+      - start: "10:30"
+        end: "12:00"
+        title: Nissan Global HQ Gallery (Yokohama)
+        location: "Nissan Global Headquarters, 1-1-1 Takashima, Nishi-ku, Yokohama"
+        url: "https://www.nissan-global.com/EN/GALLERY/"
+        notes: "Free admission. Open 10:00-18:00 on weekdays. Directly connected to Yokohama station."
+        cost: "free"
+        transit_min: 60
+        closed_days: [saturday, sunday]
+        closed_dates: [2026-09-07]
+      - start: "13:00"
+        end: "15:00"
+        title: Minato Mirai waterfront
+        location: "Minato Mirai 21, Nishi-ku, Yokohama"
+        transit_min: 15
+
+  - date: 2026-09-09
+    label: Departure day
+    items:
+      - start: "10:00"
+        end: "11:00"
+        title: Hotel check-out
+        location: "APA Hotel Akihabara Suehirocho Ekimae, Sotokanda 3-15-7, Chiyoda-ku"

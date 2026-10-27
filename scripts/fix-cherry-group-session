@@ -1,0 +1,96 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""
+fix-cherry-group-session — clear a stale session pointer that survives restarts.
+
+WHY THIS EXISTS
+---------------
+The Eric & Cherry group chat (8164e7f7...) has been silently dropping every
+inbound message since at least 2026-07-09. Its sessions.json entry points at
+session id aaf9b52d-2e26-4f74-ba87-2cb49bd8dac6, whose transcript no longer
+exists. Every inbound message therefore tries `claude --resume <dead-id>`,
+fails with exit 1, retries twice, and dead-letters. No agent ever sees it.
+
+Messages lost this way so far: 2026-07-09 (x2), 2026-08-01, 2026-08-12,
+2026-08-19 (the BART parking question), plus more — DLQ count is climbing.
+
+WHY IT NEEDS A SCRIPT
+---------------------
+The daemon writes the registry back out from memory on shutdown. So:
+  - clearing the file while the daemon runs  -> overwritten on next write
+  - restarting without clearing              -> stale value reloaded
+The only sequence that sticks is: STOP -> CLEAR -> START. That's all this does.
+
+Safe to re-run: if the pointer is already gone it exits without touching
+anything. Takes a timestamped backup of sessions.json either way.
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+REGISTRY = Path.home() / "dispatch/state/sessions.json"
+CHAT_ID = "8164e7f75e994c769800691497b8c39a"
+CLI = "claude-assistant"
+
+
+def run(*args: str) -> int:
+    print(f"  $ {' '.join(args)}")
+    return subprocess.run(args, capture_output=True, text=True).returncode
+
+
+def main() -> int:
+    if not REGISTRY.exists():
+        print(f"registry not found: {REGISTRY}", file=sys.stderr)
+        return 1
+
+    entry = json.loads(REGISTRY.read_text()).get(CHAT_ID)
+    if entry is None:
+        print(f"no registry entry for {CHAT_ID} — nothing to do")
+        return 0
+    if not entry.get("session_id"):
+        print("session_id already cleared — nothing to do")
+        return 0
+
+    print(f"stale session_id: {entry['session_id']}")
+
+    print("\n1/3 stopping daemon (registry is flushed from memory on shutdown)")
+    run(CLI, "stop")
+    time.sleep(5)
+
+    print("\n2/3 clearing the stale pointer")
+    backup = REGISTRY.with_suffix(f".json.bak-{int(time.time())}")
+    shutil.copy2(REGISTRY, backup)
+    print(f"  backup: {backup}")
+
+    data = json.loads(REGISTRY.read_text())
+    old = data[CHAT_ID].pop("session_id", None)
+    data[CHAT_ID].pop("last_message_time", None)
+    fd, tmp = tempfile.mkstemp(dir=REGISTRY.parent)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, REGISTRY)
+    print(f"  cleared: {old}")
+
+    print("\n3/3 starting daemon")
+    run(CLI, "start")
+    time.sleep(8)
+
+    still = json.loads(REGISTRY.read_text())[CHAT_ID].get("session_id")
+    if still:
+        print(f"\nFAILED — pointer came back as {still}", file=sys.stderr)
+        return 1
+    print("\nOK — pointer cleared and daemon restarted.")
+    print("The group will spawn a fresh session on its next inbound message.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

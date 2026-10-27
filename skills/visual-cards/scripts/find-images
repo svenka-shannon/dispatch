@@ -4,11 +4,20 @@
 # dependencies = []
 # ///
 """
-visual-cards/find-images — search Unsplash for free CC photo IDs matching a query,
-download the top N to a working dir.
+visual-cards/find-images — search Unsplash for free photos matching a query and
+download the top N, ready to use as card heroes/tiles.
 
 Usage:
-    find-images "lower broadway nashville" [--n 5] [--out /tmp/imgs]
+    find-images "lower broadway nashville" [--n 5] [--out /tmp/imgs] [--width 1400]
+
+Why it drives Chrome (do not "simplify" this back to webfetch):
+    Unsplash sits behind Anubis, a proof-of-work anti-scraper wall. Plain HTTP
+    (curl / scrapling / the webfetch CLI) gets a 401 "Making sure you're not a
+    bot!" challenge page and zero results. A real browser solves the challenge,
+    so the SEARCH step goes through chrome-control. The image CDN
+    (images.unsplash.com) is NOT behind Anubis, so the DOWNLOAD step is a plain
+    curl — and it takes ?w= / ?q= params, so the CDN resizes for us and we never
+    need sips.
 """
 import argparse
 import re
@@ -17,70 +26,70 @@ import sys
 import urllib.parse
 from pathlib import Path
 
+CHROME = Path.home() / ".claude/skills/chrome-control/scripts/chrome"
 
-def search_unsplash(query: str, n: int) -> list[str]:
-    """Return up to N Unsplash photo IDs matching the query."""
+
+def search_unsplash(query: str, n: int, timeout: int = 40) -> list[str]:
+    """Return up to N direct images.unsplash.com photo URLs matching the query."""
+    if not CHROME.exists():
+        sys.exit(f"Error: chrome-control CLI not found at {CHROME}")
     q = urllib.parse.quote(query.replace(" ", "-"))
     url = f"https://unsplash.com/s/photos/{q}"
-    webfetch = Path.home() / ".claude/skills/webfetch/scripts/webfetch"
-    if not webfetch.exists():
-        sys.exit("Error: webfetch CLI not found at " + str(webfetch))
-
     out = subprocess.run(
-        [str(webfetch), url], capture_output=True, text=True, timeout=30
+        [str(CHROME), "fetch", url, "--html", "--timeout", str(timeout)],
+        capture_output=True, text=True, timeout=timeout + 90,
     )
-    # IDs appear like /photos/<id>/download
-    ids = re.findall(r"/photos/([a-zA-Z0-9_-]{8,})/download", out.stdout)
-    # de-dupe preserving order
+    if "Making sure you're not a bot" in out.stdout:
+        sys.exit("Unsplash anti-bot challenge was not solved — is Chrome running? Try: chrome reset")
+
+    # Real photos are /photo-<id>. Skip /file-<id> (user uploads/avatars) and
+    # /opengraph/ (social card placeholders) — both are not search results.
+    urls = re.findall(r"https://images\.unsplash\.com/photo-[a-zA-Z0-9_-]+", out.stdout)
     seen, dedup = set(), []
-    for i in ids:
-        if i not in seen:
-            seen.add(i)
-            dedup.append(i)
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            dedup.append(u)
         if len(dedup) >= n:
             break
     return dedup
 
 
-def download(photo_id: str, out_dir: Path) -> Path:
+def download(url: str, out_dir: Path, width: int) -> Path | None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / f"unsplash_{photo_id}.jpg"
+    pid = url.rsplit("/", 1)[-1]
+    out = out_dir / f"unsplash_{pid}.jpg"
     subprocess.run(
-        ["curl", "-sL", "-A", "Mozilla/5.0",
-         f"https://unsplash.com/photos/{photo_id}/download?force=true",
-         "-o", str(out)],
-        check=False, capture_output=True
+        ["curl", "-sL", "-A", "Mozilla/5.0", f"{url}?w={width}&q=80", "-o", str(out)],
+        check=False, capture_output=True,
     )
     if out.exists() and out.stat().st_size > 5000:
-        # Resize to ~1080px wide for card use
-        small = out_dir / f"unsplash_{photo_id}_sm.jpg"
-        subprocess.run(
-            ["sips", "-s", "format", "jpeg", "-Z", "1200",
-             "-s", "formatOptions", "75",
-             str(out), "--out", str(small)],
-            check=False, capture_output=True
-        )
-        return small
-    return out  # may be empty / error page
+        return out
+    if out.exists():
+        out.unlink()
+    return None
 
 
-def main():
+def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("query", help="Search query (e.g. 'nashville broadway honky tonk')")
     ap.add_argument("--n", type=int, default=5)
-    ap.add_argument("--out", type=Path, default=Path("/tmp/visual-cards-imgs"),
-                    help="Download dir (default: /tmp/visual-cards-imgs)")
+    ap.add_argument("--width", type=int, default=1400, help="CDN-resized width")
+    ap.add_argument("--out", type=Path, default=Path("/tmp/visual-cards-imgs"))
     args = ap.parse_args()
 
-    ids = search_unsplash(args.query, args.n)
-    if not ids:
-        print(f"no photo IDs found for query: {args.query}")
-        sys.exit(1)
-    print(f"found {len(ids)} IDs: {', '.join(ids)}")
-    for i in ids:
-        p = download(i, args.out)
-        print(f"  {p}")
+    urls = search_unsplash(args.query, args.n)
+    if not urls:
+        print(f"no photos found for query: {args.query}")
+        return 1
+    print(f"found {len(urls)} photos")
+    for u in urls:
+        p = download(u, args.out, args.width)
+        print(f"  {p}" if p else f"  FAILED {u}")
+    print("\nNB: LOOK at these before shipping — Unsplash search is loose and "
+          "returns off-topic results. Generic stock is a known failure mode.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

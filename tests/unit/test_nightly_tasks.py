@@ -249,7 +249,7 @@ class TestConsolidationScript:
 
     def test_script_references_consolidation_scripts(self):
         content = self.script_path.read_text()
-        assert "consolidate_3pass.py" in content
+        assert "consolidate_memory.py" in content  # replaced consolidate_3pass in c387700
         assert "consolidate_chat.py" in content
         assert "--all" in content
 

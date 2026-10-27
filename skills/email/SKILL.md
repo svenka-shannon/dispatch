@@ -5,6 +5,14 @@ description: Read Gmail over IMAP from the command line — list, read, and sear
 
 # email — Gmail over IMAP
 
+> **STATUS 2026-08-29: NOT SET UP. This skill currently cannot read any mail.**
+> The keychain item `gmail-app-password` does not exist, Mail.app has no
+> accounts configured, and the claude.ai Gmail connector is unauthenticated.
+> Until an app password is stored, **never tell anyone to "forward me the
+> email"** — ask them to type or screenshot the specific value instead.
+> See `~/.claude/skills/sms-assistant/admin-rules.md`.
+
+
 `~/.claude/skills/email/scripts/email` reads Gmail directly over IMAP. Python
 stdlib only (`imaplib` + `email`), no third-party packages, no browser, no
 OAuth.

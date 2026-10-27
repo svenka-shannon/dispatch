@@ -51,6 +51,8 @@ class DiscordListener:
         bot_token: str,
         bot_role_ids: list[str] | None = None,
         bot_names: list[str] | None = None,
+        guild_ids: list[str] | None = None,
+        respond_all_guild_ids: list[str] | None = None,
     ):
         if not DISCORD_AVAILABLE:
             raise ImportError("discord.py is not installed. Run: uv add 'discord.py>=2.3.0'")
@@ -62,6 +64,11 @@ class DiscordListener:
         self.bot_token = bot_token
         self.bot_role_ids = set(int(r) for r in (bot_role_ids or []))
         self.bot_names = [n.lower() for n in (bot_names or ["sven"])]
+        # 2026-10-26: per-project chat server. Every channel in these guilds is accepted
+        # (no config edit + restart per new channel), and in respond_all guilds every
+        # message is processed without an @mention: each channel = one project session.
+        self.guild_ids = set(int(g) for g in (guild_ids or []))
+        self.respond_all_guild_ids = set(int(g) for g in (respond_all_guild_ids or []))
         self.running = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._client: discord.Client | None = None
@@ -117,7 +124,8 @@ class DiscordListener:
                 return
 
             # Defense-in-depth channel filter (Discord permissions are primary gate)
-            if message.channel.id not in self.channel_ids:
+            in_project_guild = message.guild.id in self.guild_ids
+            if message.channel.id not in self.channel_ids and not in_project_guild:
                 return
 
             text = message.content
@@ -128,7 +136,7 @@ class DiscordListener:
                     return
 
             # ── Mention filter: only process messages directed at the bot ──
-            is_mentioned = False
+            is_mentioned = message.guild.id in self.respond_all_guild_ids
 
             # 1. Direct @mention of the bot user
             if client.user in message.mentions:

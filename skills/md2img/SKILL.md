@@ -43,3 +43,7 @@ echo "# Hello" | md2img - output.png
 - Rendering plans to send as images in SMS/iMessage
 - Creating shareable screenshots of documentation
 - Converting markdown to images for social media
+
+## Gotchas
+
+- **Don't use `-t dark` for tables.** The dark theme renders table cell text dark-on-dark, so you can't read it (seen 2026-10-24). Use the default light theme for anything with tables.

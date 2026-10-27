@@ -47,7 +47,83 @@ Need to scrape a website?
 ~/.claude/skills/chrome-control/scripts/chrome fetch "https://example.com"
 ```
 
-`chrome fetch` uses your real Chrome browser which fully executes JavaScript, so product data, prices, descriptions, and other dynamic content are all present.
+`chrome fetch` uses your real Chrome browser which fully executes JavaScript, so product data, prices, descriptions, and other dynamic content are all present. It polls until the page text stops growing, so it does not return the empty-but-valid document an SPA hands back instantly. Add `--timeout 40` for slow pages.
+
+**But try tier 2 with render flags FIRST — it is cheaper and often returns more.**
+
+An empty tier-1 body is a JS-rendering failure, not necessarily a bot-detection
+failure. The fix is usually *waiting*, and tier 2 can wait perfectly well:
+
+```bash
+webfetch <url> --tier 2 --network-idle --wait 5000
+```
+
+Measured on `booking.com/searchresults.html?ss=Boston` (2026-08-19):
+
+| Approach | Result |
+|---|---|
+| tier 1 (HTTP only) | empty body, exit 0 — silent failure |
+| **tier 2 + `--network-idle --wait 5000`** | **46 KB, real listings** ✅ |
+| `chrome fetch` | 13.6 KB, real listings ✅ |
+
+So tier 2 **does** beat booking.com. Do not conclude "scrapling can't do this"
+from a bare tier-1 failure — that tests HTTP fetching, not scrapling.
+
+### Why `network_idle` is non-negotiable for tier 2 (measured, powered)
+
+Controlled comparison, booking.com, n=6 per arm, interleaved (2026-08-19):
+
+| Arm | Served (HTTP 200 + listings) | Output |
+|---|---|---|
+| **strong** (`network_idle` + wait) | **6 / 6** | 58,374–59,987 bytes |
+| weak (`--no-network-idle`) | **0 / 6** | 28 bytes, 0 listings |
+
+Fisher exact two-tailed **p = 0.00216**. Replicated independently on a second
+machine (6/6 vs 1/6); **pooled 12/12 vs 1/12, p = 0.0000096**.
+
+The weak arm's pooled rate (1/12 = 0.083) is indistinguishable from the site's
+~1/8 background serve rate — so **the weak form isn't a weaker fetch, it's no
+fetch**. It just enters the lottery below.
+
+Key insight: the nondeterminism is a property of the *unwaited* path. Give
+Camoufox time to follow the challenge redirect and **the served-vs-challenged
+outcome becomes deterministic — but the payload still wobbles** (byte counts
+varied across all six served runs). Apparent "flakiness" was us sampling a race
+we were losing.
+
+⚠️ **Metric warning:** `grep -c` counts matching *LINES*, not occurrences. Both
+agents measuring this independently reported a "flat, zero-variance" listing
+count that was an artifact of that, on markup where everything sits on few lines.
+Use `grep -o ... | wc -l` for occurrences, and compare raw byte counts, before
+claiming a payload is stable.
+
+### Measure n>1 — anti-bot responses are NOT deterministic
+
+Measured 2026-08-19, tier 1 against booking.com, 8 consecutive runs:
+
+| Result | Count |
+|---|---|
+| HTTP 202, 0 chars text | 7 |
+| **HTTP 200, 45,541 bytes — served** | **1** |
+
+**A single run has a ~12% chance of telling you the opposite story.** Two agents
+independently posted contradictory booking.com numbers all day, and both were
+honest n=1 reads of the same behaviour. Before claiming "site X can't be fetched"
+or "tier N is broken", run it **at least 5 times** and report the distribution.
+
+This is also the strongest argument for gating on extracted text rather than HTTP
+status: on the run that gets served, a text gate simply sees content and stops.
+It never has to infer *why* a response was thin — challenged, throttled, or
+slow — it only measures what came back.
+
+Precision matters on this claim: a **status-alone** rule would escalate an
+already-served page 1 time in 8. A status check *AND-ed with a thin-text test* is
+safe from that, because it can't fire when real text arrived — it's diagnostic
+text, not a veto. The reason to still leave status out of the gate here is that
+the advice it produced ("challenged → change transport") was itself wrong: tier 2
+clears the challenge on its own given `network_idle`.
+Reserve `chrome fetch` for pages needing your logged-in session or real-Chrome
+fingerprint, not merely for JS rendering.
 
 **Known JS-rendered site patterns:**
 - Shopify stores (shop.hak5.org, any `myshopify.com` or custom Shopify domain)
@@ -196,3 +272,29 @@ Installed automatically via uv script header:
 - `beautifulsoup4>=4.12` - HTML parsing
 
 First run will install camoufox browser (~300MB).
+
+---
+
+## Japanese sites: encoding is per-site, do NOT blanket-apply iconv
+
+Verified 2026-08-27 by fetching both sites directly.
+
+| Site | Encoding | Fetch |
+|---|---|---|
+| **jalan.net** | **Windows-31J / CP932** | `curl -sL -A "<browser UA>" URL \| iconv -f CP932 -t UTF-8` |
+| **tabelog.com** | **UTF-8** | plain `curl -sL -A "<browser UA>" URL` — **no iconv** |
+
+`webfetch` (scrapling) dies on jalan with `unknown encoding: 'Windows-31J'`, which is why the iconv workaround exists. **That workaround is specific to jalan.** Applying `iconv -f CP932` to Tabelog corrupts every Japanese character — Tabelog's response header is literally `text/html; charset=utf-8`.
+
+I propagated the wrong advice into several research briefs before checking. Confirm with:
+
+```bash
+curl -sL -A "<browser UA>" "$URL" -o /tmp/x.html && file -I /tmp/x.html
+```
+
+If it says `charset=utf-8`, skip iconv. Rakuten and the official hotel/shop sites are UTF-8 too.
+
+Also worth knowing for Japanese research:
+- **Tabelog closure markers:** look for `閉店` and `掲載保留` (delisted — treat as gone). A page loading fine does not mean the shop is open.
+- Rakuten per-room specs live at `hotel.travel.rakuten.co.jp/hotelinfo/plan/<id>?f_flg=ROOM`; the structured checkbox fields are unreliable, the **free-text 客室説明 is the trustworthy field**.
+- じゃらん hotel-level amenity grids (`バストイレ別 ○/×`) are **property-wide**, not per-room — do not read them as applying to the cheapest room.

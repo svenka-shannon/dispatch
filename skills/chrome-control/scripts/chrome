@@ -13,6 +13,9 @@ Usage:
     chrome [-p PROFILE] focus <tab_id>  Focus/activate a tab
     chrome [-p PROFILE] navigate <tab_id> <url>  Navigate tab to URL
 
+    chrome [-p PROFILE] fetch <url>       One-shot: open, wait for JS render, print text, close
+                                          Flags: --html --keep-open --timeout SEC --min-chars N
+
     chrome [-p PROFILE] read <tab_id>     Read interactive elements
     chrome [-p PROFILE] text <tab_id>     Get page text content
     chrome [-p PROFILE] html <tab_id>     Get page HTML
@@ -26,9 +29,14 @@ Usage:
     chrome [-p PROFILE] key <tab_id> <key>        Send key
     chrome [-p PROFILE] scroll <tab_id> <dir>     Scroll page
     chrome [-p PROFILE] hover <tab_id> <x> <y>    Hover at coordinates
+    chrome [-p PROFILE] os-type <tab_id> [--at X,Y] (--text T | --stdin | --secret-service S)
+                          [--clear] [--select] [--enter]   LAST-RESORT OS-level click+type
+                          (aborts unless Chrome is frontmost; see `chrome os-type --help`)
 
-    chrome [-p PROFILE] screenshot <tab_id>  Take screenshot
+    chrome [-p PROFILE] screenshot <tab_id> [--timeout SEC]  Take screenshot (default timeout 30s)
+    chrome shot-purge [--since 10m] [--dry-run]  Delete recent screenshots (e.g. ones showing a card)
     chrome [-p PROFILE] js <tab_id> <code>   Execute JavaScript
+    chrome [-p PROFILE] upload <tab_id> <selector|auto> <file>...  Attach local files to a file input (works on Gmail)
 
     chrome [-p PROFILE] console <tab_id>  Read console messages
     chrome [-p PROFILE] network <tab_id>  Read network requests
@@ -45,6 +53,7 @@ Options:
 import sys
 import socket
 import json
+import time
 import shutil
 import os
 import subprocess
@@ -250,7 +259,12 @@ class ChromeControl:
         self.sock.sendall(msg.encode())
         data = b""
         while b"\n" not in data:
-            data += self.sock.recv(65536)
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                # 2026-10-01: a closed socket returns b"" forever; this loop used to spin until
+                # the caller was killed (fill-card-iframe hung 30 min after the card was typed).
+                raise ConnectionError(f"native host closed the connection during '{command}'")
+            data += chunk
         return json.loads(data.decode().strip())
 
 
@@ -391,6 +405,94 @@ def cmd_html(client, args):
     tab_id = parse_tab_id(args[0])
     result = get_result(client.send("get_page_html", tabId=tab_id))
     print(result if isinstance(result, str) else result.get("html", result))
+
+
+def cmd_fetch(client, args):
+    """Open a URL, wait for JS-rendered content, print it, then close the tab.
+
+    One-shot replacement for the manual open -> poll text -> close dance.
+    Polls until the page text stops growing (or --timeout), so SPAs and
+    Shopify/React/Next.js pages return real content instead of an empty body.
+    """
+    keep_open = False
+    want_html = False
+    timeout = 20.0
+    min_chars = 200
+    positional = []
+
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--keep-open":
+            keep_open = True
+        elif a == "--html":
+            want_html = True
+        elif a == "--timeout":
+            i += 1
+            if i >= len(args):
+                print("Error: --timeout requires a value (seconds)", file=sys.stderr)
+                sys.exit(1)
+            timeout = float(args[i])
+        elif a == "--min-chars":
+            i += 1
+            if i >= len(args):
+                print("Error: --min-chars requires a value", file=sys.stderr)
+                sys.exit(1)
+            min_chars = int(args[i])
+        else:
+            positional.append(a)
+        i += 1
+
+    if not positional:
+        print("Usage: chrome fetch <url> [--html] [--keep-open] "
+              "[--timeout SECONDS] [--min-chars N]", file=sys.stderr)
+        sys.exit(1)
+
+    url = normalize_url(positional[0])
+    result = get_result(client.send("open_tab", url=url))
+    tab_id = result.get("tabId")
+    if tab_id is None:
+        print(f"Error: failed to open tab for {url}", file=sys.stderr)
+        sys.exit(1)
+
+    action = "get_page_html" if want_html else "get_page_text"
+    key = "html" if want_html else "text"
+
+    content = ""
+    prev_len = -1
+    deadline = time.monotonic() + timeout
+
+    try:
+        while True:
+            try:
+                raw = get_result(client.send(action, tabId=tab_id))
+                content = raw if isinstance(raw, str) else raw.get(key, "") or ""
+            except Exception:
+                content = content or ""
+
+            cur_len = len(content.strip())
+            # Settled: enough content AND it stopped growing since last poll.
+            if cur_len >= min_chars and cur_len == prev_len:
+                break
+            if time.monotonic() >= deadline:
+                break
+            prev_len = cur_len
+            time.sleep(0.5)
+    finally:
+        if not keep_open:
+            try:
+                get_result(client.send("close_tab", tabId=tab_id))
+            except Exception:
+                print(f"Warning: could not close tab {tab_id}", file=sys.stderr)
+
+    if not content.strip():
+        print(f"Error: no content from {url} after {timeout:.0f}s. "
+              f"Page may need login, or try --timeout 40.", file=sys.stderr)
+        sys.exit(1)
+
+    print(content)
+    if keep_open:
+        print(f"\n[tab {tab_id} left open]", file=sys.stderr)
 
 
 def cmd_find(client, args):
@@ -586,12 +688,36 @@ def cmd_hover(client, args):
 
 
 def cmd_screenshot(client, args):
-    """Take screenshot and save to ~/Pictures."""
-    if len(args) < 1:
-        print("Usage: chrome screenshot <tab_id>", file=sys.stderr)
+    """Take screenshot and save to ~/Pictures.
+
+    --timeout SEC (default 30): 2026-10-18 a screenshot hung ~120s while a native
+    <select> dropdown was open (captureVisibleTab never returns). Fail fast instead.
+    """
+    timeout = 30.0
+    positional = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--timeout":
+            i += 1
+            if i >= len(args):
+                print("Error: --timeout requires a value (seconds)", file=sys.stderr)
+                sys.exit(1)
+            timeout = float(args[i])
+        else:
+            positional.append(args[i])
+        i += 1
+    if len(positional) < 1:
+        print("Usage: chrome screenshot <tab_id> [--timeout SEC]   (default 30s)", file=sys.stderr)
         sys.exit(1)
-    tab_id = parse_tab_id(args[0])
-    result = get_result(client.send("screenshot", timeout=120, tabId=tab_id))
+    tab_id = parse_tab_id(positional[0])
+    try:
+        result = get_result(client.send("screenshot", timeout=timeout, tabId=tab_id))
+    except socket.timeout:
+        print(f"Error: screenshot timed out after {timeout:.0f}s. A native <select> dropdown or an "
+              "OS dialog may be open (Chrome can't capture while it is). Press Escape / dismiss it, "
+              "or capture the whole screen instead: screencapture -x /tmp/screen.png",
+              file=sys.stderr)
+        sys.exit(1)
 
     # Get source path
     src_path = result.get("screenshotPath")
@@ -606,8 +732,12 @@ def cmd_screenshot(client, args):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     dest_path = PICTURES_DIR / f"screenshot_{timestamp}.jpg"
 
-    # Copy file
-    shutil.copy2(src_path, dest_path)
+    # Move (not copy) so the native host's temp copy doesn't linger — screenshots of
+    # checkout pages can show card data and must be purgeable from one place.
+    try:
+        shutil.move(src_path, dest_path)
+    except OSError:
+        shutil.copy2(src_path, dest_path)
 
     # Resize if too large (prevents buffer overflow when Claude reads it)
     # Target: max 1600px on longest side (keeps ~800KB file size, well under 1MB SDK limit)
@@ -636,6 +766,370 @@ def cmd_screenshot(client, args):
     print(dest_path)
 
 
+# ---------------------------------------------------------------------------
+# OS-level typing fallback: `chrome os-type`  (LAST RESORT)
+#
+# 2026-10-18: on OpenTable and Walmart checkouts, read/type/insert-text could not
+# reach the inputs (out-of-process Stripe iframes, React forms). What worked was
+# focus + an OS-level click + OS-level keystrokes with Chrome frontmost. This
+# wraps that recipe with the guard rails that were missing that day:
+#   - abort if Chrome is not frontmost (a TCC "wants to record your screen"
+#     dialog stole the keystrokes),
+#   - window-relative coordinate mapping computed live (never hardcoded),
+#   - a settle delay + harmless primer (the first char was dropped after a click),
+#   - text fed to cliclick on STDIN (`cliclick -f -`), so secrets never hit argv/ps.
+# ---------------------------------------------------------------------------
+
+CHROME_BUNDLE_ID = "com.google.Chrome"
+SCREENSHOT_MAX_DIM = 1600  # cmd_screenshot downsizes to this; os-type maps coords back through it
+
+
+class OsTypeError(Exception):
+    """Raised by os_type(); exit_code 3 = Chrome not frontmost."""
+
+    def __init__(self, msg, exit_code=1):
+        super().__init__(msg)
+        self.exit_code = exit_code
+
+
+def _cliclick_path():
+    return shutil.which("cliclick") or "/opt/homebrew/bin/cliclick"
+
+
+def frontmost_app():
+    """(bundle_id, display_name) of the frontmost macOS app via lsappinfo; ('', '') if unknown."""
+    try:
+        asn = subprocess.run(["lsappinfo", "front"], capture_output=True,
+                             text=True, timeout=5).stdout.strip()
+        if not asn:
+            return ("", "")
+        out = subprocess.run(["lsappinfo", "info", "-only", "bundleid", "-only", "name", asn],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ("", "")
+    vals = {}
+    for line in out.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            vals[k.strip().strip('"')] = v.strip().strip('"')
+    return (vals.get("CFBundleIdentifier", ""), vals.get("LSDisplayName", ""))
+
+
+def chrome_is_frontmost(wait=0.0):
+    """Poll up to `wait` seconds for Chrome to be frontmost. Returns (ok, bundle_id, name)."""
+    deadline = time.monotonic() + wait
+    while True:
+        bid, name = frontmost_app()
+        if bid == CHROME_BUNDLE_ID:
+            return True, bid, name
+        if time.monotonic() >= deadline:
+            return False, bid, name
+        time.sleep(0.1)
+
+
+def _not_frontmost_error(bid, name, when):
+    return OsTypeError(
+        f"Google Chrome is not the frontmost app {when} (frontmost: {name or '?'} [{bid or '?'}]). "
+        "Refusing to send OS keystrokes: they would go to that app. A macOS permission dialog "
+        "(e.g. 'python3.14 wants to record your screen') may have stolen focus: approve/deny it "
+        "(auth-dialog-monitor skill) and retry.", exit_code=3)
+
+
+def _main_display_backing_scale():
+    """Pixels per point of the main display (1.0 on a non-Retina 1080p panel)."""
+    try:
+        out = subprocess.run(["system_profiler", "SPDisplaysDataType", "-json"],
+                             capture_output=True, text=True, timeout=20).stdout
+        data = json.loads(out)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return 1.0
+    for gpu in data.get("SPDisplaysDataType", []):
+        for d in gpu.get("spdisplays_ndrvs", []):
+            if d.get("spdisplays_main") == "spdisplays_yes":
+                try:
+                    px = float(d["_spdisplays_pixels"].split(" x ")[0])
+                    pt = float(d["_spdisplays_resolution"].split(" x ")[0])
+                    return px / pt if pt else 1.0
+                except (KeyError, ValueError, IndexError):
+                    return 1.0
+    return 1.0
+
+
+_GEOM_EXPR = ("({sx: screenX, sy: screenY, ow: outerWidth, oh: outerHeight, "
+              "iw: innerWidth, ih: innerHeight, dpr: devicePixelRatio})")
+
+
+def tab_geometry(client, tab_id):
+    """Window/viewport geometry of a tab, read live via the CDP isolated world (CSP-safe)."""
+    res = client.send("debugger_eval", tabId=tab_id, code="return " + _GEOM_EXPR + ";")
+    g = res.get("result") if isinstance(res, dict) else None
+    if isinstance(g, dict) and isinstance(g.get("result"), dict):
+        g = g["result"]
+    if not (isinstance(g, dict) and all(k in g for k in ("sx", "sy", "oh", "iw", "ih", "dpr"))):
+        raise OsTypeError(f"could not read window geometry for tab {tab_id}: {str(res)[:200]}")
+    return g
+
+
+def to_screen_point(g, x, y, space="shot"):
+    """Map tab coordinates to global screen points (what cliclick wants).
+
+    space: 'shot'   = pixels in a `chrome screenshot` image (default)
+           'css'    = CSS viewport px (what `chrome click-at` takes)
+           'screen' = already screen points
+    Content origin = (screenX, screenY + outerHeight - innerHeight*zoom); e.g. on the
+    1920x1080 panel with a 1200px window that is (642, 179). Computed every call, so a
+    moved/resized window is handled.
+    """
+    if space == "screen":
+        return int(round(x)), int(round(y))
+    dpr = float(g.get("dpr") or 1.0)
+    zoom = 1.0 if abs(dpr - 1.0) < 1e-6 else dpr / _main_display_backing_scale()
+    if space == "shot":
+        raw_w, raw_h = g["iw"] * dpr, g["ih"] * dpr
+        s = min(1.0, SCREENSHOT_MAX_DIM / max(raw_w, raw_h, 1))
+        x, y = x / (dpr * s), y / (dpr * s)          # -> CSS px
+    elif space != "css":
+        raise OsTypeError(f"unknown coordinate space '{space}' (use shot|css|screen)")
+    left = g["sx"]
+    top = g["sy"] + g["oh"] - g["ih"] * zoom
+    return int(round(left + x * zoom)), int(round(top + y * zoom))
+
+
+def shot_to_css(g, x, y):
+    """Screenshot pixels -> CSS viewport px (for `click_at`)."""
+    dpr = float(g.get("dpr") or 1.0)
+    s = min(1.0, SCREENSHOT_MAX_DIM / max(g["iw"] * dpr, g["ih"] * dpr, 1))
+    return int(round(x / (dpr * s))), int(round(y / (dpr * s)))
+
+
+def _cliclick(lines, secret=False):
+    """Run cliclick with commands on STDIN (`-f -`): typed text never appears in argv."""
+    exe = _cliclick_path()
+    if not os.path.exists(exe):
+        raise OsTypeError("cliclick not found (brew install cliclick)")
+    r = subprocess.run([exe, "-w", "20", "-f", "-"], input="\n".join(lines) + "\n",
+                       capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        detail = "(details suppressed: secret input)" if secret else r.stderr.strip()[:300]
+        raise OsTypeError(f"cliclick failed (exit {r.returncode}) {detail}")
+
+
+def _type_lines(text):
+    """cliclick lines that type `text` exactly (cliclick -f strips edge whitespace)."""
+    if any(c in text for c in "\r\n\t"):
+        raise OsTypeError("text contains newline/tab; type it in pieces (use --enter for Enter)")
+    core = text.strip(" ")
+    lead = len(text) - len(text.lstrip(" "))
+    trail = len(text) - len(text.rstrip(" ")) if core else 0
+    lines = ["kp:space"] * lead
+    if core:
+        lines.append("t:" + core)
+    lines += ["kp:space"] * trail
+    return lines
+
+
+def read_keychain(service, account=None):
+    """Read a Keychain secret in-process (security's stdout, never argv/printed)."""
+    cmd = ["security", "find-generic-password", "-s", service, "-w"]
+    if account:
+        cmd[2:2] = ["-a", account]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0 or not r.stdout.strip():
+        raise OsTypeError(f"keychain item not found: service={service} account={account}")
+    return r.stdout.rstrip("\n")
+
+
+def os_type(client, tab_id, text, at=None, space="shot", clear=False, select=False,
+            enter=False, primer=True, settle=0.4, secret=False):
+    """Focus tab, verify Chrome frontmost, optional OS click, then OS-type `text`.
+
+    Raises OsTypeError. Returns the screen point clicked (or None).
+    """
+    get_result(client.send("focus_tab", tabId=tab_id))
+    ok, bid, name = chrome_is_frontmost(wait=1.5)
+    if not ok:
+        raise _not_frontmost_error(bid, name, "after focusing the tab")
+    point = None
+    if at is not None:
+        g = tab_geometry(client, tab_id)
+        point = to_screen_point(g, at[0], at[1], space)
+        _cliclick([f"c:{point[0]},{point[1]}"])
+    time.sleep(settle)                      # let focus land / native popup open
+    ok, bid, name = chrome_is_frontmost()
+    if not ok:
+        raise _not_frontmost_error(bid, name, "right before typing")
+    lines = []
+    if primer and not select:
+        # Harmless key event to wake the field: the 1st real char got dropped after clicks.
+        lines += ["kd:shift", "ku:shift", "w:100"]
+    if clear and not select:
+        lines += ["kd:cmd", "t:a", "ku:cmd", "kp:delete", "w:50"]
+    lines += _type_lines(text)
+    if select or enter:
+        lines += ["w:150", "kp:enter"]
+    _cliclick(lines, secret=secret)
+    if select:
+        time.sleep(0.6)  # the DOM value updates ~0.5s after the native menu closes
+    return point
+
+
+def _parse_xy(s):
+    try:
+        x, y = s.replace(" ", ",").split(",")
+        return float(x), float(y)
+    except ValueError:
+        raise OsTypeError(f"bad coordinate '{s}' (want X,Y)")
+
+
+OS_TYPE_HELP = """Usage: chrome os-type <tab_id> [--at X,Y] [--coords shot|css|screen]
+                      (--text T | --stdin | --secret-service S [--secret-account A])
+                      [--clear] [--select] [--enter] [--no-primer] [--settle SEC]
+
+LAST-RESORT OS-level typing for inputs chrome-control can't reach (out-of-process
+payment iframes, React checkout forms). Focuses the tab, aborts (exit 3) unless Google
+Chrome is the frontmost app, optionally OS-clicks at X,Y, waits, sends a harmless
+primer key, then types via cliclick fed on STDIN (nothing typed ever appears in argv).
+
+  --at X,Y            click here first. Coordinates are in --coords space:
+  --coords SPACE      shot (default; pixels in a `chrome screenshot` image), css
+                      (viewport px, same as click-at), or screen (global points)
+  --text T            non-secret text (it IS in argv — never use for card/CVV/passwords)
+  --stdin             read the text from stdin (pipe secrets this way)
+  --secret-service S  read the text from Keychain in-process (`--secret-account A`)
+  --clear             Cmd+A, Delete before typing
+  --select            native <select>: --at opens it, type the OPTION TEXT as shown
+                      (e.g. "CA" not "California", "29" not "2029"), then Enter
+  --enter             press Enter after typing
+  --no-primer         skip the shift-tap primer
+  --settle SEC        wait after the click (default 0.4)
+"""
+
+
+def cmd_os_type(client, args):
+    """OS-level typing fallback. See OS_TYPE_HELP."""
+    if not args or args[0] in ("-h", "--help"):
+        print(OS_TYPE_HELP)
+        sys.exit(0 if args else 1)
+    tab_id = parse_tab_id(args[0])
+    opts = {"at": None, "coords": "shot", "text": None, "stdin": False, "service": None,
+            "account": None, "clear": False, "select": False, "enter": False,
+            "primer": True, "settle": 0.4}
+    valued = {"--at": "at", "--coords": "coords", "--text": "text",
+              "--secret-service": "service", "--secret-account": "account", "--settle": "settle"}
+    flags = {"--stdin": "stdin", "--clear": "clear", "--select": "select", "--enter": "enter"}
+    i = 1
+    try:
+        while i < len(args):
+            a = args[i]
+            if a in valued:
+                if i + 1 >= len(args):
+                    raise OsTypeError(f"{a} requires a value")
+                opts[valued[a]] = args[i + 1]
+                i += 2
+                continue
+            if a in flags:
+                opts[flags[a]] = True
+            elif a == "--no-primer":
+                opts["primer"] = False
+            elif a in ("-h", "--help"):
+                print(OS_TYPE_HELP)
+                sys.exit(0)
+            else:
+                raise OsTypeError(f"unknown argument '{a}' (see chrome os-type --help)")
+            i += 1
+        sources = [opts["text"] is not None, opts["stdin"], opts["service"] is not None]
+        if sum(sources) != 1:
+            raise OsTypeError("give exactly one of --text, --stdin, --secret-service")
+        secret = opts["text"] is None
+        if opts["service"]:
+            text = read_keychain(opts["service"], opts["account"])
+        elif opts["stdin"]:
+            text = sys.stdin.read().rstrip("\n")
+        else:
+            text = opts["text"]
+        if not text:
+            raise OsTypeError("nothing to type (empty text)")
+        at = _parse_xy(opts["at"]) if opts["at"] else None
+        point = os_type(client, tab_id, text, at=at, space=opts["coords"], clear=opts["clear"],
+                        select=opts["select"], enter=opts["enter"], primer=opts["primer"],
+                        settle=float(opts["settle"]), secret=secret)
+    except OsTypeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(e.exit_code)
+    where = f" after clicking screen ({point[0]},{point[1]})" if point else ""
+    what = "secret, value not shown" if secret else "text"
+    print(f"os-type: typed {len(text)} chars ({what}) into tab {tab_id}{where}")
+    if opts["select"] and len(text) > 3 and not any(ch.isdigit() for ch in text):
+        print(f"Warning: native select type-ahead matches the option LABEL letter by letter; if the "
+              f"options are abbreviations, '{text}' picks the wrong one ('California' -> CO). "
+              "Type the label exactly as shown ('CA').", file=sys.stderr)
+    if opts["select"]:
+        print("Native select: verify the chosen option with `chrome screenshot` (dropdown is closed now).")
+
+
+def _parse_duration(s):
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    s = s.strip().lower()
+    try:
+        if s and s[-1] in units:
+            return float(s[:-1]) * units[s[-1]]
+        return float(s)
+    except ValueError:
+        print(f"Error: bad duration '{s}' (e.g. 90s, 10m, 2h, 1d)", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_shot_purge(client, args):
+    """Delete recent chrome screenshots (e.g. ones that showed a card). No-match safe.
+
+    chrome shot-purge [--since 10m] [--dry-run]
+    Removes ~/Pictures/chrome-screenshots/screenshot_*.jpg plus the native host's
+    temp copies (chrome_screenshot_*) modified within the window. Uses Python globbing,
+    so there are no zsh 'no matches found' errors.
+    """
+    import glob
+    import tempfile
+    since = "10m"
+    dry = False
+    i = 0
+    while i < len(args):
+        if args[i] == "--since" and i + 1 < len(args):
+            since = args[i + 1]
+            i += 2
+            continue
+        if args[i] == "--dry-run":
+            dry = True
+        elif args[i] in ("-h", "--help"):
+            print("Usage: chrome shot-purge [--since 10m] [--dry-run]")
+            return
+        else:
+            print(f"Error: unknown argument '{args[i]}'", file=sys.stderr)
+            sys.exit(1)
+        i += 1
+    cutoff = time.time() - _parse_duration(since)
+    patterns = [str(PICTURES_DIR / "screenshot_*.jpg")]
+    for d in {tempfile.gettempdir(), os.environ.get("TMPDIR", ""), "/tmp"}:
+        if d:
+            patterns.append(os.path.join(d, "chrome_screenshot_*"))
+    hits = set()
+    for pat in patterns:
+        for p in glob.glob(pat):
+            try:
+                if os.path.getmtime(p) >= cutoff:
+                    hits.add(os.path.realpath(p))
+            except OSError:
+                pass
+    for p in sorted(hits):
+        if not dry:
+            try:
+                os.remove(p)
+            except OSError as e:
+                print(f"Warning: could not delete {p}: {e}", file=sys.stderr)
+                continue
+        print(("would delete " if dry else "deleted ") + p)
+    print(f"{'Would delete' if dry else 'Deleted'} {len(hits)} screenshot(s) modified in the last {since}.")
+
+
 def cmd_js(client, args):
     """Execute JavaScript in page."""
     if len(args) < 2:
@@ -649,6 +1143,64 @@ def cmd_js(client, args):
             print(json.dumps(result, indent=2))
         else:
             print(result)
+
+
+def cmd_djs(client, args):
+    """Run JS via the CDP debugger in an isolated world: works on strict-CSP pages
+    (Microsoft/Google sign-in) where `chrome js` fails with 'unsafe-eval'.
+
+    Usage: chrome djs <tab_id> <code>   (code is a function BODY: use `return ...`)
+    """
+    if len(args) < 2:
+        print("Usage: chrome djs <tab_id> <code>", file=sys.stderr)
+        sys.exit(1)
+    tab_id = parse_tab_id(args[0])
+    code = " ".join(args[1:])
+    result = get_result(client.send("debugger_eval", tabId=tab_id, code=code))
+    print(json.dumps(result, indent=2) if isinstance(result, (dict, list)) else result)
+
+
+def cmd_upload(client, args):
+    """Attach local file(s) to an <input type=file> — works on Trusted-Types pages (Gmail).
+
+    Usage: chrome upload <tab_id> <css_selector|auto> <file> [file...]
+    Runs through the CDP debugger in an isolated world (not page eval, so Trusted
+    Types / CSP don't block it), builds File objects from base64, assigns them to the
+    input via DataTransfer and fires input/change. 'auto' = last file input on the page.
+    Keep files small (a few MB total); the payload travels through native messaging.
+    """
+    import base64, mimetypes
+    if len(args) < 3:
+        print("Usage: chrome upload <tab_id> <css_selector|auto> <file> [file...]", file=sys.stderr)
+        sys.exit(1)
+    tab_id = parse_tab_id(args[0])
+    selector = args[1]
+    files = []
+    for f in args[2:]:
+        path = os.path.expanduser(f)
+        with open(path, "rb") as fh:
+            files.append({"name": os.path.basename(path),
+                          "type": mimetypes.guess_type(path)[0] or "application/octet-stream",
+                          "b64": base64.b64encode(fh.read()).decode()})
+    code = (
+        "const files = " + json.dumps(files) + ";"
+        "const sel = " + json.dumps(selector) + ";"
+        "const inputs = Array.from(document.querySelectorAll('input[type=file]'));"
+        "const el = sel === 'auto' ? inputs[inputs.length - 1] : document.querySelector(sel);"
+        "if (!el) return {ok: false, error: 'no file input found', count: inputs.length};"
+        "const dt = new DataTransfer();"
+        "for (const f of files) {"
+        "  const bin = atob(f.b64); const u8 = new Uint8Array(bin.length);"
+        "  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);"
+        "  dt.items.add(new File([u8], f.name, {type: f.type}));"
+        "}"
+        "el.files = dt.files;"
+        "el.dispatchEvent(new Event('input', {bubbles: true}));"
+        "el.dispatchEvent(new Event('change', {bubbles: true}));"
+        "return {ok: true, attached: files.map(f => f.name), inputs: inputs.length};"
+    )
+    result = get_result(client.send("debugger_eval", tabId=tab_id, code=code))
+    print(json.dumps(result, indent=2) if isinstance(result, (dict, list)) else result)
 
 
 def cmd_js_all_frames(client, args):
@@ -889,18 +1441,34 @@ def cmd_wake(client, args):
             )
         sys.exit(1)
 
-    # Close the throwaway wake tab(s) so we don't leak them.
-    try:
-        socket_path = find_profile_socket(None)
-        c = ChromeControl(socket_path)
-        tabs = (get_result(c.send("list_tabs")) or {}).get("tabs", [])
-        for tab in tabs:
-            if str(tab.get("url", "")).startswith(wake_url):
-                c.send("close_tab", tabId=tab["id"])
-    except Exception:
-        pass  # best-effort cleanup; connectivity is restored regardless
+    # DO NOT close the wake tab. It is not a leak — it is the life support.
+    #
+    # An MV3 service worker stays alive while one of the extension's own pages
+    # is open. This function used to close the tab here and then print success,
+    # on the assumption that "connectivity is restored regardless". That
+    # assumption is false: closing the wake page evicts the worker within
+    # milliseconds, so wake verified connectivity, destroyed it, and then
+    # announced it.
+    #
+    # Measured 2026-08-27 in /tmp/chrome_control.log: 2,242 of 2,269
+    # `Extension disconnected` events land within 3 lines of a `close_tab`.
+    # A peer box with no wake command has 150 close_tabs and 0 worker kills —
+    # so it is not close_tab that is dangerous, it is closing THIS page.
+    #
+    # The verification above is real, but it ran before the destructive step.
+    # Re-verify after, and let the exit code be the verifier's.
+    still_up = get_profiles()
+    if not still_up:
+        print(
+            "Wake page loaded and the worker started, but connectivity was lost "
+            "again immediately — something closed the extension page.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     print("Service worker revived — chrome-control is connected.")
+    print(f"Left a background tab open on {wake_url} — it is what keeps the "
+          "MV3 worker alive. Closing it will drop the connection.")
 
 
 def cmd_reload_extension(client, args):
@@ -977,8 +1545,13 @@ COMMANDS = {
     "hover": cmd_hover,
     "screenshot": cmd_screenshot,
     "shot": cmd_screenshot,
+    "shot-purge": None,  # Special case - no client needed
+    "os-type": cmd_os_type,
     "js": cmd_js,
+    "upload": cmd_upload,
+    "djs": cmd_djs,
     "js-all-frames": cmd_js_all_frames,
+    "fetch": cmd_fetch,
     "cookies": cmd_cookies,
     "console": cmd_console,
     "network": cmd_network,
@@ -1022,6 +1595,15 @@ def main():
     # Handle reset command (no client needed; runs even when host is wedged)
     if command == "reset":
         cmd_reset(None, cmd_args)
+        return
+
+    # Handle shot-purge (pure filesystem; works with Chrome down)
+    if command == "shot-purge":
+        cmd_shot_purge(None, cmd_args)
+        return
+
+    if command == "os-type" and (not cmd_args or cmd_args[0] in ("-h", "--help")):
+        cmd_os_type(None, cmd_args)
         return
 
     # Handle wake command (no client needed; runs when the worker is evicted)

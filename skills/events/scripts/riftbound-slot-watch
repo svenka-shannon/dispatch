@@ -1,0 +1,120 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""Watch a playriftbound.com event page and text someone the moment a spot opens.
+
+  riftbound-slot-watch <event_id_or_url> --contact +15555550100 --until 18:30 [--interval 300] [--tz America/Los_Angeles]
+                       [--session imessage/_15555550100]
+
+Loads the page in Chrome (chrome-control fetch; the site is JS-rendered), reads
+"PLAYERS N / M" and the FULL badge, and sends one SMS on each full -> open transition
+(and one when it fills back up). It stops at --until (local time in --tz). Log: ~/dispatch/logs/riftbound-slot-watch.log
+The texts go out-of-band, so pass --session <session_name> (the chat session that owns the watch):
+after each alert that actually sends, the watcher injects an FYI into that session so it knows.
+Only trust the counts for stores that register through playriftbound.com. Many stores sign
+people up in person or on Discord, so "0/40" can mean full (see events SKILL.md).
+"""
+import argparse, re, subprocess, sys, time
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+HOME = Path.home()
+CHROME = HOME / ".claude/skills/chrome-control/scripts/chrome"
+SEND = HOME / ".claude/skills/sms-assistant/scripts/send-sms"
+ASSISTANT = HOME / "dispatch/bin/claude-assistant"
+LOG = HOME / "dispatch/logs/riftbound-slot-watch.log"
+
+
+def log(msg):
+    with LOG.open("a") as f:
+        f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}\n")
+
+
+def notify(contact, msg, session):
+    """Send msg; on a confirmed send, tell the owning session so it never claims no alert went out."""
+    try:
+        r = subprocess.run([str(SEND), contact, msg], capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        log("send timed out")
+        return False
+    if r.returncode != 0 or "SENT" not in r.stdout:
+        log(f"send FAILED rc={r.returncode} out={r.stdout.strip()!r} err={r.stderr.strip()!r}")
+        return False
+    if session:
+        note = (f"FYI from riftbound-slot-watch: I already texted the owner at {datetime.now():%H:%M}: "
+                f"'{msg}'. Do NOT re-send it.")
+        try:
+            i = subprocess.run([str(ASSISTANT), "inject-prompt", session, note],
+                               capture_output=True, text=True, timeout=60)
+            log(f"inject {session} rc={i.returncode}" + ("" if i.returncode == 0 else f" err={i.stderr.strip()!r}"))
+        except subprocess.TimeoutExpired:
+            log(f"inject {session} timed out")
+    return True
+
+
+def check(url):
+    try:
+        out = subprocess.run([str(CHROME), "fetch", url, "--timeout", "40", "--min-chars", "800"],
+                             capture_output=True, text=True, timeout=120).stdout
+    except subprocess.TimeoutExpired:
+        return None
+    lines = [l.strip() for l in out.splitlines() if l.strip()]
+    title = next((lines[i + 1] for i, l in enumerate(lines) if l == "SIGN IN" and i + 2 < len(lines)), "")
+    m = None
+    for i, l in enumerate(lines):
+        if l == "PLAYERS" and i + 1 < len(lines):
+            m = re.match(r"(\d+)\s*/\s*(\d+)", lines[i + 1])
+            break
+    if not m:
+        return None
+    n, cap = int(m.group(1)), int(m.group(2))
+    full = "EVENT IS FULL" in out or n >= cap
+    closed = "EVENT IS CLOSED" in out
+    return {"n": n, "cap": cap, "full": full, "closed": closed, "title": title}
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("event")
+    ap.add_argument("--contact", required=True)
+    ap.add_argument("--until", required=True, help="HH:MM local (event start)")
+    ap.add_argument("--interval", type=int, default=300)
+    ap.add_argument("--tz", default="America/Los_Angeles")
+    ap.add_argument("--label", default="")
+    ap.add_argument("--session", default="",
+                    help="owning chat session (e.g. imessage/_15555550100); gets an FYI after each sent alert")
+    a = ap.parse_args()
+    url = a.event if a.event.startswith("http") else f"https://playriftbound.com/en-US/events/{a.event}"
+    tz = ZoneInfo(a.tz)
+    hh, mm = map(int, a.until.split(":"))
+    stop = datetime.now(tz).replace(hour=hh, minute=mm, second=0, microsecond=0)
+    log(f"start {url} until {stop:%H:%M} every {a.interval}s -> {a.contact} session={a.session or '-'}")
+    was_open = None
+    fails = 0
+    while datetime.now(tz) < stop:
+        s = check(url)
+        if s is None:
+            fails += 1
+            log(f"check failed ({fails})")
+        else:
+            fails = 0
+            is_open = not s["full"] and not s["closed"]
+            log(f"{s['n']}/{s['cap']} full={s['full']} closed={s['closed']}")
+            label = a.label or s["title"] or "the event"
+            if is_open and was_open is not True:
+                msg = f"🚨 spot opened: {label} is {s['n']}/{s['cap']}. register now: {url}"
+                sent = notify(a.contact, msg, a.session)
+                log(f"ALERT open {s['n']}/{s['cap']} sent={sent}")
+            elif was_open is True and not is_open:
+                sent = notify(a.contact, f"{label} filled back up ({s['n']}/{s['cap']})", a.session)
+                log(f"ALERT refilled sent={sent}")
+            was_open = is_open
+        time.sleep(a.interval)
+    log("stop (event start reached)")
+
+
+if __name__ == "__main__":
+    main()

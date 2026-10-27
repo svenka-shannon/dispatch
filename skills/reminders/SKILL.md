@@ -7,6 +7,20 @@ description: Create and manage reminders using native JSON system. Use when aske
 
 Native reminder system with local timezone support, crash safety, and automatic retry.
 
+> **Use `claude-assistant remind` — it is the live path.** It stores to
+> `~/dispatch/state/reminders.json` via `assistant/reminders.py`. No AppleScript,
+> no Apple Reminders.app, no Automation permission required. This works today.
+>
+> **`scripts/add_reminder.py` and `scripts/poll_due.py` are DEAD CODE.** They
+> drive Apple Reminders.app via `tell application "Reminders"`, nothing in the
+> daemon calls them, and they were last touched 2026-03-20. Confirmed
+> 2026-08-19: `assistant/cli.py` → `add_reminder_cli()` → JSON, never these.
+>
+> They also *hang ~25s+ and return nothing* on this machine, because
+> `python3.14` has no Automation grant for `com.apple.reminders`. Do NOT request
+> that permission to "fix" them — the capability is unused. Verify a path is
+> live before escalating a permission request for it.
+
 ## Two Modes
 
 Reminders operate in two modes:
@@ -41,6 +55,15 @@ claude-assistant remind add "Call Tokyo" --contact "John Smith" --at "9am" --tz 
 
 # With target (fg=foreground, spawn=new agent)
 claude-assistant remind add "Long analysis task" --contact "John Smith" --in 1h --target spawn
+```
+
+### Capture the ID at creation time
+
+`remind add` prints a machine-capturable `ID: <id>` line. **Capture it** if you might need to cancel later, and mention it in your notes/reply:
+
+```bash
+ID=$(claude-assistant remind add "re-check the blocked step" --contact "+1..." --in 2m | awk '/^ID:/{print $2}')
+echo "$ID"   # e.g. abc12345
 ```
 
 ### Target Types
@@ -95,7 +118,13 @@ claude-assistant remind list --contact "John Smith"
 
 # Show failed reminders only
 claude-assistant remind list --failed
+
+# Full records as JSON (id, title, next_fire, schedule, contact/event) - use this from scripts
+claude-assistant remind list --json
+claude-assistant remind list --json | jq -r '.[] | select(.title | test("walmart"; "i")) | .id'
 ```
+
+The table truncates long titles with `..` **only when printing to a terminal**; piped output shows full titles. Still, for anything scripted, use `--json`, not `grep`/`awk` over the table.
 
 Output:
 ```
@@ -112,12 +141,20 @@ ghi11111   Nightly consolidation          2026-03-04 02:00 AM EST   Event: task.
 # By ID
 claude-assistant remind cancel abc12345
 
-# By title
+# By exact full title (--force if several share that exact title)
 claude-assistant remind cancel --title "Daily standup"
+claude-assistant remind cancel --title "Daily standup" --force
 
-# Cancel all matching (if multiple)
-claude-assistant remind cancel --title "standup" --force
+# By case-insensitive substring of the FULL title - cancels ALL matches,
+# prints each cancelled "id → title", exits 1 if nothing matched
+claude-assistant remind cancel --match "walmart verification"
 ```
+
+`cancel` exits non-zero (with an error on stderr) when the id/title/match hits nothing - check the exit code and the `Cancelled: <id> → <title>` lines.
+
+**Cancelling safely (do NOT `list | grep | awk | xargs cancel`):** that pipeline has silently cancelled nothing twice (truncated titles + empty xargs input runs nothing and exits 0), letting stale reminders fire. Instead:
+1. Use the `ID:` you captured from `remind add`, or `remind cancel --match "<distinctive substring>"`.
+2. Verify it is gone before telling anyone it's cancelled: `claude-assistant remind list --json | jq -r '.[] | "\(.id) \(.title)"'`.
 
 ## Retry Failed Reminder
 

@@ -143,11 +143,26 @@ class DependencyCheck:
     recovery_window_s: int = 3600
     # Don't re-SMS every cycle while ESCALATED — re-escalate at most this often.
     reescalate_after_s: int = 4 * 3600
+    # While ESCALATED, keep trying recover() this often (None = never, the old
+    # behaviour). 2026-09-27: screen_lock's unlock failed 3x at 08:29 on a
+    # transient, the runner escalated and then never tried again — the Mac sat
+    # locked for 14h while the page said "Typing the Keychain password…".
+    retry_while_escalated_s: Optional[int] = None
 
 
 # ──────────────────────────────────────────────────────────────
 # Per-dependency runtime state
 # ──────────────────────────────────────────────────────────────
+
+def _reason_key(detail: str) -> str:
+    """Stable identity of an escalation's failure reason, for cross-incident dedupe.
+
+    Drops the parenthesised tail (subprocess output, attempt counters) and digits
+    so the same underlying ask compares equal across incidents.
+    """
+    head = detail.split(" (", 1)[0]
+    return "".join(c for c in head if not c.isdigit()).strip().lower()
+
 
 class _DepRuntime:
     def __init__(self, check: DependencyCheck):
@@ -162,6 +177,12 @@ class _DepRuntime:
         self.recovery_times: deque[float] = deque()
         # Whether the recovery-frequency alarm has already fired for the current burst.
         self.alarm_fired: bool = False
+        # Monotonic time of the last recover() attempt made while ESCALATED.
+        self.last_escalated_retry_at: float = 0.0
+        # Cross-incident dedupe: reason key + monotonic time of the last
+        # escalation that actually notified someone.
+        self.last_notified_reason: Optional[str] = None
+        self.last_notified_at: float = 0.0
 
 
 # ──────────────────────────────────────────────────────────────
@@ -359,7 +380,10 @@ class DependencyHealthRunner:
         ):
             self._transition(rt, target_down, "probe", probe.detail, probe.diagnostics)
         elif rt.state == DepState.ESCALATED:
-            # Still down after escalation — keep probing, re-escalate occasionally.
+            # Still down after escalation — keep probing, optionally keep retrying
+            # recovery (the cause is often transient), re-escalate occasionally.
+            if await self._retry_while_escalated(rt, probe):
+                return probe
             self._maybe_reescalate(rt, probe.detail, probe.diagnostics)
             return probe
         elif rt.state == DepState.RECOVERING:
@@ -491,13 +515,62 @@ class DependencyHealthRunner:
         rt.last_escalation_at = self._clock()
         if rt.state != DepState.ESCALATED:
             self._transition(rt, DepState.ESCALATED, "escalate", detail, diagnostics)
+            # The retry-while-escalated clock starts at escalation, not at 0.
+            rt.last_escalated_retry_at = self._clock()
         else:
             # Already escalated; emit a re-escalation event.
             self._emit(rt, DepState.ESCALATED.value, DepState.ESCALATED.value,
                        "escalate", f"still down — {detail}", diagnostics)
         if first_time:
-            self._fire_escalation(rt, detail, diagnostics)
+            reason = _reason_key(detail)
+            since = self._clock() - rt.last_notified_at
+            if (rt.last_notified_reason == reason and rt.last_notified_at
+                    and since < rt.check.reescalate_after_s):
+                # 2026-10-03: chrome_control flapped DOWN → ESCALATED → (self-
+                # recovers minutes later) → HEALTHY → DOWN …, and every new
+                # incident re-SMSed the identical ask (8 texts in a day). The
+                # per-incident rate limit can't see across incidents, so dedupe
+                # on the failure reason: same ask within reescalate_after_s is
+                # logged + emitted, not re-sent.
+                log.warning("DEP_HEALTH | %s | escalation suppressed — same reason notified "
+                            "%.0f min ago: %s", rt.check.name, since / 60, detail)
+                self._emit(rt, DepState.ESCALATED.value, DepState.ESCALATED.value, "none",
+                           f"escalation suppressed (duplicate within "
+                           f"{rt.check.reescalate_after_s // 3600}h) — {detail}",
+                           diagnostics, escalation_suppressed=True)
+            else:
+                rt.last_notified_reason = reason
+                rt.last_notified_at = self._clock()
+                self._fire_escalation(rt, detail, diagnostics)
         # else: rate-limited; _maybe_reescalate handles periodic re-SMS.
+
+    async def _retry_while_escalated(self, rt: _DepRuntime, probe: ProbeResult) -> bool:
+        """One recover() attempt while ESCALATED, rate-limited. True if it recovered."""
+        check = rt.check
+        if check.recover is None or not check.retry_while_escalated_s:
+            return False
+        now = self._clock()
+        if now - rt.last_escalated_retry_at < check.retry_while_escalated_s:
+            return False
+        rt.last_escalated_retry_at = now
+        try:
+            rec = await self._maybe_thread_with_timeout(check.recover, check.recover_timeout_s)
+        except asyncio.TimeoutError:
+            rec = RecoverResult.fail(f"recovery timed out after {check.recover_timeout_s}s",
+                                     recover_timed_out=True)
+        except Exception as e:  # noqa: BLE001
+            rec = RecoverResult.fail(f"recovery errored: {e}", recover_error=str(e))
+        if not rec.success:
+            log.warning("DEP_HEALTH | %s | retry while ESCALATED failed — %s", check.name, rec.detail)
+            return False
+        self._record_recovery(rt)
+        self._transition(rt, DepState.HEALTHY, "recover",
+                         f"recovered by retry while escalated — {rec.detail}",
+                         rec.diagnostics, recovered=True)
+        rt.attempt = 0
+        rt.escalated = False
+        rt.alarm_fired = False
+        return True
 
     def _maybe_reescalate(self, rt: _DepRuntime, detail: str, diagnostics: dict[str, Any]) -> None:
         now = self._clock()
@@ -566,6 +639,16 @@ class DependencyHealthRunner:
 # Default escalation: SMS the admin (NOT via a chat session)
 # ──────────────────────────────────────────────────────────────
 
+def _sms_headline(detail: str, limit: int = 280) -> str:
+    """The human-facing part of an escalation detail for a text message: everything
+    before the parenthesised diagnostic tail, cut at a word boundary if still long.
+    The complete detail stays in the manager log and the health.dependency event."""
+    head = detail.split(" (", 1)[0].strip()
+    if len(head) <= limit:
+        return head
+    return head[:limit].rsplit(" ", 1)[0] + " …"
+
+
 def make_sms_escalator(send_sms: Callable[[str, str], Any],
                        admin_phone: Optional[str]) -> EscalateFn:
     """Build the default escalation callback: shell out to send-sms to the admin.
@@ -582,18 +665,16 @@ def make_sms_escalator(send_sms: Callable[[str, str], Any],
             log.error("DEP_HEALTH | %s | ESCALATED (%s) but no admin phone configured: %s",
                       name, state, detail)
             return
-        # Build a structured, *specific* message — concrete ask, not "X is broken".
-        # The detail already carries the specifics (per-check escalate callbacks
-        # craft the precise fix; this default wraps it).
-        body = f"[SVEN] 🚨 dependency '{name}' {state}\n{detail}"
-        # Append the most useful diagnostics if present and not already in detail.
-        extras = []
-        for k in ("probe_rc", "probe_output", "recover_rc", "recover_output", "disable_reason"):
-            v = diagnostics.get(k)
-            if v not in (None, ""):
-                extras.append(f"{k}={v}")
-        if extras:
-            body += "\n" + " | ".join(extras)
+        # One short, specific line — the concrete ask, not a diagnostic dump.
+        # 2026-10-03: this used to append the full detail + probe/recover output
+        # (~2000 chars of chrome-heal prefs JSON) to every text; the owner called
+        # it "an insane amount of slop". The detail's parenthesised tail and the
+        # diagnostics are for humans debugging, and they already live in the
+        # manager log + the health.dependency bus event.
+        what = ("is down and auto-fix failed" if state in ("ESCALATED", "DOWN")
+                else f"needs attention ({state.lower()})")
+        body = (f"[SVEN] {name} {what}: {_sms_headline(detail)}\n"
+                f"details: claude-assistant health-history --dep {name}")
         try:
             send_sms(admin_phone, body)
         except Exception as e:  # noqa: BLE001

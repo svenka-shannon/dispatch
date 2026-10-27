@@ -118,7 +118,14 @@ class Bus:
             from alembic.config import Config
             from alembic import command
             from sqlalchemy import create_engine
+        except ImportError as e:
+            # Standalone `uv run --script` CLIs (email-producer, fact, ...)
+            # open the bus without alembic installed. The daemon runs in the
+            # project venv and applies migrations at startup, so just skip.
+            logger.debug(f"Skipping bus migrations (alembic unavailable: {e})")
+            return
 
+        try:
             alembic_cfg = Config(str(Path(__file__).parent / "alembic.ini"))
             engine = create_engine(
                 f"sqlite:///{self.db_path}",
@@ -757,7 +764,8 @@ class Bus:
 
     def fts_rebuild(self):
         """Drop and recreate FTS indexes from scratch.
-        Uses the same logic as migration 002 for table creation + backfill.
+        Uses the same logic as migration 002 for table creation + backfill,
+        then re-applies migration 004's fast-prune triggers.
 
         IMPORTANT: Must be run with daemon stopped, or acquires exclusive lock
         to prevent concurrent writes from creating duplicates during backfill.
@@ -776,6 +784,10 @@ class Bus:
 
         # Recreate tables and triggers (uses executescript which auto-commits)
         migration_002._create_fts_tables_and_triggers(self._conn)
+        # Re-apply 004's fast-prune triggers, otherwise the slow full-scan
+        # delete triggers from 002 come back (70-150s prune lock holds).
+        migration_004 = importlib.import_module("bus.migrations.versions.004_fast_fts_prune")
+        migration_004._apply_fast_prune_triggers(self._conn)
 
         # Backfill within an exclusive transaction to prevent concurrent writes
         # from creating duplicates during the backfill window.

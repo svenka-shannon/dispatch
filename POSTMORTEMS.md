@@ -753,6 +753,14 @@ It is also chronically firing — `tickle_escalated` has fired 72–88 times per
 for the past week, so its escalation condition is permanently true and it no
 longer functions as an escalation.
 
+**Retired 2026-10-26.** The escalated tickle (`_imessage_tickle_escalated`) is
+removed. Its `launchctl kickstart` was always blocked by SIP (rc=150), and in 8
+days of bus data only 2 of 670 firings were followed by a `message.received`
+within 30s, which is chance level. App Nap is now covered by the
+`imessage_app_nap` dependency check plus the light 30s tickle. The
+`imessage.tickle_escalated` event is no longer emitted, so the query below only
+returns historical rows.
+
 ### Verification Queries
 
 Staleness spikes over 60s in the daemon log:

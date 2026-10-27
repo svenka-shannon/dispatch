@@ -118,7 +118,10 @@ def _create_fts_tables_and_triggers(connection):
 def _backfill_fts(connection):
     """Backfill FTS tables from existing data. Shared by migration and fts-rebuild.
     IMPORTANT: Hot tables are backfilled BEFORE archive tables to ensure hot entries
-    get lower rowids. This guarantees MIN(rowid) DELETE triggers work correctly."""
+    get lower rowids. This guarantees MIN(rowid) DELETE triggers work correctly.
+    Since 004 the archive copy keeps the hot row's FTS entry (no archive insert
+    trigger, guarded hot delete), so MIN(rowid) only matters for non-archived
+    deletes (delete_topic, archive=0 topics)."""
     text_expr = payload_text_sql("payload", "type")
     sdk_text = sdk_payload_text_sql("payload")
 

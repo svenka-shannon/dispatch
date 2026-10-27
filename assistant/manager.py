@@ -3802,74 +3802,6 @@ class Manager:
         except Exception as e:
             log.warning(f"IMESSAGE_TICKLE | failed: {e}")
 
-    async def _imessage_tickle_escalated(self):
-        """Heavy tickle used when the light osascript ping isn't waking the stack.
-
-        Observed 2026-07-31: inbound iMessage arrived via push, but the chat.db
-        write was deferred ~8 minutes because IMDPersistenceAgent had App-Napped
-        after Messages.app sat idle for 17h. The 30s `count of chats` tickle
-        wasn't enough to wake it. This escalation kickstarts imagent (which owns
-        the persistence path) and brings Messages.app to the foreground briefly
-        so IMDPersistenceAgent flushes its queue.
-
-        Gated by `_last_escalated_tickle_ts` in the caller — do NOT loop-kick.
-        """
-        uid = os.getuid()
-        # 1) Kickstart imagent — the daemon that ferries messages to chat.db.
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "launchctl", "kickstart", "-k", f"gui/{uid}/com.apple.imagent",
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await asyncio.wait_for(proc.wait(), timeout=10)
-            # 2026-09-21: this used to log "OK" unconditionally without ever
-            # looking at returncode. It has NEVER worked on this machine:
-            # `launchctl kickstart -k gui/501/com.apple.imagent` returns
-            # **150: "Operation not permitted while System Integrity Protection
-            # is engaged"**. SIP is on by default, so this escalation is a
-            # guaranteed no-op on any normally-configured Mac. It ran 549 times
-            # and reported success 549 times while imagent sat at 52 days
-            # uptime, which is why nobody noticed the inbound-detection stalls.
-            # Real mitigation is disabling App Nap on Messages:
-            #     defaults write com.apple.Messages NSAppSleepDisabled -bool YES
-            # (applied 2026-09-21). Keep the kickstart attempt — it is harmless
-            # and would work if SIP were ever disabled — but tell the truth.
-            if proc.returncode == 0:
-                log.warning("IMESSAGE_TICKLE_ESCALATED | launchctl kickstart imagent OK")
-            elif proc.returncode == 150:
-                log.warning(
-                    "IMESSAGE_TICKLE_ESCALATED | kickstart imagent BLOCKED BY SIP "
-                    "(rc=150) — this escalation cannot work while SIP is engaged; "
-                    "relying on the App Nap defaults + foreground tickle instead"
-                )
-            else:
-                log.warning(
-                    f"IMESSAGE_TICKLE_ESCALATED | kickstart imagent FAILED "
-                    f"rc={proc.returncode}"
-                )
-        except asyncio.TimeoutError:
-            log.warning("IMESSAGE_TICKLE_ESCALATED | launchctl kickstart imagent timed out")
-        except Exception as e:
-            log.warning(f"IMESSAGE_TICKLE_ESCALATED | launchctl kickstart failed: {e}")
-
-        # 2) Briefly foreground Messages.app so it services its RunLoop.
-        #    `open -a` won't steal focus persistently — user can immediately
-        #    switch back. This is the strongest signal to macOS that the app
-        #    should exit App Nap.
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "open", "-a", "Messages",
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await asyncio.wait_for(proc.wait(), timeout=5)
-            log.warning("IMESSAGE_TICKLE_ESCALATED | open -a Messages OK")
-        except asyncio.TimeoutError:
-            log.warning("IMESSAGE_TICKLE_ESCALATED | open -a Messages timed out")
-        except Exception as e:
-            log.warning(f"IMESSAGE_TICKLE_ESCALATED | open failed: {e}")
-
     def _chatdb_last_in_out(self) -> tuple[float | None, float | None]:
         """(last inbound, last outbound) message times from chat.db, unix seconds.
 
@@ -6405,33 +6337,12 @@ You have 15 minutes. Work efficiently.
         # First tickle fires ~5s after start so any backlog flushes early.
         last_imessage_tickle = time.time() - 25
         IMESSAGE_TICKLE_INTERVAL = 30
-
-        # Escalated tickle: when the 30s light tickle isn't enough to wake
-        # IMDPersistenceAgent (observed 2026-07-31 — 8min chat.db write delay
-        # after Messages.app sat idle for 17h), fire launchctl kickstart +
-        # brief foreground of Messages.app. Only trigger when BOTH:
-        #   - last_rowid hasn't advanced for >5min (chat.db appears frozen)
-        #   - Messages.app has been idle >1hr (no inbound activity)
-        # Debounced so we don't loop-kick every poll iteration.
-        _now_init = time.time()
-        last_rowid_change_ts = _now_init
-        last_rowid_snapshot = self.last_rowid
-        last_inbound_activity_ts = _now_init
-        last_escalated_tickle_ts = 0.0  # never fired yet
-        STALE_CHATDB_THRESHOLD = 300      # 5 min without a new rowid
-        # 2026-09-21: was 3600 (1 hr). Measured inbound-detection lag on this
-        # box: median 0.2s but p90 431s, max 1244s, and on quiet days 92-98% of
-        # the user's worst reply times were PURELY this deferral. Deferrals were
-        # observed after idles far shorter than an hour (a >6h gap averaged 433s
-        # lag, but short gaps still stalled ~34s), so a 1-hour gate missed most
-        # of them -- 14 of 23 high-lag messages had no tickle at all during
-        # their stall. Note the escalation's step 1 (launchctl kickstart imagent)
-        # is a guaranteed no-op under SIP (rc=150); step 2 (`open -a Messages`)
-        # is the part that actually works, so it needs to fire when it matters.
-        # Still AND-ed with chatdb_stale > 300s and debounced 900s, so this only
-        # fires during a genuine stall and at most once per 15 min.
-        MESSAGES_IDLE_THRESHOLD = 600     # 10 min with no inbound
-        ESCALATED_TICKLE_DEBOUNCE = 900   # don't re-escalate for 15 min
+        # (2026-10-26: the "escalated tickle" — launchctl kickstart imagent +
+        # `open -a Messages` — was removed. The kickstart is SIP-blocked
+        # (rc=150) and in 8 days of bus data only 2 of 670 firings were
+        # followed by a message.received within 30s, i.e. chance level. App
+        # Nap is handled by the imessage_app_nap dependency check, which keeps
+        # NSAppSleepDisabled set, plus this light tickle.)
 
         # Wi-Fi bounce when inbound is probably stuck at Apple (dead apsd socket).
         # Self-gated (see _aps_bounce_if_stalled); this only paces the check.
@@ -6593,55 +6504,13 @@ You have 15 minutes. Work efficiently.
                     await self.reminders.process_due_reminders()
                     last_reminder_check = time.time()
 
-                # Track inbound activity + rowid movement for the escalated
-                # tickle heuristic. If either messages OR reactions arrived, or
-                # last_rowid advanced (e.g. from _save_state above), refresh
-                # both trackers.
                 _now_tick = time.time()
-                if messages or reactions:
-                    last_inbound_activity_ts = _now_tick
-                if self.last_rowid != last_rowid_snapshot:
-                    last_rowid_snapshot = self.last_rowid
-                    last_rowid_change_ts = _now_tick
 
                 # Periodic Messages.app tickle (fire-and-forget) — keeps
                 # IMDPersistenceAgent flushing chat.db despite App Nap.
                 if _now_tick - last_imessage_tickle > IMESSAGE_TICKLE_INTERVAL:
                     asyncio.create_task(self._imessage_tickle(), name="imessage-tickle")
                     last_imessage_tickle = _now_tick
-
-                # Escalated tickle: only when chat.db appears frozen AND
-                # Messages.app has been idle long enough that App Nap likely
-                # kicked in. Debounced so a single stale window fires once.
-                chatdb_stale_s = _now_tick - last_rowid_change_ts
-                messages_idle_s = _now_tick - last_inbound_activity_ts
-                since_last_escalation = _now_tick - last_escalated_tickle_ts
-                if (chatdb_stale_s > STALE_CHATDB_THRESHOLD
-                        and messages_idle_s > MESSAGES_IDLE_THRESHOLD
-                        and since_last_escalation > ESCALATED_TICKLE_DEBOUNCE):
-                    log.warning(
-                        f"IMESSAGE_TICKLE_ESCALATED | firing | "
-                        f"chatdb_stale={chatdb_stale_s:.0f}s "
-                        f"messages_idle={messages_idle_s:.0f}s "
-                        f"last_rowid={self.last_rowid}"
-                    )
-                    try:
-                        produce_event(
-                            self._producer, "system", "imessage.tickle_escalated",
-                            {
-                                "chatdb_stale_seconds": round(chatdb_stale_s, 1),
-                                "messages_idle_seconds": round(messages_idle_s, 1),
-                                "last_rowid": self.last_rowid,
-                            },
-                            source="daemon",
-                        )
-                    except Exception as e:
-                        log.debug(f"IMESSAGE_TICKLE_ESCALATED | bus produce failed: {e}")
-                    asyncio.create_task(
-                        self._imessage_tickle_escalated(),
-                        name="imessage-tickle-escalated",
-                    )
-                    last_escalated_tickle_ts = _now_tick
 
                 if (_now_tick - last_aps_bounce_check > APS_BOUNCE_CHECK_INTERVAL
                         and (aps_bounce_task is None or aps_bounce_task.done())):

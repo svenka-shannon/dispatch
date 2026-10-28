@@ -3,6 +3,9 @@ name: nano-banana
 description: Generate and edit images using Google Gemini. Use when asked to create, generate, edit, or modify any image, artwork, photo, or visual content.
 ---
 
+> **Not for engineering/hardware renders.** For a 3D view of a real part or device, use the `cad` skill (real geometry).
+
+
 # Nano Banana Pro Image Generation
 
 Generate images from text prompts or edit existing images using Google's Nano Banana Pro model (Gemini 3 Pro Image).

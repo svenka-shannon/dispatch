@@ -7,6 +7,8 @@ description: Spotify integration - auth, playlists, track metadata, song recomme
 
 Spotify integration for the dj-buyer pipeline and general music discovery/recommendation.
 
+> ⚠️ **Check first:** `~/code/dj-buyer` (which holds the token DB and the client secret) is not present on every machine. If `ls ~/code/dj-buyer` fails, the Spotify API is unavailable here. Answer from web search or general knowledge, say that the Spotify results are unverified, and do not try the re-auth flow.
+
 **Credentials**: Stored in `~/code/dj-buyer/state.db` (table: `spotify_auth`)
 **Client ID**: `43d9bf46f34d48bb80cc23803c8db2a8`
 **Account**: see Contacts.app for owner details

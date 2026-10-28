@@ -3,6 +3,9 @@ name: midjourney
 description: Generate images with Midjourney via scrapling API requests. Trigger words - midjourney, imagine, generate image, ai art.
 ---
 
+> **Not for engineering/hardware renders.** For a 3D view of a real part or device, use the `cad` skill (real geometry).
+
+
 # Midjourney Image Generation
 
 Generate images using Midjourney's API via scrapling (no browser automation for generation).

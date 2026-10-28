@@ -114,3 +114,24 @@ Looks up movie or TV show information using the imdb-lookup skill CLI.
 - Uses `--format discord` for markdown-formatted output suitable for Discord channels
 - Card output includes: title, year, rating, runtime, genres, and IMDb link
 - Powered by the TMDB API via the imdb-lookup CLI (no web scraping)
+
+## Project server mode (one channel = one project session)
+
+```yaml
+discord:
+  guild_ids: ["<guild id>"]              # accept EVERY channel in this server (no per-channel config/restart)
+  respond_all_guild_ids: ["<guild id>"]  # no @mention needed in this server
+  users:
+    "<discord user id>": {name: "...", tier: "admin"}
+```
+New channels in a `guild_ids` server work immediately. Each one gets its own session at `~/transcripts/discord/{channel_id}/`. The bot role has Administrator, so you can create channels via REST: `POST /guilds/{id}/channels {"name":..., "type":0}`.
+
+**Finding a user's Discord ID:** have them post once. The listener logs `[discord] Unmapped user: <name> (<id>)`. Add that ID to `discord.users`. Config is read at startup, so a detached daemon restart is needed after editing it.
+
+**Setup gotchas:**
+- The developer portal's "Create app" and the bot OAuth "Authorize" step both show an hCaptcha, so a human has to tick it.
+- "Reset Token" asks for the account password (Keychain `discord-account`, typed with `chrome os-type --secret-service`).
+- Store the token without echoing it: `printf 'add-generic-password -U -a sven -s discord_bot_token -w %s\n' "$TOK" | security -i`.
+- Turn on the Message Content intent and save it **on its own**. Unticking "Public Bot" in the same save fails validation ("Private application cannot have a default authorization link"), and the whole save is dropped.
+- The OAuth authorize flow can silently drop Manage Channels from the requested permissions. Check `GET /guilds/{id}/roles` afterwards.
+- `GID` is a read-only zsh variable, so don't use it as a shell variable name.

@@ -156,6 +156,11 @@ to the user instead of inventing a price.
 2. **Price guardrail**: STOP and confirm if total > $50
 3. **Clear cart first** before every purchase to prevent cart contamination
 4. **Dry-run by default**: Show what would be purchased, then ask to proceed
+5. **Approval only covers the quoted estimate.** STOP before "Place your order" and get a fresh yes if either:
+   - the final cart total (incl. tax/shipping) is more than 15% over the last figure the user approved (the top of a quoted range), or
+   - any line item differs from what was approved (different ASIN/model/brand, an added item, a qty change).
+   Report the approved total vs the actual total, a per-item diff, and the reason for each substitution. This applies to every ordering subagent too. Do not retry or route around a checkout blocker.
+6. **Don't buy hardware for an unvalidated design.** Ask first, or order only the parts needed to validate the design.
 
 ### Pre-flight
 
@@ -232,7 +237,7 @@ chrome text <tab>  # Check: shipping address, payment method, order total
 
 Verify:
 - Right product and quantity
-- Reasonable price (< $50 guardrail)
+- Within the approved estimate (+15%) and no substitutions (Safety Rule 5)
 - Correct shipping address
 - Correct payment method
 

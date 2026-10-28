@@ -1,6 +1,6 @@
 ---
 name: cad
-description: Generate 3D CAD models programmatically using CadQuery. Create parametric parts, export STL/STEP, render previews. Trigger words - cad, 3d model, parametric, stl, step, bracket, enclosure, part.
+description: Generate 3D CAD models programmatically using CadQuery. Create parametric parts, export STL/STEP, render previews. Trigger words - cad, 3d model, parametric, stl, step, bracket, enclosure, part, openscad, scad.
 ---
 
 # CAD Skill
@@ -93,6 +93,31 @@ Uses Blender Cycles with:
 - 64 samples for quick preview
 - Blue metallic material
 - Dark background
+
+## Rule: a 3D rendering of a hardware design is real geometry
+When asked to "render" or "show in 3D" a part or device, build the model first (CadQuery or OpenSCAD) and render that geometry
+(`cad-render`, or an OpenSCAD PNG). **Never use Midjourney or nano-banana for engineering/hardware renders.** They invent
+geometry that doesn't match the design.
+
+## OpenSCAD (.scad files)
+Keep the `.scad` file as the source of truth. CadQuery can't import it.
+
+Install: the Homebrew cask is **disabled** (it fails Gatekeeper), so install from the DMG and keep a permanent copy.
+Don't run the binary from a mounted DMG, because it's gone once the DMG is unmounted:
+```bash
+# download the macOS DMG from https://openscad.org/downloads.html, then:
+hdiutil attach ~/Downloads/OpenSCAD-*.dmg
+cp -R /Volumes/OpenSCAD/OpenSCAD.app /Applications/
+xattr -dr com.apple.quarantine /Applications/OpenSCAD.app
+hdiutil detach /Volumes/OpenSCAD
+```
+Headless use:
+```bash
+OSC=/Applications/OpenSCAD.app/Contents/MacOS/OpenSCAD
+$OSC -o part.stl part.scad
+$OSC -o part.png --autocenter --viewall --imgsize=1600,1200 part.scad   # add --camera=... for a specific view
+~/.claude/skills/cad/scripts/cad-render part.stl                         # nicer Blender render from the STL
+```
 
 ## Limitations
 

@@ -54,6 +54,7 @@ security find-generic-password -a "sven" -s "privacy-card-cvv" -w
 1. **Always confirm with admin** before making any purchase
 2. Check the card's spending limit in Privacy.com if needed
 3. Verify the merchant is legitimate
+4. **Approval only covers what was quoted:** if the final total is >15% over the approved figure, or any item was substituted/added/changed, stop before paying and get a fresh yes (see amazon skill Safety Rule 5)
 
 ### Making a Purchase
 

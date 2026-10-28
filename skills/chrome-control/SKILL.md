@@ -319,6 +319,12 @@ chrome screenshot <tab_id> --timeout 20
 chrome shot-purge --since 10m [--dry-run]
 ```
 
+#### WebGL / canvas pages
+`chrome screenshot` returns a **black** image for WebGL canvases (Three.js, 3D viewers). Never judge a render from it.
+Capture the real screen instead: `chrome focus <tab> && sleep 1 && screencapture -x /tmp/shot.png`. Chrome must be
+frontmost and the screen unlocked; add `-R x,y,w,h` to crop. Check that something is rendering via `chrome js`
+(e.g. `renderer.info.render.calls`), and reject any uniform/black frame as a failed capture, not a "pass".
+
 ### JavaScript
 
 ```bash
@@ -327,6 +333,15 @@ chrome js <tab_id> <code>
 chrome js 123456 "document.title"
 chrome js 123456 "document.querySelector('button').click()"
 ```
+
+#### `js` vs `djs`
+| | `chrome js` | `chrome djs` |
+|---|---|---|
+| World | MAIN (sees page globals like `THREE`, app state) | ISOLATED (DOM only, no page globals) |
+| Code shape | an expression, with no `return` (wrap multi-statement code in an IIFE) | a function body, so `return` is required |
+| Strict CSP pages | blocked ("unsafe-eval"), may hang/time out | works |
+
+Errors: `Illegal return statement` means you used `return` in `js`. `THREE is not defined` means you used `djs` for page globals; use `js` for those.
 
 ### Debugging
 
@@ -777,6 +792,7 @@ Prefer `--into` (selector-based `type`). Plain `insert_text` at focus can silent
 `chrome js` fails on these pages with "violates Content Security Policy ... 'unsafe-eval'". Use
 `chrome djs <tab> "<function body with return>"` instead. It runs in an isolated world through the CDP debugger,
 and it can read the DOM, get element coordinates for `click-at`, and `.click()` buttons.
+It **can't see page globals** (isolated world); use `chrome js` for those (see "`js` vs `djs`").
 On those pages `chrome type <tab> '#id' text` prints "Element not found" but still types into the focused field.
 Check with `djs` (`return document.querySelector('#id').value`). `insert-text` silently types nothing there.
 

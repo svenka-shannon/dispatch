@@ -98,11 +98,13 @@ if [[ -n "$SESSION_NAME" ]]; then
   # Build skill read hint for sms backends
   SKILL_HINT=""
   if [[ "$SOURCE" == "imessage" || "$SOURCE" == "signal" ]]; then
-    SKILL_HINT="Re-read ~/.claude/skills/sms-assistant/${SOURCE}.md for backend-specific rules (tapback, reply commands, etc.)."$'\n'
+    SKILL_HINT="Re-read ~/.claude/skills/sms-assistant/${SOURCE}.md for backend-specific rules (tapback, reply commands, etc.). "
   fi
 
+  # Keep the signed override body ONE plain paragraph. A "**Important:** ..." line inside
+  # the body looks like the wrapper footer, so sessions left it out of --payload-file,
+  # verification failed, and the session reported a "fake admin override" (2026-11-01).
   "$HOME_DIR/dispatch/bin/claude-assistant" inject-prompt "$SESSION_NAME" --admin \
-    "Context was just compacted. If you were mid-task, continue where you left off. If you owe the user a reply, send it now.
-${SKILL_HINT}**Important:** You are in a text message session. Communicate back with: $REPLY_CMD" \
+    "Context was just compacted. If you were mid-task, continue where you left off. If you owe the user a reply, send it now. ${SKILL_HINT}Reply with: $REPLY_CMD" \
     2>/dev/null &
 fi

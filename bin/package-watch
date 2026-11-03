@@ -21,6 +21,7 @@ State:  ~/dispatch/state/package-watch.state.json   {tracking: last_event}
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -131,6 +132,95 @@ def _parse_eta(eta: str):
     return None
 
 
+CHROME = HOME / ".claude/skills/chrome-control/scripts/chrome"
+AMAZON_ORDER_RE = re.compile(r"\b(\d{3}-\d{7}-\d{7})\b")
+# Shipment-status lines worth reporting; everything else on the card is noise
+# ("Your package was left near the front door", product titles, buttons).
+AMAZON_STATUS_RE = re.compile(
+    r"^(Arriving|Delivered|Shipped|Out for delivery|Now (arriving|expected)|"
+    r"Delayed|Running late|Undeliverable|Return|Refund|Cancel|Delivery attempted|"
+    r"Not yet shipped|Preparing for shipment)", re.I)
+_AMAZON_JS = (
+    "JSON.stringify([...document.querySelectorAll('.order-card, .js-order-card')]"
+    ".map(c=>({id:(c.innerText.match(/\\d{3}-\\d{7}-\\d{7}/)||[''])[0],"
+    "st:[...c.querySelectorAll('.delivery-box__primary-text, "
+    ".yohtmlc-shipment-status-primaryText, [class*=shipment-status]')]"
+    ".map(e=>e.innerText.trim()).filter(Boolean)})))"
+)
+
+
+def amazon_statuses() -> dict[str, list[str]]:
+    """Per-order shipment statuses from the logged-in Amazon orders page.
+
+    2026-11-03, Eric: "Why did the tracker say no tracking number then". Amazon
+    orders ship via Amazon Logistics and never get a carrier number we can feed
+    to `track`, so every Amazon entry sat in the awaiting-shipment branch and
+    the digest said "no tracking number known" the morning after the parts
+    were delivered. Amazon's own order page is the source of truth: read it.
+
+    Returns {order_id: [unique status lines]} or {} on any failure (the caller
+    falls back to the old aging line, so a Chrome hiccup can't mute the digest).
+    """
+    tab = None
+    try:
+        p = subprocess.run([str(CHROME), "open", "https://www.amazon.com/your-orders/orders"],
+                           capture_output=True, text=True, timeout=60)
+        m = re.search(r"\d{6,}", p.stdout or "")
+        if not m:
+            log(f"amazon: could not open orders tab: {(p.stdout + p.stderr).strip()}")
+            return {}
+        tab = m.group(0)
+        cards = []
+        for _ in range(4):  # page renders async; poll instead of one fixed sleep
+            time.sleep(4)
+            p = subprocess.run([str(CHROME), "js", tab, _AMAZON_JS],
+                               capture_output=True, text=True, timeout=60)
+            out = (p.stdout or "").strip()
+            try:
+                cards = json.loads(out[out.index("["):out.rindex("]") + 1])
+            except ValueError:
+                cards = []
+            if cards:
+                break
+        if not cards:
+            log("amazon: no order cards found (signed out, bot check, or layout change)")
+            return {}
+        result: dict[str, list[str]] = {}
+        for c in cards:
+            seen: list[str] = []
+            for s in c.get("st", []):
+                s = s.split("\n")[0].strip()
+                if AMAZON_STATUS_RE.match(s) and s not in seen:
+                    seen.append(s)
+            if c.get("id"):
+                result[c["id"]] = seen
+        return result
+    except Exception as e:
+        log(f"amazon: status read failed: {e}")
+        return {}
+    finally:
+        if tab:
+            subprocess.run([str(CHROME), "close", tab], capture_output=True, timeout=30)
+
+
+def _amazon_delivered_date(status: str):
+    """'Delivered November 2' / 'Delivered today' / 'Delivered yesterday' -> date."""
+    rest = status[len("Delivered"):].strip().lower()
+    today = date.today()
+    if rest.startswith("today"):
+        return today
+    if rest.startswith("yesterday"):
+        return date.fromordinal(today.toordinal() - 1)
+    for fmt in ("%B %d %Y", "%b %d %Y"):
+        try:
+            d = datetime.strptime(f"{rest.split(',')[0].title()} {today.year}", fmt).date()
+            # "Delivered December 30" read on Jan 2 belongs to last year
+            return d.replace(year=today.year - 1) if d > today else d
+        except ValueError:
+            continue
+    return None
+
+
 def main() -> int:
     if not CONFIG.exists():
         log(f"no config at {CONFIG}")
@@ -148,9 +238,42 @@ def main() -> int:
     # days while a later order shipped and nobody noticed. Age them instead, and
     # speak up once they cross their threshold.
     pending = [w for w in watches if not w.get("tracking")]
+    amazon = {}
+    if any(AMAZON_ORDER_RE.search(w.get("order", "")) and "amazon" in w.get("order", "").lower()
+           for w in pending):
+        amazon = amazon_statuses()
+        log(f"amazon: read {len(amazon)} order card(s)")
+    retire_orders: set[str] = set()
+    delivered_orders_now: list[str] = []
     for w in pending:
         label = w.get("label", w.get("order", "?"))
         contact = w.get("contact") or _owner_phone()
+
+        # Amazon order with a live status from the orders page: report that,
+        # not the "no tracking number" aging line.
+        m = AMAZON_ORDER_RE.search(w.get("order", ""))
+        sts = amazon.get(m.group(1)) if m else None
+        if sts:
+            oid = m.group(1)
+            log(f"{label}: amazon statuses {sts}")
+            if all(s.lower().startswith("delivered") for s in sts):
+                dates = [d for d in (_amazon_delivered_date(s) for s in sts) if d]
+                last = max(dates) if dates else None
+                if state.get(f"{oid}:delivered_reported") or (last and last < date.today()):
+                    log(f"{label}: fully delivered {last} — already news, retiring")
+                    retire_orders.add(w.get("order"))
+                    continue
+                digest_lines.append(f"· {label} — DELIVERED ({sts[-1][len('Delivered'):].strip()})")
+                delivered_orders_now.append(oid)
+                continue
+            # Partial / in transit: list each shipment status once. Already-delivered
+            # shipments are yesterday's news; mention them only as a count.
+            open_ = [s for s in sts if not s.lower().startswith("delivered")]
+            done = len(sts) - len(open_)
+            extra = f" (+{done} shipment{'s' if done > 1 else ''} already delivered)" if done else ""
+            digest_lines.append(f"· {label} — {'; '.join(open_)}{extra}")
+            continue
+
         try:
             ordered = datetime.strptime(w["ordered"], "%Y-%m-%d").date()
         except Exception:
@@ -248,10 +371,13 @@ def main() -> int:
         win = r.get("delivery_window")
         digest_lines.append(f"· {label} — {when}" + (f", {win.lower()}" if win else ""))
 
-    if retire:
-        kept = [w for w in watches if w.get("tracking") not in retire]
+    if retire or retire_orders:
+        kept = [w for w in watches
+                if not (w.get("tracking") and w["tracking"] in retire)
+                and not (not w.get("tracking") and w.get("order") in retire_orders)]
         CONFIG.write_text(json.dumps(kept, indent=2) + "\n")
-        log(f"retired {len(retire)} delivered entr(ies) from config: {sorted(retire)}")
+        log(f"retired {len(watches) - len(kept)} delivered entr(ies) from config: "
+            f"{sorted(retire | retire_orders)}")
 
     # ── DAILY DIGEST ──────────────────────────────────────────────────
     # 2026-09-24, Eric: "I don't need a text every milestone, just a daily or
@@ -286,7 +412,7 @@ def main() -> int:
     header = "📦 package tracker"
     if notify(contact, header + "\n" + "\n".join(digest_lines)):
         state["_last_digest_date"] = today
-        for n in delivered_now:
+        for n in delivered_now + delivered_orders_now:
             state[f"{n}:delivered_reported"] = today
     STATE.write_text(json.dumps(state, indent=2))
     return 0

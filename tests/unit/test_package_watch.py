@@ -382,3 +382,51 @@ def test_delivered_yesterday_with_only_delivered_at_is_retired(tmp_path, monkeyp
     pw.main()
     assert sent == []
     assert _j.loads(pw.CONFIG.read_text()) == []
+
+
+class TestAmazonOrders:
+    """2026-11-03: Amazon orders never get a carrier number, so the digest said
+    "no tracking number known" the morning after the parts were delivered."""
+
+    def test_delivered_date_parsing(self):
+        today = date.today()
+        assert pw._amazon_delivered_date("Delivered today") == today
+        assert pw._amazon_delivered_date("Delivered yesterday") == today - timedelta(days=1)
+        d = today - timedelta(days=3)
+        assert pw._amazon_delivered_date(f"Delivered {d:%B} {d.day}") == d
+
+    def test_amazon_status_replaces_no_tracking_line(self, tmp_path, monkeypatch):
+        cfg = [{"order": "Amazon #114-0000000-0000001", "label": "parts",
+                "ordered": str(date.today()), "contact": "+10000000000"}]
+        monkeypatch.setattr(pw, "CONFIG", tmp_path / "c.json")
+        monkeypatch.setattr(pw, "STATE", tmp_path / "s.json")
+        monkeypatch.setattr(pw, "LOG", tmp_path / "log")
+        pw.CONFIG.write_text(json.dumps(cfg))
+        monkeypatch.setattr(pw, "amazon_statuses", lambda: {
+            "114-0000000-0000001": ["Arriving Thursday", "Delivered November 2"]})
+        monkeypatch.setattr(pw, "recently_spoke", lambda c: False)
+        monkeypatch.setattr(pw, "DIGEST_HOUR", 0)
+        sent = []
+        monkeypatch.setattr(pw, "notify", lambda c, t: sent.append(t) or True)
+        pw.main()
+        assert sent and "Arriving Thursday" in sent[0]
+        assert "1 shipment already delivered" in sent[0]
+        assert "no tracking number" not in sent[0]
+
+    def test_fully_delivered_in_past_is_retired_silently(self, tmp_path, monkeypatch):
+        old = date.today() - timedelta(days=2)
+        cfg = [{"order": "Amazon #114-0000000-0000002", "label": "bags",
+                "ordered": str(old), "contact": "+10000000000"}]
+        monkeypatch.setattr(pw, "CONFIG", tmp_path / "c.json")
+        monkeypatch.setattr(pw, "STATE", tmp_path / "s.json")
+        monkeypatch.setattr(pw, "LOG", tmp_path / "log")
+        pw.CONFIG.write_text(json.dumps(cfg))
+        monkeypatch.setattr(pw, "amazon_statuses", lambda: {
+            "114-0000000-0000002": [f"Delivered {old:%B} {old.day}"]})
+        monkeypatch.setattr(pw, "recently_spoke", lambda c: False)
+        monkeypatch.setattr(pw, "DIGEST_HOUR", 0)
+        sent = []
+        monkeypatch.setattr(pw, "notify", lambda c, t: sent.append(t) or True)
+        pw.main()
+        assert sent == []
+        assert json.loads(pw.CONFIG.read_text()) == []

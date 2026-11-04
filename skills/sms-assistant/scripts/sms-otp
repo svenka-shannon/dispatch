@@ -1,0 +1,70 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# ///
+"""sms-otp — wait for a verification code texted to the assistant's own phone.
+
+The assistant has its own number (`identity assistant.phone`, the tethered
+iPhone line). SMS to it are forwarded into ~/Library/Messages/chat.db with
+service = 'SMS'. Use that number for sign-ups instead of the owner's, then:
+
+    START=$(date +%s)          # record the time BEFORE you click "send code"
+    <click send code / sign up>
+    sms-otp --since $START --match DoorDash
+
+Prints just the code on stdout (exit 0), or exits 1 on timeout.
+"""
+import argparse
+import re
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+DB = Path.home() / "Library/Messages/chat.db"
+APPLE_EPOCH = 978307200
+
+
+def find(since: float, match: str | None) -> str | None:
+    con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=5)
+    try:
+        rows = con.execute(
+            """SELECT text FROM message
+               WHERE is_from_me = 0 AND service = 'SMS' AND text IS NOT NULL
+                 AND date/1000000000 + ? >= ?
+               ORDER BY date DESC LIMIT 20""",
+            (APPLE_EPOCH, since),
+        ).fetchall()
+    finally:
+        con.close()
+    for (text,) in rows:
+        if match and match.lower() not in text.lower():
+            continue
+        m = re.search(r"(?<!\d)(\d{4,8})(?!\d)", text)
+        if m:
+            return m.group(1)
+    return None
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--since", type=float, required=True,
+                    help="unix time; only SMS received at/after this (minus 30s slack) count")
+    ap.add_argument("--match", help="case-insensitive substring the SMS must contain (e.g. sender brand)")
+    ap.add_argument("--timeout", type=int, default=90, help="seconds to wait (default 90)")
+    a = ap.parse_args()
+    deadline = time.time() + a.timeout
+    while True:
+        code = find(a.since - 30, a.match)
+        if code:
+            print(code)
+            return 0
+        if time.time() >= deadline:
+            print(f"sms-otp: no code within {a.timeout}s. If SMS forwarding to this Mac broke, "
+                  "check the iPhone: Settings > Messages > Text Message Forwarding.", file=sys.stderr)
+            return 1
+        time.sleep(3)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

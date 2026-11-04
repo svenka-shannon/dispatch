@@ -120,8 +120,11 @@ Conversation rules (also for the manual `say`/`listen` primitives):
   transcript from it is normal; keep listening.)
 - **ALWAYS run `call end`** when done (even on errors) — it restores the Mac's
   audio devices. If a call crashed mid-way: `call devices --restore`.
-- Only call people when asked to, or admin/partner tier for things they'd
-  clearly want a call about. Mind the hour in the callee's timezone.
+- **Only call when the user EXPLICITLY asks for a phone call.** Never call on
+  your own initiative to "check something". 2026-11-03: the owner said "Never
+  call" after a session phoned a boba shop unasked to ask about dairy. A
+  question like "can u check that" means web/menu research and a text reply,
+  not a call. Mind the hour in the callee's timezone.
 
 ## Rehearsing a call
 

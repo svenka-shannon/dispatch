@@ -8,6 +8,9 @@ send-discord - Send a message (with optional attachments) to a Discord channel
 
 Usage:
     send-discord <channel_id> <message>
+    send-discord <channel_id> - <<'EOF'      # literal text from stdin (backticks, $, ! safe)
+    ...
+    EOF
     send-discord <channel_id> <message> --image /path/to/image.png
     send-discord <channel_id> <message> --file /path/to/file.pdf
     send-discord <channel_id> --image /path/to/image.png   # Image only
@@ -160,11 +163,17 @@ def send_text(channel_id: str, token: str, message: str):
 def main():
     parser = argparse.ArgumentParser(description="Send a message to a Discord channel")
     parser.add_argument("channel_id", help="Discord channel ID")
-    parser.add_argument("message", nargs="?", default="", help="Message text")
+    parser.add_argument("message", nargs="?", default="",
+                        help="Message text, or '-' to read it from stdin (use a quoted heredoc "
+                             "for anything containing backticks, $ or !)")
     parser.add_argument("--image", "-i", help="Path to image file to attach")
     parser.add_argument("--file", "-f", help="Path to any file to attach")
     args = parser.parse_args()
 
+    if args.message == "-":
+        # 2026-11-03: `/lfg` in backticks inside a double-quoted zsh arg ran as
+        # command substitution and silently dropped text. stdin + <<'EOF' is literal.
+        args.message = sys.stdin.read().rstrip("\n")
     if not args.message and not args.image and not args.file:
         parser.error("Must provide message, --image, or --file")
 

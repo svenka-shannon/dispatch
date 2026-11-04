@@ -363,6 +363,37 @@ chrome network <tab_id> api.example.com  # filter by URL pattern
 chrome ping
 ```
 
+## Recording a tab / screen
+
+Use this when the owner says "send me a video of X". **Do not write ffmpeg avfoundation commands by hand.** Use the CLI instead:
+
+```bash
+~/.claude/skills/chrome-control/scripts/screen-record --url https://example.com --seconds 8
+```
+
+It opens the page (or focuses and reloads `--tab`) through the `chrome` CLI and brings Chrome to the front. It then records **the whole display** with ffmpeg (screen device found automatically, scaled to at most 1280 wide, H.264, faststart), extracts frames, and prints JSON: `out`, `size_bytes`, `duration_s`, `frames`, `frame_stats`, `black`, `uniform`, `chrome_frontmost`, plus `error` on failure. A tab it opened via `--url` is closed afterwards (`--keep-open` keeps it).
+
+```bash
+# Freshly deployed site (GitHub Pages etc.): refuse to record a stale build
+screen-record --url https://me.github.io/app/ --expect-text "build 41" --seconds 10
+
+# Existing tab, hide everything outside the Chrome window, custom paths
+screen-record --tab 123456 --crop-window --seconds 6 --out /tmp/demo.mp4 --frames-dir /tmp/demo-frames
+
+# More frames to inspect (default 1 per second); no cache-bust param
+screen-record --url example.com --fps 2 --no-cache-bust
+```
+
+Options: `--url URL` | `--tab ID`, `--seconds N` (default 8), `--out PATH` (default `/tmp/screen-record-<epoch>.mp4`), `--frames-dir DIR` (default `<out>-frames/`), `--fps N` (default 1), `--expect-text STR` + `--expect-timeout S` (default 180), `--no-cache-bust`, `--crop-window`, `--settle S`, `--width PX`, `-p PROFILE`.
+
+- **Cache-bust is on by default.** `--url` gets `?_cb=<epoch>` (or `&_cb=`). `--tab` reloads by navigating to its current URL with a fresh `_cb`. With `--no-cache-bust` it uses `location.reload()` instead.
+- **`--expect-text` is the staleness guard.** It polls `chrome text` for up to ~3 min and reloads with a new cache-bust every 20s. If the text never appears it exits 4 **without recording**. Match on body text: `chrome text` may leave out the `<title>` and some headings, so test the string against `chrome text <tab>` first. Use it whenever you are showing a change that was just deployed.
+- **It records the WHOLE display.** Other windows, notifications, and the Messages sidebar (with contacts' message previews) all end up in the video. Make sure nothing sensitive is on screen, **never record during checkout/payment or while a card/password is visible**, and prefer `--crop-window` (crops to the Chrome window via `window.screenX/outerWidth`, Retina-aware). Even with `--crop-window`, anything overlapping Chrome still shows, and so does the yellow "Chrome Control started debugging this browser" bar if it is up.
+- **Black/uniform frames = missing Screen Recording TCC permission** (or a locked/asleep screen). The CLI exits 6 with `"black": true` / `"uniform": true`. **Escalate to the admin**, naming the app that needs Screen Recording. **Never click a permission dialog yourself** and don't try to work around it. On newer macOS a denied grant can also show *only the wallpaper with no windows*. The variance check does NOT catch that, which is one more reason to look at frames.
+- **ALWAYS Read 2-3 of the `frames` before sending.** Check that the right page is in front, the content is the fresh build, and there's no dialog or private content. A stale GitHub Pages build was once recorded and only caught this way.
+- **Keep videos under 25MB** for iMessage. The CLI re-encodes smaller if it goes over (`under_25mb` in the JSON). For long recordings, lower `--seconds` or `--width`.
+- Exit codes: 0 ok, 2 usage, 3 chrome CLI error (try `chrome reset`), 4 expect-text missing, 5 ffmpeg failure, 6 black/uniform capture.
+
 ## Workflow Example
 
 ```bash

@@ -106,6 +106,9 @@ Rule: **the moment you place an order (payments skill, restock-watch buys, Walma
 
 An entry with no `tracking` shows up in the digest as "no tracking number known, Nd since order", plus a ⚠️ chase flag after `alert_after_days` (default 7). When the shipping email arrives, add `"tracking": "..."` to the entry. Shipping emails land in the assistant's Gmail. Search it in Chrome (`mail.google.com/#search/<order#>`) when the IMAP `email` CLI has no app password.
 
+## Amazon orders (no carrier number needed)
+Amazon Logistics shipments never get a carrier tracking number that `track` can read. So entries like `{"order": "Amazon #114-XXXXXXX-XXXXXXX", ...}` with no `tracking` used to show "no tracking number known" in the digest, even after they were delivered (2026-11-03). `package-watch` now opens the logged-in `amazon.com/your-orders/orders` page in Chrome and reads each order card's shipment statuses ("Arriving Thursday", "Delivered November 2"). Split orders get one line per open shipment, plus a count of shipments already delivered. A fully delivered order is reported once, on the day it arrives, then retired from the config. If the page can't be read (signed out, bot check), the entry falls back to the old aging line. **Still add every Amazon order the moment you place it**, as `"order": "Amazon #<order id>"`.
+
 ## UPS parsing
 `chrome fetch --min-chars 1200` returns as soon as the nav/footer text passes 1200 chars, before UPS's tracking widget renders, which used to make every UPS lookup `status: null`. UPS therefore uses `fetch_ups` (open a tab, poll until the number is on the page, then close it) plus `parse_ups`. The status is the line above the number; only an exact "Delivered..." counts as delivered, never a heading that merely contains "deliver". The ETA comes from "Estimated delivery" → "Tomorrow, October 26 by 9:00 P.M.", normalized to `M/D/YY`, with `delivery_window` = "by 9:00 P.M.". Never match the progress-legend stage words.
 

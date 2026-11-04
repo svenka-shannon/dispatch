@@ -1,0 +1,626 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["httpx"]
+# ///
+"""
+discord-admin - guarded Discord guild/channel admin for the Sven bot.
+
+Every guild-scoped command REQUIRES --guild (a numeric guild ID, or the alias
+`project`, which resolves via `identity discord.guild_ids`). Before anything
+runs, the CLI checks that the bot is actually a member of that guild.
+
+Deletes take channel IDs only (never names). Each ID is fetched first and the
+whole run is refused if any ID belongs to a different guild. Results are
+reported from a fresh re-list of the guild, not from HTTP status codes.
+
+The bot token is read ONLY from macOS Keychain (service `discord_bot_token`).
+There is no --token flag, and environment variables / .env files are ignored.
+"""
+from __future__ import annotations
+
+import argparse
+import ast
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from urllib.parse import quote
+
+import httpx
+
+DISCORD_API = "https://discord.com/api/v10"
+KEYCHAIN_SERVICE = "discord_bot_token"
+GUILD_ALIASES = {"project": "discord.guild_ids"}
+DEFAULT_REASON = "discord-admin (Sven bot) on behalf of admin"
+MAX_RETRIES = 6
+
+# Exit codes
+EXIT_OK = 0
+EXIT_ERROR = 1      # API / environment error
+EXIT_USAGE = 2      # bad or missing arguments (argparse also uses 2)
+EXIT_REFUSED = 3    # a safety guard refused the operation
+EXIT_INCOMPLETE = 4  # delete ran but the re-list shows targets still present
+
+CHANNEL_TYPES = {
+    0: "text",
+    1: "dm",
+    2: "voice",
+    3: "group_dm",
+    4: "category",
+    5: "announcement",
+    10: "announce_thread",
+    11: "public_thread",
+    12: "private_thread",
+    13: "stage",
+    14: "directory",
+    15: "forum",
+    16: "media",
+}
+CATEGORY = 4
+
+PERMISSIONS = {
+    0: "CREATE_INSTANT_INVITE",
+    1: "KICK_MEMBERS",
+    2: "BAN_MEMBERS",
+    3: "ADMINISTRATOR",
+    4: "MANAGE_CHANNELS",
+    5: "MANAGE_GUILD",
+    6: "ADD_REACTIONS",
+    7: "VIEW_AUDIT_LOG",
+    8: "PRIORITY_SPEAKER",
+    9: "STREAM",
+    10: "VIEW_CHANNEL",
+    11: "SEND_MESSAGES",
+    12: "SEND_TTS_MESSAGES",
+    13: "MANAGE_MESSAGES",
+    14: "EMBED_LINKS",
+    15: "ATTACH_FILES",
+    16: "READ_MESSAGE_HISTORY",
+    17: "MENTION_EVERYONE",
+    18: "USE_EXTERNAL_EMOJIS",
+    19: "VIEW_GUILD_INSIGHTS",
+    20: "CONNECT",
+    21: "SPEAK",
+    22: "MUTE_MEMBERS",
+    23: "DEAFEN_MEMBERS",
+    24: "MOVE_MEMBERS",
+    25: "USE_VAD",
+    26: "CHANGE_NICKNAME",
+    27: "MANAGE_NICKNAMES",
+    28: "MANAGE_ROLES",
+    29: "MANAGE_WEBHOOKS",
+    30: "MANAGE_GUILD_EXPRESSIONS",
+    31: "USE_APPLICATION_COMMANDS",
+    32: "REQUEST_TO_SPEAK",
+    33: "MANAGE_EVENTS",
+    34: "MANAGE_THREADS",
+    35: "CREATE_PUBLIC_THREADS",
+    36: "CREATE_PRIVATE_THREADS",
+    37: "USE_EXTERNAL_STICKERS",
+    38: "SEND_MESSAGES_IN_THREADS",
+    39: "USE_EMBEDDED_ACTIVITIES",
+    40: "MODERATE_MEMBERS",
+    41: "VIEW_CREATOR_MONETIZATION_ANALYTICS",
+    42: "USE_SOUNDBOARD",
+    43: "CREATE_GUILD_EXPRESSIONS",
+    44: "CREATE_EVENTS",
+    45: "USE_EXTERNAL_SOUNDS",
+    46: "SEND_VOICE_MESSAGES",
+    47: "USE_CLYDE_AI",
+    48: "SET_VOICE_CHANNEL_STATUS",
+    49: "SEND_POLLS",
+    50: "USE_EXTERNAL_APPS",
+}
+ADMINISTRATOR = 1 << 3
+ALL_PERMS = sum(1 << bit for bit in PERMISSIONS)
+
+HELP_EPILOG = """\
+Deliberately NOT implemented (and must not be done with raw curl either):
+  - transferring guild ownership
+  - deleting a guild
+  - kicking or banning members
+If one of these is genuinely needed, ask the admin to do it in the Discord UI.
+
+Exit codes: 0 ok, 1 API/environment error, 2 usage error (e.g. missing --guild),
+            3 refused by a safety guard, 4 delete incomplete per re-list.
+
+The token comes ONLY from Keychain service 'discord_bot_token'. Env vars such as
+DISCORD_TOKEN and project .env files are ignored on purpose.
+"""
+
+
+class AdminError(Exception):
+    def __init__(self, message: str, code: int = EXIT_ERROR):
+        super().__init__(message)
+        self.code = code
+
+
+class Refused(AdminError):
+    def __init__(self, message: str):
+        super().__init__(message, EXIT_REFUSED)
+
+
+class ApiError(AdminError):
+    def __init__(self, method: str, path: str, status: int, body: str):
+        hint = ""
+        if status == 401:
+            hint = " (Keychain token is invalid or revoked)"
+        elif status == 403:
+            hint = (" (the bot lacks a permission for this; check `perms`. This is a"
+                    " permission problem, not a connectivity problem)")
+        super().__init__(f"{method} {path} -> HTTP {status}{hint}: {body}")
+        self.status = status
+
+
+# --------------------------------------------------------------------------
+# Token / guild resolution
+# --------------------------------------------------------------------------
+
+def get_token() -> str:
+    """Read the bot token from macOS Keychain. No other source is consulted."""
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
+            capture_output=True, text=True,
+        )
+    except OSError as e:
+        raise AdminError(f"could not run `security` to read Keychain: {e}")
+    token = (result.stdout or "").strip()
+    if result.returncode != 0 or not token:
+        raise AdminError(
+            f"Keychain item '{KEYCHAIN_SERVICE}' not found or empty. "
+            "Store it with: security add-generic-password -U -a sven -s discord_bot_token -w"
+        )
+    return token
+
+
+def _identity_bin() -> str:
+    path = Path.home() / "dispatch" / "bin" / "identity"
+    if path.exists():
+        return str(path)
+    found = shutil.which("identity")
+    if found:
+        return found
+    raise AdminError("identity CLI not found (expected ~/dispatch/bin/identity)")
+
+
+def resolve_guild(value: str) -> str:
+    """Turn a --guild value into a numeric guild id string."""
+    value = value.strip()
+    if value.isdigit():
+        return value
+    key = GUILD_ALIASES.get(value.lower())
+    if key is None:
+        raise AdminError(
+            f"--guild must be a numeric guild ID or one of: {', '.join(GUILD_ALIASES)}"
+            f" (got {value!r})",
+            EXIT_USAGE,
+        )
+    result = subprocess.run([_identity_bin(), key], capture_output=True, text=True)
+    raw = (result.stdout or "").strip()
+    if result.returncode != 0 or not raw:
+        raise AdminError(f"`identity {key}` returned nothing; cannot resolve --guild {value}")
+    try:
+        parsed = ast.literal_eval(raw)
+    except (ValueError, SyntaxError):
+        parsed = raw
+    if isinstance(parsed, (list, tuple)):
+        if not parsed:
+            raise AdminError(f"`identity {key}` is an empty list; cannot resolve --guild {value}")
+        parsed = parsed[0]
+    gid = str(parsed).strip()
+    if not gid.isdigit():
+        raise AdminError(f"`identity {key}` gave a non-numeric guild id: {gid!r}")
+    return gid
+
+
+# --------------------------------------------------------------------------
+# HTTP
+# --------------------------------------------------------------------------
+
+def _sleep(seconds: float) -> None:  # patched in tests
+    time.sleep(seconds)
+
+
+class Api:
+    def __init__(self, token: str, transport: httpx.BaseTransport | None = None):
+        self._client = httpx.Client(
+            base_url=DISCORD_API,
+            headers={
+                "Authorization": f"Bot {token}",
+                "User-Agent": "DiscordBot (discord-admin, 1.0)",
+            },
+            timeout=30.0,
+            transport=transport,
+        )
+
+    def close(self) -> None:
+        self._client.close()
+
+    def request(self, method: str, path: str, *, reason: str | None = None,
+                json: dict | None = None, params: dict | None = None,
+                allow: tuple[int, ...] = ()) -> httpx.Response:
+        headers = {}
+        if reason:
+            headers["X-Audit-Log-Reason"] = _encode_reason(reason)
+        for attempt in range(MAX_RETRIES):
+            resp = self._client.request(method, path, headers=headers, json=json, params=params)
+            if resp.status_code == 429:
+                wait = _retry_after(resp)
+                print(f"  rate limited on {method} {path}; sleeping {wait:.2f}s", file=sys.stderr)
+                _sleep(wait)
+                continue
+            if resp.status_code >= 400 and resp.status_code not in allow:
+                raise ApiError(method, path, resp.status_code, resp.text)
+            return resp
+        raise AdminError(f"{method} {path}: still rate limited after {MAX_RETRIES} attempts")
+
+    def get(self, path: str, **kw):
+        return self.request("GET", path, **kw).json()
+
+
+def _encode_reason(reason: str) -> str:
+    # Header values must be latin-1; Discord URL-decodes this header.
+    return quote(reason, safe=" ()-_.,:;/'")
+
+
+def _retry_after(resp: httpx.Response) -> float:
+    value = resp.headers.get("Retry-After")
+    if value is None:
+        try:
+            value = resp.json().get("retry_after")
+        except Exception:
+            value = None
+    try:
+        return max(float(value), 0.0) + 0.1
+    except (TypeError, ValueError):
+        return 1.0
+
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+
+def list_bot_guilds(api: Api) -> list[dict]:
+    guilds: list[dict] = []
+    after = None
+    while True:
+        params = {"limit": 200}
+        if after:
+            params["after"] = after
+        page = api.get("/users/@me/guilds", params=params)
+        guilds.extend(page)
+        if len(page) < 200:
+            return guilds
+        after = page[-1]["id"]
+
+
+def require_bot_in_guild(api: Api, guild_id: str) -> dict:
+    for g in list_bot_guilds(api):
+        if str(g["id"]) == guild_id:
+            return g
+    raise Refused(f"the bot is not a member of guild {guild_id}; refusing to operate on it")
+
+
+def list_channels(api: Api, guild_id: str) -> list[dict]:
+    return api.get(f"/guilds/{guild_id}/channels")
+
+
+def type_name(t: int) -> str:
+    return CHANNEL_TYPES.get(t, f"type{t}")
+
+
+def print_tree(channels: list[dict]) -> None:
+    def key(c):
+        return (c.get("position", 0), int(c["id"]))
+
+    cats = sorted((c for c in channels if c["type"] == CATEGORY), key=key)
+    cat_ids = {c["id"] for c in cats}
+    children: dict[str, list[dict]] = {cid: [] for cid in cat_ids}
+    loose: list[dict] = []
+    for c in channels:
+        if c["type"] == CATEGORY:
+            continue
+        parent = c.get("parent_id")
+        if parent in children:
+            children[parent].append(c)
+        else:
+            loose.append(c)
+
+    if loose:
+        print("(no category)")
+        for c in sorted(loose, key=key):
+            print(f"  {c['id']}  {type_name(c['type']):<13} #{c['name']}")
+    for cat in cats:
+        print(f"{cat['id']}  {'category':<13} {cat['name']}")
+        for c in sorted(children[cat["id"]], key=key):
+            print(f"  {c['id']}  {type_name(c['type']):<13} #{c['name']}")
+    print(f"({len(channels)} channels total)")
+
+
+def decode_perms(value: int) -> list[str]:
+    names = [name for bit, name in sorted(PERMISSIONS.items()) if value & (1 << bit)]
+    unknown = value & ~ALL_PERMS
+    if unknown:
+        names.append(f"UNKNOWN(0x{unknown:x})")
+    return names
+
+
+def fetch_channel_in_guild(api: Api, channel_id: str, guild_id: str) -> dict:
+    """GET a channel and refuse unless it belongs to guild_id."""
+    if not channel_id.isdigit():
+        raise Refused(f"{channel_id!r} is not a channel ID. Channels are addressed by ID only, never by name")
+    resp = api.request("GET", f"/channels/{channel_id}", allow=(403, 404))
+    if resp.status_code == 404:
+        raise Refused(f"channel {channel_id} does not exist (404)")
+    if resp.status_code == 403:
+        raise Refused(f"channel {channel_id}: bot cannot see it (403), so its guild cannot be verified")
+    ch = resp.json()
+    actual = str(ch.get("guild_id") or "")
+    if actual != guild_id:
+        raise Refused(
+            f"channel {channel_id} (#{ch.get('name')}) belongs to guild {actual or '<none>'}, "
+            f"not --guild {guild_id}"
+        )
+    return ch
+
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+
+def cmd_guilds(api: Api, args) -> int:
+    guilds = list_bot_guilds(api)
+    for g in guilds:
+        owner = "  (bot is owner)" if g.get("owner") else ""
+        print(f"{g['id']}  {g['name']}{owner}")
+    print(f"({len(guilds)} guilds)")
+    return EXIT_OK
+
+
+def cmd_channels(api: Api, args) -> int:
+    print(f"Guild {args.guild_id} ({args.guild_name})")
+    print_tree(list_channels(api, args.guild_id))
+    return EXIT_OK
+
+
+def cmd_delete(api: Api, args) -> int:
+    gid = args.guild_id
+    ids = list(dict.fromkeys(args.channel_ids))  # dedupe, keep order
+
+    # Phase 1: verify every id belongs to this guild before deleting anything.
+    fetched = {cid: fetch_channel_in_guild(api, cid, gid) for cid in ids}
+    all_channels = list_channels(api, gid)
+
+    plan: list[dict] = []
+    seen: set[str] = set()
+
+    def add(ch):
+        if ch["id"] not in seen:
+            seen.add(ch["id"])
+            plan.append(ch)
+
+    for cid, ch in fetched.items():
+        if ch["type"] == CATEGORY:
+            kids = [c for c in all_channels if c.get("parent_id") == cid]
+            if kids and not args.recursive:
+                names = ", ".join(f"{k['id']} #{k['name']}" for k in kids)
+                raise Refused(
+                    f"category {cid} ({ch['name']}) has {len(kids)} child channel(s): {names}. "
+                    "Pass --recursive to delete them too, or move them first"
+                )
+            for k in kids:
+                add(k)
+        add(ch)
+    # Children before their categories.
+    plan.sort(key=lambda c: c["type"] == CATEGORY)
+
+    print(f"Guild {gid} ({args.guild_name}): {len(plan)} channel(s) to delete")
+    for c in plan:
+        print(f"  {c['id']}  {type_name(c['type']):<13} {c['name']}")
+    if args.dry_run:
+        print("--dry-run: nothing deleted")
+        return EXIT_OK
+
+    # Phase 2: delete. HTTP results are informational only.
+    errors: dict[str, str] = {}
+    for c in plan:
+        try:
+            api.request("DELETE", f"/channels/{c['id']}", reason=args.reason, allow=(404,))
+        except ApiError as e:
+            errors[c["id"]] = str(e)
+            print(f"  error: {e}", file=sys.stderr)
+
+    # Phase 3: verify against a fresh listing.
+    target_ids = {c["id"] for c in plan}
+    remaining = list_channels(api, gid)
+    still = [c for c in remaining if c["id"] in target_ids]
+    if still:
+        _sleep(2.0)
+        remaining = list_channels(api, gid)
+        still = [c for c in remaining if c["id"] in target_ids]
+    still_ids = {c["id"] for c in still}
+    gone = [c for c in plan if c["id"] not in still_ids]
+
+    print(f"\nVerified by re-listing guild {gid}:")
+    print(f"GONE ({len(gone)}):")
+    for c in gone:
+        print(f"  {c['id']}  {c['name']}")
+    print(f"STILL PRESENT ({len(still)}):")
+    for c in still:
+        err = errors.get(c["id"], "no API error; still listed")
+        print(f"  {c['id']}  {c['name']}  -- {err}")
+    print("\nGuild channel tree now:")
+    print_tree(remaining)
+    return EXIT_INCOMPLETE if still else EXIT_OK
+
+
+def cmd_create_category(api: Api, args) -> int:
+    resp = api.request("POST", f"/guilds/{args.guild_id}/channels", reason=args.reason,
+                       json={"name": args.name, "type": CATEGORY})
+    ch = resp.json()
+    print(f"created category {ch['id']}  {ch['name']}  in guild {ch.get('guild_id')}")
+    return EXIT_OK
+
+
+def cmd_create_channel(api: Api, args) -> int:
+    body: dict = {"name": args.name, "type": 2 if args.type == "voice" else 0}
+    if args.category:
+        cat = fetch_channel_in_guild(api, args.category, args.guild_id)
+        if cat["type"] != CATEGORY:
+            raise Refused(f"--category {args.category} (#{cat['name']}) is a {type_name(cat['type'])}, not a category")
+        body["parent_id"] = args.category
+    resp = api.request("POST", f"/guilds/{args.guild_id}/channels", reason=args.reason, json=body)
+    ch = resp.json()
+    parent = f" under {ch['parent_id']}" if ch.get("parent_id") else ""
+    print(f"created {type_name(ch['type'])} channel {ch['id']}  #{ch['name']}{parent}  in guild {ch.get('guild_id')}")
+    return EXIT_OK
+
+
+def cmd_perms(api: Api, args) -> int:
+    gid = args.guild_id
+    me = api.get("/users/@me")
+    guild = api.get(f"/guilds/{gid}")
+    roles = {r["id"]: r for r in api.get(f"/guilds/{gid}/roles")}
+    member = api.get(f"/guilds/{gid}/members/{me['id']}")
+    member_roles = [rid for rid in member.get("roles", []) if rid in roles]
+
+    is_owner = str(guild.get("owner_id")) == str(me["id"])
+    base = int(roles[gid]["permissions"]) if gid in roles else 0
+    for rid in member_roles:
+        base |= int(roles[rid]["permissions"])
+    if is_owner or base & ADMINISTRATOR:
+        effective_guild = ALL_PERMS
+    else:
+        effective_guild = base
+
+    print(f"Bot {me.get('username')} ({me['id']}) in guild {gid} ({guild.get('name')})")
+    print(f"Owner of guild: {'yes' if is_owner else 'no'}")
+    print("Roles: " + (", ".join(f"{roles[r]['name']} ({r})" for r in member_roles) or "(only @everyone)"))
+    print(f"ADMINISTRATOR: {'YES - overrides every channel overwrite' if base & ADMINISTRATOR else 'no'}")
+    print(f"Guild permissions (0x{base:x}): {', '.join(decode_perms(base)) or '(none)'}")
+
+    if not args.channel:
+        return EXIT_OK
+
+    ch = fetch_channel_in_guild(api, args.channel, gid)
+    print(f"\nChannel {ch['id']} #{ch['name']} ({type_name(ch['type'])})")
+    overwrites = ch.get("permission_overwrites", [])
+    if not overwrites:
+        print("  no permission overwrites")
+    for ow in overwrites:
+        if ow["type"] == 0:
+            label = "@everyone" if ow["id"] == gid else roles.get(ow["id"], {}).get("name", "?")
+            who = f"role {label} ({ow['id']})"
+        else:
+            who = f"member {ow['id']}" + (" (this bot)" if ow["id"] == me["id"] else "")
+        allow, deny = int(ow.get("allow", 0)), int(ow.get("deny", 0))
+        print(f"  {who}")
+        print(f"    allow: {', '.join(decode_perms(allow)) or '-'}")
+        print(f"    deny:  {', '.join(decode_perms(deny)) or '-'}")
+
+    if effective_guild == ALL_PERMS:
+        effective = ALL_PERMS
+    else:
+        effective = base
+        by_id = {ow["id"]: ow for ow in overwrites}
+        if gid in by_id:
+            effective &= ~int(by_id[gid]["deny"])
+            effective |= int(by_id[gid]["allow"])
+        r_allow = r_deny = 0
+        for rid in member_roles:
+            if rid in by_id and by_id[rid]["type"] == 0:
+                r_allow |= int(by_id[rid]["allow"])
+                r_deny |= int(by_id[rid]["deny"])
+        effective = (effective & ~r_deny) | r_allow
+        if me["id"] in by_id and by_id[me["id"]]["type"] == 1:
+            effective &= ~int(by_id[me["id"]]["deny"])
+            effective |= int(by_id[me["id"]]["allow"])
+    label = "ALL (administrator/owner)" if effective == ALL_PERMS else ", ".join(decode_perms(effective)) or "(none)"
+    print(f"  bot effective permissions here: {label}")
+    return EXIT_OK
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="discord-admin",
+        description="Guarded Discord guild/channel admin for the Sven bot (token from Keychain only).",
+        epilog=HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = p.add_subparsers(dest="command", required=True, metavar="COMMAND")
+
+    def guild_cmd(name, help_text):
+        sp = sub.add_parser(name, help=help_text, epilog=HELP_EPILOG,
+                            formatter_class=argparse.RawDescriptionHelpFormatter)
+        sp.add_argument("--guild", required=True,
+                        help="guild ID, or 'project' (resolved via `identity discord.guild_ids`). REQUIRED.")
+        return sp
+
+    sub.add_parser("guilds", help="list guilds the bot is in")
+
+    guild_cmd("channels", "print the channel tree of a guild")
+
+    d = guild_cmd("delete", "delete channels BY ID after verifying they belong to --guild")
+    d.add_argument("channel_ids", nargs="+", metavar="CHANNEL_ID")
+    d.add_argument("--recursive", action="store_true",
+                   help="for categories: delete their child channels, then the category")
+    d.add_argument("--reason", default=DEFAULT_REASON, help="audit log reason")
+    d.add_argument("--dry-run", action="store_true", help="verify and show the plan, delete nothing")
+
+    cc = guild_cmd("create-category", "create a category")
+    cc.add_argument("name")
+    cc.add_argument("--reason", default=DEFAULT_REASON, help="audit log reason")
+
+    ch = guild_cmd("create-channel", "create a text or voice channel")
+    ch.add_argument("name")
+    ch.add_argument("--category", help="parent category ID (must be in --guild)")
+    ch.add_argument("--type", choices=["text", "voice"], default="text")
+    ch.add_argument("--reason", default=DEFAULT_REASON, help="audit log reason")
+
+    pm = guild_cmd("perms", "show the bot's guild permissions and a channel's overwrites")
+    pm.add_argument("--channel", help="channel ID to show overwrites for")
+    return p
+
+
+COMMANDS = {
+    "guilds": cmd_guilds,
+    "channels": cmd_channels,
+    "delete": cmd_delete,
+    "create-category": cmd_create_category,
+    "create-channel": cmd_create_channel,
+    "perms": cmd_perms,
+}
+
+
+def main(argv: list[str] | None = None, *, transport: httpx.BaseTransport | None = None) -> int:
+    args = build_parser().parse_args(argv)  # exits 2 on missing --guild
+    api = None
+    try:
+        if hasattr(args, "guild"):
+            args.guild_id = resolve_guild(args.guild)
+        api = Api(get_token(), transport=transport)
+        if hasattr(args, "guild"):
+            args.guild_name = require_bot_in_guild(api, args.guild_id)["name"]
+        return COMMANDS[args.command](api, args)
+    except AdminError as e:
+        prefix = "REFUSED" if e.code == EXIT_REFUSED else "error"
+        print(f"discord-admin: {prefix}: {e}", file=sys.stderr)
+        return e.code
+    except httpx.HTTPError as e:
+        print(f"discord-admin: network error: {type(e).__name__}: {e}", file=sys.stderr)
+        return EXIT_ERROR
+    finally:
+        if api is not None:
+            api.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

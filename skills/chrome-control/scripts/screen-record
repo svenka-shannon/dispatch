@@ -1,0 +1,400 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pillow>=10"]
+# ///
+"""screen-record: record the macOS display (with a Chrome tab in front) to a small mp4.
+
+Opens/reloads the page through the chrome-control CLI (never AppleScript), optionally
+waits until the page shows --expect-text (staleness guard for freshly deployed sites),
+records the whole display with ffmpeg avfoundation, extracts frames, and refuses to
+report success if the capture is black/uniform (= missing Screen Recording permission).
+
+Examples:
+  screen-record --url https://example.com --seconds 6
+  screen-record --url https://me.github.io/app/ --expect-text "v2.3 build 41" --seconds 10
+  screen-record --tab 123456 --seconds 8 --out /tmp/demo.mp4 --frames-dir /tmp/demo-frames
+
+Exit codes: 0 ok, 2 usage, 3 chrome CLI error, 4 --expect-text never appeared,
+            5 ffmpeg failure, 6 black/uniform capture (Screen Recording TCC missing).
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+from PIL import Image, ImageStat
+
+CHROME = Path.home() / ".claude/skills/chrome-control/scripts/chrome"
+CHROME_BUNDLE_ID = "com.google.Chrome"
+MAX_BYTES = 25 * 1024 * 1024
+TCC_MESSAGE = (
+    "Capture is black/uniform: the Screen Recording (TCC) permission is almost certainly missing "
+    "for the process running ffmpeg (or the screen is locked/asleep). Do NOT click any macOS "
+    "permission dialog and do NOT try to work around it. Escalate to the admin with a specific ask: "
+    "'grant Screen Recording to <the app running this session> in System Settings > Privacy & "
+    "Security > Screen Recording, then restart that session'."
+)
+
+
+class Fail(Exception):
+    def __init__(self, msg: str, code: int):
+        super().__init__(msg)
+        self.code = code
+
+
+def log(msg: str) -> None:
+    print(f"[screen-record] {msg}", file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------- chrome CLI
+
+
+def chrome(profile: str | None, *args: str, timeout: float = 60) -> str:
+    cmd = [str(CHROME)]
+    if profile is not None:
+        cmd += ["-p", profile]
+    cmd += list(args)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise Fail(f"chrome {' '.join(args)} timed out after {timeout}s (try `chrome reset`)", 3)
+    if r.returncode != 0:
+        raise Fail(f"chrome {' '.join(args)} failed: {(r.stderr or r.stdout).strip()}", 3)
+    return r.stdout
+
+
+def tab_url(profile: str | None, tab_id: str) -> str | None:
+    lines = chrome(profile, "tabs").splitlines()
+    for i, line in enumerate(lines):
+        if line.split(None, 1)[:1] == [tab_id] and i + 1 < len(lines):
+            return lines[i + 1].strip()
+    return None
+
+
+def cache_bust(url: str) -> str:
+    parts = urlsplit(url)
+    q = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k != "_cb"]
+    q.append(("_cb", str(int(time.time()))))
+    return urlunsplit(parts._replace(path=parts.path or "/", query=urlencode(q)))
+
+
+def normalize(url: str) -> str:
+    return url if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", url) else "https://" + url
+
+
+def page_text(profile: str | None, tab_id: str) -> str:
+    try:
+        return chrome(profile, "text", tab_id, timeout=30)
+    except Fail as e:
+        log(f"page text read failed (will retry): {e}")
+        return ""
+
+
+def reload_tab(profile: str | None, tab_id: str, base_url: str | None, bust: bool) -> None:
+    """Reload via navigation to a fresh cache-busted URL, or location.reload() without busting."""
+    if bust and base_url:
+        chrome(profile, "navigate", tab_id, cache_bust(base_url))
+        return
+    try:
+        chrome(profile, "js", tab_id, "location.reload()", timeout=20)
+    except Fail:
+        if not base_url:
+            raise
+        chrome(profile, "navigate", tab_id, base_url)
+
+
+def frontmost_bundle() -> str:
+    try:
+        asn = subprocess.run(["lsappinfo", "front"], capture_output=True, text=True, timeout=5).stdout.strip()
+        out = subprocess.run(["lsappinfo", "info", "-only", "bundleid", asn],
+                             capture_output=True, text=True, timeout=5).stdout
+        m = re.search(r'"CFBundleIdentifier"\s*=\s*"([^"]+)"', out)
+        return m.group(1) if m else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def wait_text_settled(profile: str | None, tab_id: str, timeout: float = 15) -> str:
+    """Poll page text until two consecutive equal-length non-empty reads (SPA-safe)."""
+    deadline = time.monotonic() + timeout
+    last = None
+    text = ""
+    while time.monotonic() < deadline:
+        text = page_text(profile, tab_id)
+        if text.strip() and last is not None and len(text) == last:
+            return text
+        last = len(text)
+        time.sleep(1)
+    return text
+
+
+# ---------------------------------------------------------------- ffmpeg
+
+
+def screen_device_index() -> str:
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
+                       capture_output=True, text=True, timeout=30)
+    out = r.stderr + r.stdout
+    m = re.search(r"\[(\d+)\]\s+Capture screen 0", out)
+    if not m:
+        raise Fail(f"No 'Capture screen 0' avfoundation device found. ffmpeg output:\n{out}", 5)
+    return m.group(1)
+
+
+def tcc_preflight() -> bool | None:
+    """CGPreflightScreenCaptureAccess(): checks only, never shows a prompt. None if unavailable."""
+    try:
+        cg = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+        fn = cg.CGPreflightScreenCaptureAccess
+        fn.restype = ctypes.c_bool
+        return bool(fn())
+    except (OSError, AttributeError):
+        return None
+
+
+def window_crop(profile: str | None, tab_id: str) -> str | None:
+    """ffmpeg crop expr for the Chrome window, from window.screenX/outerWidth (CSS points).
+
+    Scaled by iw/screen.width so it works on Retina (capture px != points). None on failure."""
+    try:
+        raw = chrome(profile, "js", tab_id,
+                     "JSON.stringify([screenX,screenY,outerWidth,outerHeight,screen.width,screen.height])",
+                     timeout=20)
+        x, y, w, h, sw, sh = json.loads(raw.strip().splitlines()[-1])
+    except (Fail, ValueError, IndexError) as e:
+        log(f"could not read window geometry, recording full screen: {e}")
+        return None
+    x, y = max(0, x), max(0, y)
+    w, h = min(w, sw - x), min(h, sh - y)
+    return f"crop=trunc(iw*{w}/{sw}/2)*2:trunc(ih*{h}/{sh}/2)*2:iw*{x}/{sw}:ih*{y}/{sh},"
+
+
+def record(idx: str, seconds: float, out: Path, width: int, crf: int, crop: str = "") -> None:
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "avfoundation", "-framerate", "30", "-capture_cursor", "1",
+        "-i", f"{idx}:none", "-t", str(seconds),
+        "-vf", f"{crop}scale='min({width},iw)':-2",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(out),
+    ]
+    log("recording: " + " ".join(cmd))
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=seconds + 60)
+    except subprocess.TimeoutExpired:
+        raise Fail("ffmpeg recording timed out", 5)
+    if r.returncode != 0 or not out.exists() or out.stat().st_size == 0:
+        raise Fail(f"ffmpeg recording failed (exit {r.returncode}): {r.stderr.strip()}", 5)
+
+
+def shrink(src: Path, width: int, crf: int) -> None:
+    tmp = src.with_suffix(".shrink.mp4")
+    r = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src),
+         "-vf", f"scale='min({width},iw)':-2", "-c:v", "libx264", "-preset", "veryfast",
+         "-crf", str(crf), "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(tmp)],
+        capture_output=True, text=True, timeout=600)
+    if r.returncode != 0:
+        raise Fail(f"ffmpeg re-encode failed: {r.stderr.strip()}", 5)
+    tmp.replace(src)
+
+
+def duration(path: Path) -> float | None:
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                        "-of", "default=nw=1:nk=1", str(path)], capture_output=True, text=True)
+    try:
+        return round(float(r.stdout.strip()), 3)
+    except ValueError:
+        return None
+
+
+def extract_frames(video: Path, frames_dir: Path, fps: float) -> list[Path]:
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    for old in frames_dir.glob("frame_*.jpg"):
+        old.unlink()
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video),
+                        "-vf", f"fps={fps}", "-q:v", "3", str(frames_dir / "frame_%04d.jpg")],
+                       capture_output=True, text=True, timeout=300)
+    if r.returncode != 0:
+        raise Fail(f"frame extraction failed: {r.stderr.strip()}", 5)
+    return sorted(frames_dir.glob("frame_*.jpg"))
+
+
+def frame_stats(path: Path) -> dict:
+    with Image.open(path) as im:
+        g = im.convert("L")
+        g.thumbnail((320, 320))
+        st = ImageStat.Stat(g)
+        mean, std = st.mean[0], st.stddev[0]
+    return {"path": str(path), "mean": round(mean, 2), "stddev": round(std, 2),
+            "black": mean < 12 and std < 4, "uniform": std < 3}
+
+
+# ---------------------------------------------------------------- main
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Record the whole display (with a Chrome tab in front) to a small mp4 + frames.",
+        formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    src = ap.add_mutually_exclusive_group()
+    src.add_argument("--url", help="open this URL in a new tab (cache-busted with _cb=<epoch> by default)")
+    src.add_argument("--tab", help="focus and reload this existing chrome-control tab id")
+    ap.add_argument("--no-cache-bust", action="store_true", help="don't append _cb=<epoch>")
+    ap.add_argument("--seconds", type=float, default=8, help="recording length (default 8)")
+    ap.add_argument("--out", help="output mp4 (default /tmp/screen-record-<epoch>.mp4)")
+    ap.add_argument("--frames-dir", help="where to put extracted frames (default <out>-frames/)")
+    ap.add_argument("--fps", type=float, default=1, help="frame extraction rate (default 1)")
+    ap.add_argument("--expect-text", help="abort before recording unless the page text contains this "
+                                          "(polls + cache-busted reloads for up to --expect-timeout)")
+    ap.add_argument("--expect-timeout", type=float, default=180, help="seconds for --expect-text (default 180)")
+    ap.add_argument("--settle", type=float, default=2, help="seconds to wait after load before recording (default 2)")
+    ap.add_argument("--width", type=int, default=1280, help="max output width (default 1280)")
+    ap.add_argument("--crop-window", action="store_true",
+                    help="crop to the Chrome window (hides other apps; still captures anything overlapping it)")
+    ap.add_argument("--keep-open", action="store_true", help="don't close the tab opened via --url")
+    ap.add_argument("-p", "--profile", help="chrome-control profile (passed to `chrome -p`)")
+    a = ap.parse_args()
+
+    if a.seconds <= 0 or a.fps <= 0:
+        ap.error("--seconds and --fps must be > 0")
+    if a.expect_text and not (a.url or a.tab):
+        ap.error("--expect-text needs --url or --tab")
+
+    epoch = int(time.time())
+    out = Path(a.out or f"/tmp/screen-record-{epoch}.mp4").expanduser().resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    frames_dir = Path(a.frames_dir).expanduser().resolve() if a.frames_dir else out.with_name(out.stem + "-frames")
+    bust = not a.no_cache_bust
+    result: dict = {"ok": False, "out": str(out), "frames_dir": str(frames_dir)}
+    opened_tab: str | None = None
+    tab_id: str | None = None
+
+    for tool in ("ffmpeg", "ffprobe"):
+        if not shutil.which(tool):
+            result["error"] = f"{tool} not found (brew install ffmpeg)"
+            print(json.dumps(result, indent=2))
+            return 5
+
+    try:
+        pre = tcc_preflight()
+        result["tcc_preflight"] = pre
+        if pre is False:
+            log("CGPreflightScreenCaptureAccess() = false; capture will likely be black (still trying once).")
+        idx = screen_device_index()
+        result["device_index"] = idx
+
+        base_url: str | None = None
+        if a.url:
+            base_url = normalize(a.url)
+            first = cache_bust(base_url) if bust else base_url
+            o = chrome(a.profile, "open", first, timeout=90)
+            m = re.search(r"Opened tab (\d+)", o)
+            if not m:
+                raise Fail(f"could not parse tab id from `chrome open` output: {o.strip()}", 3)
+            tab_id = opened_tab = m.group(1)
+            result["url"] = first
+        elif a.tab:
+            tab_id = a.tab
+            base_url = tab_url(a.profile, tab_id)
+            if base_url is None:
+                raise Fail(f"tab {tab_id} not found in `chrome tabs`", 3)
+            chrome(a.profile, "focus", tab_id)
+            reload_tab(a.profile, tab_id, base_url, bust)
+            result["url"] = cache_bust(base_url) if bust else base_url
+        result["tab_id"] = tab_id
+
+        if tab_id:
+            if a.expect_text:
+                deadline = time.monotonic() + a.expect_timeout
+                last_reload = time.monotonic()
+                found = False
+                while True:
+                    if a.expect_text in page_text(a.profile, tab_id):
+                        found = True
+                        break
+                    if time.monotonic() >= deadline:
+                        break
+                    if time.monotonic() - last_reload >= 20:
+                        log(f"expected text not on page yet; reloading (cache-bust={bust})")
+                        reload_tab(a.profile, tab_id, base_url, bust)
+                        last_reload = time.monotonic()
+                    time.sleep(3)
+                result["expect_text_found"] = found
+                if not found:
+                    raise Fail(f"--expect-text {a.expect_text!r} never appeared within {a.expect_timeout:.0f}s; "
+                               "page is probably stale (deploy not live yet / CDN cache). Not recording.", 4)
+            else:
+                wait_text_settled(a.profile, tab_id)
+
+            chrome(a.profile, "focus", tab_id)
+            time.sleep(a.settle)
+            front = frontmost_bundle()
+            if front != CHROME_BUNDLE_ID:
+                subprocess.run(["open", "-a", "Google Chrome"], capture_output=True, timeout=10)
+                time.sleep(1)
+                front = frontmost_bundle()
+            result["chrome_frontmost"] = front == CHROME_BUNDLE_ID
+            if front != CHROME_BUNDLE_ID:
+                log(f"WARNING: Chrome is not frontmost (frontmost: {front or '?'}); a dialog may be covering it.")
+
+        crop = ""
+        if a.crop_window:
+            if not tab_id:
+                raise Fail("--crop-window needs --url or --tab", 2)
+            crop = window_crop(a.profile, tab_id) or ""
+            result["cropped_to_window"] = bool(crop)
+
+        record(idx, a.seconds, out, a.width, 28, crop)
+        size = out.stat().st_size
+        if size > MAX_BYTES:
+            log(f"{size} bytes > 25MB; re-encoding smaller")
+            shrink(out, min(a.width, 960), 34)
+            size = out.stat().st_size
+        result["size_bytes"] = size
+        result["under_25mb"] = size <= MAX_BYTES
+        result["duration_s"] = duration(out)
+
+        frames = extract_frames(out, frames_dir, a.fps)
+        stats = [frame_stats(f) for f in frames]
+        result["frames"] = [s["path"] for s in stats]
+        result["frame_stats"] = [{k: s[k] for k in ("path", "mean", "stddev")} for s in stats]
+        result["black"] = bool(stats) and all(s["black"] for s in stats)
+        result["uniform"] = bool(stats) and all(s["uniform"] for s in stats)
+        if not stats:
+            raise Fail("no frames extracted", 5)
+        if result["black"] or result["uniform"]:
+            raise Fail(TCC_MESSAGE, 6)
+        result["ok"] = True
+        result["next_step"] = "Read 2-3 of the frames to confirm the right (fresh) content before sending."
+        code = 0
+    except Fail as e:
+        result["error"] = str(e)
+        log(str(e))
+        code = e.code
+    finally:
+        if opened_tab and not a.keep_open:
+            try:
+                chrome(a.profile, "close", opened_tab, timeout=20)
+                result["tab_closed"] = True
+            except Fail as e:
+                log(f"failed to close tab {opened_tab}: {e}")
+                result["tab_closed"] = False
+
+    print(json.dumps(result, indent=2))
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

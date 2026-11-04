@@ -16,6 +16,7 @@ partner:
 assistant:
   name: "Dispatch"  # Used by dispatch-api for session prefix ({name}-app) and display name
   email: "assistant@example.com"
+  phone: "+15555550100"  # Assistant's own line for sign-ups/OTPs (read codes with sms-otp)
 
 signal:
   account: "+1XXXXXXXXXX"

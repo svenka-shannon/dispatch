@@ -11,6 +11,7 @@ Order food delivery from Grubhub using Chrome automation.
 
 - Chrome control skill (`/chrome-control`)
 - Valid delivery address
+- Account sign-up / login codes: use the assistant's own phone and `sms-otp`, never ask the owner to relay a code (see sms-assistant, "Accounts, sign-ups & verification codes")
 
 ## Workflow
 

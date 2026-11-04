@@ -961,3 +961,16 @@ with connection-dropped errors). Until removed:
 - Write research findings to disk so they survive a session restart.
 - If your API calls start failing repeatedly, the daemon will clean-restart you;
   on a fresh start, read recent SMS history and continue — don't re-announce.
+
+## Accounts, sign-ups & verification codes
+The assistant has its own phone number and email. Use them for every sign-up, login and verification code. **Never ask the owner to relay a code** (2026-11-02: a session asked him to forward a DoorDash code sent to his phone, and he replied "Why dont you use your number ..?").
+
+- **Phone / SMS codes:** use `identity assistant.phone` (the tethered iPhone line), never the owner's number. SMS to it are forwarded into chat.db (service `SMS`). Read a code with:
+  ```bash
+  START=$(date +%s)   # take this BEFORE you trigger the code
+  # ...click "send code"...
+  ~/.claude/skills/sms-assistant/scripts/sms-otp --since $START --match <Brand>
+  ```
+- **Email codes / magic links:** use `identity assistant.email`. Read them with the `email` skill (see its "One-time codes & magic links" recipe), or Chrome's Gmail tab if IMAP isn't set up.
+- **Owner's details are the last resort:** use the owner's phone/email only if the site rejects ours, and text the owner a heads-up *before* you trigger the code.
+- New site accounts: follow the passwords skill, "Create a site account".

@@ -55,6 +55,7 @@ email search <query> [--limit N] [--gmail | --imap]
 email mailboxes
 
 # global flags: --mailbox NAME (default INBOX), --json, --account ADDR
+# global flags go BEFORE the subcommand: `email --json read 184213`
 ```
 
 ### Examples
@@ -65,11 +66,29 @@ email list --unread --limit 50              # unread only
 email list --from stripe.com --since 7      # last week, from Stripe
 email list --subject "order confirmation"
 email read 184213                           # full body, never truncated
-email read 184213 --json                    # structured, for parsing
+email --json read 184213                    # structured, for parsing
 email search 'from:amazon has:attachment' --gmail
 email search 'SUBJECT "invoice" SINCE 01-Aug-2026' --imap
-email list --mailbox "[Gmail]/Sent Mail"
+email --mailbox "[Gmail]/Sent Mail" list
 ```
+
+### One-time codes & magic links
+
+Sign-up / login codes sent to the assistant's address (`identity assistant.email`)
+land here. For codes texted to `identity assistant.phone`, use
+`~/.claude/skills/sms-assistant/scripts/sms-otp` instead (see sms-assistant,
+"Accounts, sign-ups & verification codes").
+
+```bash
+E=~/.claude/skills/email/scripts/email
+$E list --from <brand> --since 1 --limit 3          # newest first; or:
+$E search 'from:<brand> newer_than:1d' --gmail --limit 3
+$E read <uid> | grep -iE 'code|verif|one.time' | grep -oE '\b[0-9]{4,8}\b'   # the code (skip years like 2026)
+$E read <uid> | grep -oE 'https?://[^ >"]+' | grep -iE 'verif|confirm|sign.?in|login|magic|token'  # the link
+```
+
+Check the message date is after you clicked "send code"; if the newest match is
+older, wait 15s and re-run `list`. Reading never marks the mail read.
 
 ## Behaviour worth knowing
 

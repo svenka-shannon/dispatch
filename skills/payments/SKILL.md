@@ -134,6 +134,7 @@ $F <tab> --zip "$ZIP"
 
 ## Walmart account (created 2026-10-18)
 - Login is svenka.shannon@gmail.com. The password is in Keychain: service `walmart`, account = the login (type it with `chrome os-type <tab> --at X,Y --secret-service walmart --secret-account <login>`; never `-w` into argv). The account phone is the admin's (`identity owner.phone`), so a new device or login may text him a code; give him a heads-up first.
+- New accounts use the assistant's own phone (`identity assistant.phone`) and read codes with `sms-otp`, not the owner's number. See sms-assistant, "Accounts, sign-ups & verification codes".
 - The Privacy card is saved as the default payment (last 4: see Keychain). The preferred address is the admin's (`identity owner.name`, `identity owner.address`).
 - **Automation:** Walmart's identity/checkout pages ignore chrome-control `insert-text`. Use `chrome os-type <tab> --at X,Y --text ...`, which checks that Chrome is frontmost, clicks and types. Native `<select>` menus: `chrome os-type <tab> --at X,Y --select --text CA`. Type the option label as shown: state is the abbreviation ("CA", not "California", which picks "CO"), and card year is 2 digits.
 - Decline the Walmart+ $1 trial, OnePay and donation upsells.

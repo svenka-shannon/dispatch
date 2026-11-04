@@ -229,6 +229,8 @@ Amazon may prompt "Keep hackers out" (phone verification) — skip it:
 chrome click-by-name <tab> "Not now"
 ```
 
+Verification codes on an account the assistant owns: use its own phone/email and read the code yourself (`sms-otp` for SMS); never ask the owner to relay one. See sms-assistant, "Accounts, sign-ups & verification codes".
+
 ### Step 4: Review Order
 
 ```bash

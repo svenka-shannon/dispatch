@@ -51,7 +51,7 @@ Use this when a site needs an account to book/buy something.
    ```
    Service name = the site in lowercase (e.g. `walmart`). When the signup form needs it, read it at the moment of typing (`security find-generic-password -s <site> -w` into `cliclick t:"..."` or the form fill), never into a variable you print. If the site has password rules (symbols etc.), append a fixed suffix like `!9a` inside the `$(...)`.
 2. **Sign up with the assistant's email** (`identity assistant.email`). Email OTPs and verification links arrive in that Gmail. Read them with the `email` skill, or in Chrome's Gmail tab.
-3. **Phone number:** skip it if it's optional. If the site requires one, use the owner's (`identity owner.phone`), but **text the owner a heads-up first** ("signing up for <site> with your number, you may get a verification text"), since the code goes to their phone.
+3. **Phone number:** skip it if it's optional. If the site requires one, use the assistant's own line (`identity assistant.phone`), **never the owner's**. Take `START=$(date +%s)` BEFORE you trigger the code, then read it with `~/.claude/skills/sms-assistant/scripts/sms-otp --since $START --match <Brand>`. Only if the site rejects that number, fall back to the owner's (`identity owner.phone`), and **text the owner first** ("<site> won't take my number, signing up with yours, you'll get a verification text").
 4. **Decline every upsell:** memberships and free trials (Walmart+, Prime, etc.), store credit cards, marketing/SMS opt-ins, "save 10% today" offers. Untick pre-ticked marketing boxes.
 5. **Record it:** add a row to the "Site accounts" table above (login method, Keychain service, which phone, whether a card is saved, preferred address). No secrets in the table.
 

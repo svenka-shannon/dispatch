@@ -44,6 +44,7 @@ Account: an OpenTable account signed in on Sven's Chrome, with email svenka.shan
 - `read`, `type` and `insert-text` don't reach the inputs (the auth form is an out-of-process iframe), and `iframe-click` finds nothing.
 - What works: `click-by-name` for real buttons, `click-at <x> <y>` with screenshot coordinates (1:1), and **`cliclick t:<text>`** for typing. That needs Chrome to be frontmost (`chrome focus <tab>`, check with `lsappinfo front`).
 - Sign-in: load `https://www.opentable.com/authenticate/start?rp=https%3A%2F%2Fwww.opentable.com%2F&srs=1&isFromBookingFlow=false` top-level. Type the email, Continue, then get the code from Gmail (`chrome fetch "https://mail.google.com/mail/u/0/#search/opentable"`; it's in the snippet). Type the code, Continue.
+- Any code texted to the assistant's line: `sms-otp` (take START before triggering). Never ask the owner to relay a code; see sms-assistant, "Accounts, sign-ups & verification codes".
 - "Notify me" on the website only shows a QR code. **Availability alerts are app-only**, so the assistant can't set them. The owner can, in their own app.
 
 **Steps (≈1 min; OpenTable holds the slot for 5 min once a seating is selected):**

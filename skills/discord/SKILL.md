@@ -182,3 +182,6 @@ On 2026-11-01 a session deleted 17 channels in the wrong server: a `.env` for a 
 - **Every owner message gets a reply, even a single line, BEFORE you go back to background work.** Reply to anything pending before you launch build agents. On 2026-11-03 the owner wrote "You don't reply" and "You didn't address my comments about rank etc" while agents ran.
 - **When the owner says he doesn't want X, don't build X.** He said "don't really care about tiers", and the session built a 10-tier ranked ladder anyway.
 - Don't copy a competitor's whole feature table. Build what was asked for, then list extras as options and ask before building them.
+- **Never post about compaction or a still-working status.** Post only results, blockers that need a decision, or replies to unanswered owner messages. (2026-11-04: about 113 "still at it" posts during a loop. Owner: "Compacting messages don't need to go in discord channels".)
+- **In a project channel, the channel IS the context.** Don't ask which project. If a request is truly ambiguous, state a default and start ("I'll assume the card-sorter build and start a draft unless you say otherwise").
+- **A new owner request preempts a running background loop.** Pause the loop and start the request. Never report "still waiting on clarification" when you could start on a default.

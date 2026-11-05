@@ -104,7 +104,9 @@ if [[ -n "$SESSION_NAME" ]]; then
   # Keep the signed override body ONE plain paragraph. A "**Important:** ..." line inside
   # the body looks like the wrapper footer, so sessions left it out of --payload-file,
   # verification failed, and the session reported a "fake admin override" (2026-11-01).
+  # 2026-11-04: "If you owe the user a reply, send it now" made a looping session post
+  # ~113 "still at it" messages after compactions. Results and real replies only.
   "$HOME_DIR/dispatch/bin/claude-assistant" inject-prompt "$SESSION_NAME" --admin \
-    "Context was just compacted. If you were mid-task, continue where you left off. If you owe the user a reply, send it now. ${SKILL_HINT}Reply with: $REPLY_CMD" \
+    "Context was just compacted. If you were mid-task, continue where you left off. Do NOT send any message about the compaction itself or a still-working status update; the user does not want those. Only send a message if a user message is actually unanswered or you have a real result to report. ${SKILL_HINT}In that case reply with: $REPLY_CMD" \
     2>/dev/null &
 fi

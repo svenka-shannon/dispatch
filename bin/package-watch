@@ -259,7 +259,11 @@ def main() -> int:
             if all(s.lower().startswith("delivered") for s in sts):
                 dates = [d for d in (_amazon_delivered_date(s) for s in sts) if d]
                 last = max(dates) if dates else None
-                if state.get(f"{oid}:delivered_reported") or (last and last < date.today()):
+                # 2026-11-05: retiring on "delivered before today" meant a parcel that
+                # landed AFTER the morning digest was never reported at all (the
+                # litter bags + belt order, delivered 11/4 afternoon, retired silently
+                # on 11/5). Report every delivery once; only skip ones >1 day stale.
+                if state.get(f"{oid}:delivered_reported") or (last and (date.today() - last).days > 1):
                     log(f"{label}: fully delivered {last} — already news, retiring")
                     retire_orders.add(w.get("order"))
                     continue

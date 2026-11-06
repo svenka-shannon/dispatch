@@ -413,8 +413,25 @@ class TestAmazonOrders:
         assert "1 shipment already delivered" in sent[0]
         assert "no tracking number" not in sent[0]
 
+    def test_delivered_yesterday_after_digest_is_still_reported(self, tmp_path, monkeypatch):
+        y = date.today() - timedelta(days=1)
+        cfg = [{"order": "Amazon #114-0000000-0000003", "label": "belt",
+                "ordered": str(y), "contact": "+10000000000"}]
+        monkeypatch.setattr(pw, "CONFIG", tmp_path / "c.json")
+        monkeypatch.setattr(pw, "STATE", tmp_path / "s.json")
+        monkeypatch.setattr(pw, "LOG", tmp_path / "log")
+        pw.CONFIG.write_text(json.dumps(cfg))
+        monkeypatch.setattr(pw, "amazon_statuses", lambda: {
+            "114-0000000-0000003": [f"Delivered {y:%B} {y.day}"]})
+        monkeypatch.setattr(pw, "recently_spoke", lambda c: False)
+        monkeypatch.setattr(pw, "DIGEST_HOUR", 0)
+        sent = []
+        monkeypatch.setattr(pw, "notify", lambda c, t: sent.append(t) or True)
+        pw.main()
+        assert sent and "DELIVERED" in sent[0]
+
     def test_fully_delivered_in_past_is_retired_silently(self, tmp_path, monkeypatch):
-        old = date.today() - timedelta(days=2)
+        old = date.today() - timedelta(days=3)
         cfg = [{"order": "Amazon #114-0000000-0000002", "label": "bags",
                 "ordered": str(old), "contact": "+10000000000"}]
         monkeypatch.setattr(pw, "CONFIG", tmp_path / "c.json")

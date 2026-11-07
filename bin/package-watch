@@ -267,7 +267,10 @@ def main() -> int:
                     log(f"{label}: fully delivered {last} — already news, retiring")
                     retire_orders.add(w.get("order"))
                     continue
-                digest_lines.append(f"· {label} — DELIVERED ({sts[-1][len('Delivered'):].strip()})")
+                # Name the LATEST delivery date. Card order isn't chronological
+                # (2026-11-06 reported "November 4" for a box that landed Nov 5).
+                when = f"{last:%B} {last.day}" if last else sts[-1][len("Delivered"):].strip()
+                digest_lines.append(f"· {label} — DELIVERED ({when})")
                 delivered_orders_now.append(oid)
                 continue
             # Partial / in transit: list each shipment status once. Already-delivered

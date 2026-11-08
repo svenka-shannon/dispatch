@@ -1,0 +1,584 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["pyyaml>=6", "pillow>=10"]
+# ///
+"""Render a step-by-step assembly / exploded-view video (MP4, optional GIF) from OpenSCAD or STL parts.
+
+Usage:
+  cad-assembly-video assembly.scad --steps steps.yaml [--out out.mp4] [--gif]
+                     [--fps 24] [--size 1280x720] [--keyframes DIR]
+
+Pipeline:
+  1. Copy assembly.scad into a temp dir, rewriting relative use<>/include<>/import() paths to
+     absolute so it renders from there.
+  2. Generate wrapper.scad: one module per step, explode offsets eased by $t, camera ($vpr/$vpt/$vpd)
+     keyframed per step (eased transitions + optional turntable outro).
+  3. Probe renders (--viewall --summary) pick a fixed camera that fits the whole exploded scene.
+  4. `openscad --animate N --backend=manifold --render`, sharded across CPU cores.
+  5. Captions are drawn as transparent PNGs (Pillow) and burned in with the ffmpeg overlay filter
+     (Homebrew ffmpeg has no drawtext/libfreetype). Encode H.264 yuv420p +faststart; GIF via palettegen.
+  6. Print JSON: out, size, duration, frames, keyframes ...
+"""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures as cf
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+from pathlib import Path
+
+import yaml
+from PIL import Image, ImageDraw, ImageFont
+
+PALETTE = ["#4C78A8", "#F58518", "#54A24B", "#E45756", "#72B7B2", "#EECA3B",
+           "#B279A2", "#FF9DA6", "#9D755D", "#BAB0AC"]
+FONT_CANDIDATES = [
+    ("/System/Library/Fonts/Supplemental/Arial Bold.ttf", "/System/Library/Fonts/Supplemental/Arial.ttf"),
+    ("/System/Library/Fonts/HelveticaNeue.ttc", "/System/Library/Fonts/HelveticaNeue.ttc"),
+    ("/Library/Fonts/Arial Unicode.ttf", "/Library/Fonts/Arial Unicode.ttf"),
+]
+MARGIN = 1.15        # viewall distance multiplier (breathing room)
+CAPTION_LIFT = 0.07  # fraction of frame height the model is raised to clear the caption bar
+AXES = {"x": (1, 0, 0), "y": (0, 1, 0), "z": (0, 0, 1)}
+
+
+def die(msg: str, code: int = 1):
+    print(json.dumps({"error": msg}), file=sys.stdout)
+    sys.exit(code)
+
+
+def find_openscad() -> str:
+    for c in [os.environ.get("OPENSCAD"), shutil.which("openscad"),
+              "/Applications/OpenSCAD.app/Contents/MacOS/OpenSCAD"]:
+        if c and Path(c).exists():
+            return c
+    die("openscad not found. Install: brew install --cask openscad@snapshot")
+
+
+# ---------------------------------------------------------------- path rewriting
+USE_RE = re.compile(r'\b(use|include)\s*<([^>]+)>')
+FILE_RE = re.compile(r'\b(import|surface)\s*\(\s*(file\s*=\s*)?"([^"]+)"')
+
+
+def absolutize(src: str, base: Path) -> str:
+    """Rewrite relative use<>/include<>/import("")/surface("") paths to absolute ones (relative to base)."""
+    def fix(p: str) -> str:
+        pp = Path(p).expanduser()
+        if pp.is_absolute():
+            return str(pp)
+        cand = (base / pp).resolve()
+        return str(cand) if cand.exists() else p  # leave library-path refs (e.g. BOSL2) alone
+
+    src = USE_RE.sub(lambda m: f"{m.group(1)} <{fix(m.group(2))}>", src)
+    src = FILE_RE.sub(lambda m: f'{m.group(1)}({m.group(2) or ""}"{fix(m.group(3))}"', src)
+    return src
+
+
+# ---------------------------------------------------------------- yaml parsing
+def parse_explode(val, default_dist: float):
+    if val is None:
+        val = "+z"
+    if isinstance(val, (int, float)):
+        return [0.0, 0.0, float(val)]
+    if isinstance(val, (list, tuple)):
+        if len(val) != 3:
+            die(f"explode vector needs 3 numbers: {val}")
+        return [float(v) for v in val]
+    m = re.fullmatch(r'\s*([+-]?)([xyz])\s*([0-9.]+)?\s*', str(val).lower())
+    if not m:
+        die(f"bad explode spec {val!r}; use [x,y,z], '+z', '-x 40', or a number (z offset)")
+    sign = -1.0 if m.group(1) == "-" else 1.0
+    dist = float(m.group(3)) if m.group(3) else default_dist
+    return [sign * dist * a for a in AXES[m.group(2)]]
+
+
+def as_list(v):
+    if v is None:
+        return []
+    return v if isinstance(v, list) else [v]
+
+
+def fmt_vec(v):
+    return "[" + ",".join(f"{float(x):.6g}" for x in v) + "]"
+
+
+def scad_str(s: str) -> str:
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def step_body(step: dict, yaml_dir: Path, asm_dir: Path | None) -> str:
+    """OpenSCAD statements for one step's parts (assembled position)."""
+    lines = []
+    for p in as_list(step.get("part")) + as_list(step.get("parts")):
+        code = str(p).strip()
+        if not code.endswith(";") and not code.endswith("}"):
+            code += ";"
+        lines.append(absolutize(code, asm_dir or yaml_dir))
+    for s in as_list(step.get("stl")):
+        sp = Path(str(s)).expanduser()
+        if not sp.is_absolute():
+            cands = [yaml_dir / sp] + ([asm_dir / sp] if asm_dir else [])
+            sp = next((c for c in cands if c.exists()), cands[0])
+        if not sp.exists():
+            die(f"stl not found: {s}")
+        lines.append(f'import({scad_str(str(sp.resolve()))}, convexity=10);')
+    body = "\n    ".join(lines)
+    if step.get("rotate") is not None:
+        body = f"rotate({fmt_vec(step['rotate'])}) {{\n    {body}\n  }}"
+    if step.get("at") is not None:
+        body = f"translate({fmt_vec(step['at'])}) {{\n    {body}\n  }}"
+    return body
+
+
+# ---------------------------------------------------------------- scad generation
+def build_wrapper(cfg, steps, timeline, nframes, asm_name, mode) -> str:
+    out = ["// generated by cad-assembly-video", ""]
+    if asm_name:
+        out.append(f"{mode} <{asm_name}>")
+    # defines come AFTER the include so they override the file's own top-level values (last assignment wins).
+    # Strings are emitted as raw OpenSCAD expressions; write '"text"' for a string literal.
+    for k, v in (cfg.get("defines") or {}).items():
+        val = ("true" if v else "false") if isinstance(v, bool) else v
+        out.append(f"{k} = {val};")
+    out += [
+        "",
+        "PROBE = 0;  // 0=animate, 1=assembled, 2=assembled+exploded+intro, 3=assembled+exploded, 100+i=step i travel, 200+i=step i only",
+        f"NF = {nframes};",
+        "F = round($t * NF);",
+        f"INTRO_END = {timeline['intro_end']};",
+        "function clamp01(x) = min(1, max(0, x));",
+        "function ease(x) = let(p = clamp01(x)) p < 0.5 ? 4*p*p*p : 1 - pow(-2*p + 2, 3) / 2;",
+        "function lerp(a, b, u) = a + (b - a) * u;",
+        "// explode offset: spread-out layout (vi) during intro, then v eases to 0 over [start, start+fly)",
+        "function off(start, fly, v, vi) = F < INTRO_END ? vi : v * (1 - ease((F - start) / fly));",
+        "",
+        "// camera segments: [f0, f1, rot0, tr0, d0, rot1, tr1, d1, linear?]",
+        "CAM = [",
+    ]
+    for c in timeline["cam"]:
+        out.append(f"  [{c['f0']}, {c['f1']}, {fmt_vec(c['r0'])}, {fmt_vec(c['t0'])}, {c['d0']:.6g}, "
+                   f"{fmt_vec(c['r1'])}, {fmt_vec(c['t1'])}, {c['d1']:.6g}, {1 if c['linear'] else 0}],")
+    out += [
+        "];",
+        "function cam_seg(f) = let(m = [for (c = CAM) if (f >= c[0] && f < c[1]) c]) len(m) ? m[0] : CAM[len(CAM)-1];",
+        "_c = cam_seg(F);",
+        "_u = _c[8] ? clamp01((F - _c[0]) / max(1, _c[1] - _c[0])) : ease((F - _c[0]) / max(1, _c[1] - _c[0]));",
+        "$vpr = lerp(_c[2], _c[5], _u);",
+        "$vpt = lerp(_c[3], _c[6], _u);",
+        "$vpd = lerp(_c[4], _c[7], _u);",
+        "",
+    ]
+    for i, st in enumerate(steps):
+        body = st["_body"]
+        out.append(f"// step {i+1}: {st.get('caption','')}".replace("\n", " "))
+        if body:
+            out.append(f"module __step_{i}() color({scad_str(st['_color'])}) {{\n  {body}\n}}")
+        else:
+            out.append(f"module __step_{i}() {{}}")
+    out += ["", "if (PROBE == 0) {"]
+    for i, st in enumerate(steps):
+        t = timeline["steps"][i]
+        out.append(f"  if (F < INTRO_END || F >= {t['start']}) "
+                   f"translate(off({t['start']}, {t['fly']}, {fmt_vec(st['_explode'])}, "
+                   f"{fmt_vec(st['_intro'])})) __step_{i}();")
+    out += ["} else {"]
+    for i, st in enumerate(steps):
+        out.append(f"  if (PROBE <= 3 || PROBE == {100+i} || PROBE == {200+i}) __step_{i}();")
+        out.append(f"  if (PROBE == 2 || PROBE == 3 || PROBE == {100+i}) translate({fmt_vec(st['_explode'])}) __step_{i}();")
+        out.append(f"  if (PROBE == 2) translate({fmt_vec(st['_intro'])}) __step_{i}();")
+    out.append("}")
+    return "\n".join(out) + "\n"
+
+
+def probe(osc, wrapper: Path, probe_id: int, size, cam_rot, colorscheme, timeout=900) -> dict:
+    png = wrapper.parent / f"probe_{probe_id}.png"
+    summ = wrapper.parent / f"probe_{probe_id}.json"
+    cmd = [osc, "--backend=manifold", "--render", "-o", str(png), "-D", f"PROBE={probe_id}",
+           f"--camera=0,0,0,{cam_rot[0]},{cam_rot[1]},{cam_rot[2]},100", "--viewall", "--autocenter",
+           f"--imgsize={size[0]},{size[1]}", f"--colorscheme={colorscheme}",
+           "--summary", "camera", "--summary", "geometry", "--summary", "bounding-box", "--summary-file", str(summ), str(wrapper)]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0 or not summ.exists():
+        die(f"openscad probe {probe_id} failed:\n{r.stderr[-4000:]}")
+    return json.loads(summ.read_text())
+
+
+def layout_intro(osc, wrapper, steps, explode_dist, colorscheme, jobs):
+    """Intro 'parts overview': parts exploding along the same direction are stacked so they don't overlap.
+
+    For each direction group (in step order) part i is pushed out along u = unit(explode) by
+    max(|explode|, frontier + gap - min_proj(part)), where frontier = max projection of the previous
+    part in that group after its push. Per-step `intro_explode: [x,y,z]` overrides.
+    """
+    def bbox(i):
+        if not steps[i]["_body"] or steps[i].get("intro_explode") is not None:
+            return None
+        g = (probe(osc, wrapper, 200 + i, (64, 36), [55, 0, 25], colorscheme).get("geometry") or {})
+        return g.get("bounding_box")
+
+    with cf.ThreadPoolExecutor(max(1, jobs)) as ex:
+        boxes = list(ex.map(bbox, range(len(steps))))
+    gap = 0.15 * explode_dist
+    frontiers = []  # [(unit, frontier)]
+    for st, bb in zip(steps, boxes):
+        e = st["_explode"]
+        if st.get("intro_explode") is not None:
+            st["_intro"] = [float(x) for x in st["intro_explode"]]
+            continue
+        mag = math.sqrt(sum(a * a for a in e))
+        if not bb or mag < 1e-9:
+            st["_intro"] = list(e)
+            continue
+        u = [a / mag for a in e]
+        lo = sum(min(uk * a, uk * b) for uk, a, b in zip(u, bb["min"], bb["max"]))
+        hi = sum(max(uk * a, uk * b) for uk, a, b in zip(u, bb["min"], bb["max"]))
+        grp = next((g for g in frontiers if sum(a * b for a, b in zip(g[0], u)) > 0.999), None)
+        push = mag if grp is None else max(mag, grp[1] + gap - lo)
+        st["_intro"] = [uk * push for uk in u]
+        if grp is None:
+            frontiers.append([u, hi + push])
+        else:
+            grp[1] = max(grp[1], hi + push)
+
+
+def unwrap(prev, new):
+    """Shift angles of `new` by multiples of 360 so they're nearest to `prev` (avoid long spins)."""
+    return [n + 360 * round((p - n) / 360) for p, n in zip(prev, new)]
+
+
+# ---------------------------------------------------------------- captions
+def load_fonts(size: int, font_path: str | None):
+    if font_path:
+        f = ImageFont.truetype(font_path, size)
+        return f, f, ImageFont.truetype(font_path, int(size * 0.75))
+    for bold, reg in FONT_CANDIDATES:
+        if Path(bold).exists() and Path(reg).exists():
+            try:
+                return (ImageFont.truetype(bold, size), ImageFont.truetype(reg, size),
+                        ImageFont.truetype(bold, int(size * 0.75)))
+            except OSError:
+                continue
+    f = ImageFont.load_default(size)
+    return f, f, f
+
+
+def caption_png(path: Path, size, badge: str, text: str, font_path=None):
+    W, H = size
+    fs = max(14, round(H / 24))
+    bold, reg, small = load_fonts(fs, font_path)
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    pad = round(fs * 0.7)
+    lines = []
+    if text:
+        avg = max(1.0, d.textlength("abcdefghijklmnopqrstuvwxyz ABCDEFGH", font=reg) / 35)
+        maxchars = max(10, int((W - 4 * pad) / avg))
+        for para in str(text).splitlines():
+            lines += textwrap.wrap(para, maxchars) or [""]
+    if lines:
+        lh = round(fs * 1.25)
+        bh = lh * len(lines) + 2 * pad
+        d.rectangle([0, H - bh, W, H], fill=(15, 18, 24, 205))
+        y = H - bh + pad
+        for ln in lines:
+            tw = d.textlength(ln, font=reg)
+            d.text(((W - tw) / 2, y), ln, font=reg, fill=(255, 255, 255, 255))
+            y += lh
+    if badge:
+        bw = d.textlength(badge, font=small) + 2 * pad
+        bh2 = round(fs * 0.75 * 1.2) + pad
+        d.rounded_rectangle([pad, pad, pad + bw, pad + bh2], radius=pad // 2, fill=(15, 18, 24, 215))
+        d.text((pad * 2, pad + pad / 2), badge, font=small, fill=(255, 200, 80, 255))
+    img.save(path)
+
+
+# ---------------------------------------------------------------- main
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("assembly", nargs="?", help="assembly .scad (its modules are use<>'d); omit if all steps are stl:")
+    ap.add_argument("--steps", required=True, help="steps.yaml")
+    ap.add_argument("--out", help="output .mp4 (default /tmp/cad_output/<name>_assembly_<ts>.mp4)")
+    ap.add_argument("--gif", action="store_true", help="also write a GIF next to the MP4")
+    ap.add_argument("--gif-width", type=int, default=720)
+    ap.add_argument("--fps", type=int, default=24)
+    ap.add_argument("--size", default="1280x720", help="WxH (even numbers)")
+    ap.add_argument("--keyframes", help="dump one captioned PNG per step (mid-flight) + intro/final into DIR")
+    ap.add_argument("--colorscheme", help="OpenSCAD colorscheme (default from yaml or 'Tomorrow')")
+    ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4, help="parallel openscad shards")
+    ap.add_argument("--font", help="TTF/TTC font for captions")
+    ap.add_argument("--keep", action="store_true", help="keep the temp work dir (wrapper.scad, frames)")
+    args = ap.parse_args()
+
+    for tool in ("ffmpeg",):
+        if not shutil.which(tool):
+            die(f"{tool} not found (brew install ffmpeg)")
+    osc = find_openscad()
+    try:
+        W, H = (int(x) for x in args.size.lower().split("x"))
+    except ValueError:
+        die("--size must be WxH, e.g. 1280x720")
+    W -= W % 2
+    H -= H % 2
+    fps = args.fps
+
+    steps_path = Path(args.steps).expanduser().resolve()
+    if not steps_path.exists():
+        die(f"steps file not found: {steps_path}")
+    cfg = yaml.safe_load(steps_path.read_text()) or {}
+    if isinstance(cfg, list):
+        cfg = {"steps": cfg}
+    steps = cfg.get("steps") or []
+    if not steps:
+        die("steps.yaml has no steps")
+    yaml_dir = steps_path.parent
+    colorscheme = args.colorscheme or cfg.get("colorscheme", "Tomorrow")
+    mode = cfg.get("mode", "use")
+    if mode not in ("use", "include"):
+        die("mode must be 'use' or 'include'")
+
+    asm_dir, asm_name = None, None
+    if args.assembly and not Path(args.assembly).expanduser().exists():
+        die(f"assembly not found: {args.assembly}")
+    work = Path(tempfile.mkdtemp(prefix="cad-assembly-"))
+    if args.assembly:
+        asm = Path(args.assembly).expanduser().resolve()
+        asm_dir = asm.parent
+        asm_name = "assembly_src.scad"
+        (work / asm_name).write_text(absolutize(asm.read_text(), asm_dir))
+    name = Path(args.assembly).stem if args.assembly else steps_path.stem
+
+    # ---- timeline (frames)
+    seconds_default = float(cfg.get("seconds_per_step", 3.0))
+    fly_frac = float(cfg.get("fly_fraction", 0.6))
+    intro_s = float(cfg.get("intro_seconds", 2.0 if cfg.get("intro", True) else 0))
+    outro = cfg.get("outro", {"spin": True})
+    if outro is True:
+        outro = {"spin": True}
+    outro = outro or {}
+    outro_s = float(outro.get("seconds", 4.0)) if outro else 0.0
+
+    # first pass with placeholder explode distance (needed for assembled-bbox probe)
+    for i, st in enumerate(steps):
+        st["_color"] = str(st.get("color") or PALETTE[i % len(PALETTE)])
+        st["_body"] = step_body(st, yaml_dir, asm_dir)
+        st["_explode"] = [0, 0, 0]
+        st["_intro"] = [0, 0, 0]
+
+    def write_wrapper(timeline, nframes):
+        wp = work / "wrapper.scad"
+        wp.write_text(build_wrapper(cfg, steps, timeline, nframes, asm_name, mode))
+        return wp
+
+    dummy_tl = {"intro_end": 0, "steps": [{"start": 0, "fly": 1}] * len(steps),
+                "cam": [{"f0": 0, "f1": 1, "r0": [55, 0, 25], "t0": [0, 0, 0], "d0": 100,
+                         "r1": [55, 0, 25], "t1": [0, 0, 0], "d1": 100, "linear": False}]}
+    cam_cfg = cfg.get("camera") or {}
+    base_rot = [float(x) for x in cam_cfg.get("rot", [60, 0, 30])]
+    wp = write_wrapper(dummy_tl, 1)
+    s1 = probe(osc, wp, 1, (W, H), base_rot, colorscheme)
+    bb = (s1.get("geometry") or {}).get("bounding_box") or {"size": [100, 100, 100]}
+    explode_dist = float(cfg.get("explode_distance") or round(max(bb["size"]) * 0.6, 1) or 50)
+    for st in steps:
+        st["_explode"] = parse_explode(st.get("explode"), explode_dist)
+    if intro_s:
+        layout_intro(osc, write_wrapper(dummy_tl, 1), steps, explode_dist, colorscheme, args.jobs)
+
+    # camera for whole scene (assembled + exploded) with a margin for captions
+    wp = write_wrapper(dummy_tl, 1)
+    s2 = probe(osc, wp, 2, (W, H), base_rot, colorscheme)  # intro framing (spread-out parts)
+    s3 = probe(osc, wp, 3, (W, H), base_rot, colorscheme)  # step framing (assembled + fly-in paths)
+    zoom = float(cam_cfg.get("zoom", 1.0))
+    fov = float(s2["camera"].get("fov", 22.5))
+
+    def lift(t, r, d):
+        """Move the view target down along screen-up so the model sits above the caption bar."""
+        rx, rz = math.radians(r[0]), math.radians(r[2])
+        up = [-math.sin(rz) * math.cos(rx), math.cos(rz) * math.cos(rx), math.sin(rx)]  # Rz*Rx*(0,1,0)
+        shift = 2 * d * math.tan(math.radians(fov / 2)) * CAPTION_LIFT
+        return [a - u * shift for a, u in zip(t, up)]
+
+    d0 = float(cam_cfg.get("dist") or s3["camera"]["distance"] * MARGIN / zoom)
+    t0_ = [float(x) for x in cam_cfg["center"]] if cam_cfg.get("center") else lift(
+        s3["camera"]["translation"], base_rot, d0)
+    base_cam = {"r": base_rot, "t": t0_, "d": d0}
+    di = float(cam_cfg.get("dist") or s2["camera"]["distance"] * MARGIN / zoom)
+    intro_cam = {"r": base_rot, "d": di, "t": [float(x) for x in cam_cfg["center"]] if cam_cfg.get("center")
+                 else lift(s2["camera"]["translation"], base_rot, di)}
+
+    def step_cam(i, st):
+        c = st.get("camera")
+        if not c:
+            return dict(base_cam)
+        if isinstance(c, str):
+            v = [float(x) for x in c.split(",")]
+            if len(v) != 7:
+                die(f"step {i+1}: camera string must be tx,ty,tz,rx,ry,rz,dist")
+            return {"t": v[0:3], "r": v[3:6], "d": v[6]}
+        rot = [float(x) for x in c.get("rot", base_cam["r"])]
+        center, d = list(s3["camera"]["translation"]), base_cam["d"]
+        if c.get("fit") == "step" and st["_body"]:
+            sp = probe(osc, wp, 100 + i, (W, H), rot, colorscheme)
+            center, d = sp["camera"]["translation"], sp["camera"]["distance"] * MARGIN
+        if c.get("dist") is not None:
+            d = float(c["dist"])
+        d /= float(c.get("zoom", 1.0))
+        if c.get("center") is not None:
+            t = [float(x) for x in c["center"]]  # explicit look-at point: used as-is
+        elif not c.get("fit") and cam_cfg.get("center"):
+            t = list(base_cam["t"])
+        else:
+            t = lift(center, rot, d)  # re-lift for this rotation so the model clears the caption bar
+        return {"r": rot, "t": t, "d": d}
+
+    # ---- build timeline in frames
+    f = 0
+    intro_end = round(intro_s * fps)
+    cams, tl_steps, captions = [], [], []
+    title = cfg.get("title") or "Parts overview"
+    if intro_end:
+        cams.append({"f0": 0, "f1": intro_end, "r0": intro_cam["r"], "t0": intro_cam["t"], "d0": intro_cam["d"],
+                     "r1": intro_cam["r"], "t1": intro_cam["t"], "d1": intro_cam["d"], "linear": False})
+        captions.append({"f0": 0, "f1": intro_end, "badge": "", "text": title, "key": "00_intro"})
+        f = intro_end
+    prev = intro_cam if intro_end else base_cam
+    n = len(steps)
+    for i, st in enumerate(steps):
+        dur = max(2, round(float(st.get("seconds", seconds_default)) * fps))
+        cam = step_cam(i, st)
+        cam["r"] = unwrap(prev["r"], cam["r"])
+        moving = cam != prev
+        trans = max(1, round(dur * 0.3)) if moving else 0
+        if trans:
+            cams.append({"f0": f, "f1": f + trans, "r0": prev["r"], "t0": prev["t"], "d0": prev["d"],
+                         "r1": cam["r"], "t1": cam["t"], "d1": cam["d"], "linear": False})
+        cams.append({"f0": f + trans, "f1": f + dur, "r0": cam["r"], "t0": cam["t"], "d0": cam["d"],
+                     "r1": cam["r"], "t1": cam["t"], "d1": cam["d"], "linear": False})
+        # parts start flying after the camera settles
+        fly = max(1, round((dur - trans) * fly_frac))
+        tl_steps.append({"start": f + trans, "fly": fly, "dur": dur})
+        captions.append({"f0": f, "f1": f + dur, "badge": f"Step {i+1} of {n}",
+                         "text": st.get("caption", ""), "key": f"{i+1:02d}_step",
+                         "kf": f + trans + round(fly * 0.4)})
+        prev = cam
+        f += dur
+    if outro_s:
+        od = round(outro_s * fps)
+        final = dict(base_cam)
+        final["r"] = unwrap(prev["r"], base_cam["r"])
+        settle = round(od * 0.2) if final != prev else 0
+        if settle:
+            cams.append({"f0": f, "f1": f + settle, "r0": prev["r"], "t0": prev["t"], "d0": prev["d"],
+                         "r1": final["r"], "t1": final["t"], "d1": final["d"], "linear": False})
+        spin = 360.0 if outro.get("spin", True) else 0.0
+        r_end = [final["r"][0], final["r"][1], final["r"][2] + spin]
+        # final assembly framing: assembled bbox (s1 camera) looks better than exploded framing
+        d_fin = s1["camera"]["distance"] * MARGIN * 1.1 if spin else final["d"]
+        t_fin = lift(s1["camera"]["translation"], final["r"], d_fin) if spin else final["t"]
+        cams.append({"f0": f + settle, "f1": f + od, "r0": final["r"], "t0": final["t"], "d0": final["d"],
+                     "r1": r_end, "t1": t_fin, "d1": d_fin, "linear": True})
+        captions.append({"f0": f, "f1": f + od, "badge": "Done",
+                         "text": outro.get("caption", "Assembly complete"), "key": f"{n+1:02d}_final",
+                         "kf": f + od - 1})
+        f += od
+    nframes = f
+    timeline = {"intro_end": intro_end, "steps": tl_steps, "cam": cams}
+    wp = write_wrapper(timeline, nframes)
+
+    # ---- render frames (sharded)
+    frames_dir = work / "frames"
+    frames_dir.mkdir()
+    jobs = max(1, min(args.jobs, nframes))
+    t0 = time.time()
+
+    def shard(k):
+        cmd = [osc, "--backend=manifold", "--render", "-o", str(frames_dir / "f.png"),
+               f"--imgsize={W},{H}", f"--colorscheme={colorscheme}", "--projection=p",
+               "--animate", str(nframes), "--animate_sharding", f"{k}/{jobs}", str(wp)]
+        return subprocess.run(cmd, capture_output=True, text=True)
+
+    with cf.ThreadPoolExecutor(jobs) as ex:
+        results = list(ex.map(shard, range(1, jobs + 1)))
+    for r in results:
+        if r.returncode != 0:
+            die(f"openscad render failed:\n{r.stderr[-4000:]}")
+    got = sorted(frames_dir.glob("f*.png"))
+    if len(got) != nframes:
+        die(f"expected {nframes} frames, got {len(got)} (see {work})")
+    render_s = time.time() - t0
+
+    # ---- captions -> overlay
+    cap_inputs = []
+    for j, c in enumerate(captions):
+        p = work / f"cap_{j:03d}.png"
+        caption_png(p, (W, H), c["badge"], c["text"], args.font)
+        c["png"] = p
+        cap_inputs += ["-i", str(p)]
+    chain, last = [], "[0:v]"
+    for j, c in enumerate(captions):
+        lbl = f"[v{j}]"
+        chain.append(f"{last}[{j+1}:v]overlay=0:0:enable='between(n,{c['f0']},{c['f1']-1})'{lbl}")
+        last = lbl
+    chain.append(f"{last}format=yuv420p[vout]")
+
+    if args.out:
+        out = Path(args.out).expanduser().resolve()
+    else:
+        out = Path("/tmp/cad_output") / f"{name}_assembly_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-framerate", str(fps),
+           "-i", str(frames_dir / "f%05d.png"), *cap_inputs,
+           "-filter_complex", ";".join(chain), "-map", "[vout]",
+           "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p",
+           "-movflags", "+faststart", "-r", str(fps), str(out)]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"ffmpeg encode failed:\n{r.stderr[-4000:]}")
+
+    result = {"out": str(out), "size_bytes": out.stat().st_size, "duration_s": round(nframes / fps, 2),
+              "frames": nframes, "fps": fps, "width": W, "height": H, "steps": n,
+              "explode_distance": explode_dist, "render_seconds": round(render_s, 1)}
+
+    if args.gif:
+        gif = out.with_suffix(".gif")
+        gw = min(args.gif_width, W)
+        gfps = min(fps, 15)
+        r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(out), "-vf",
+                            f"fps={gfps},scale={gw}:-1:flags=lanczos,split[a][b];"
+                            f"[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=4",
+                            "-loop", "0", str(gif)], capture_output=True, text=True)
+        if r.returncode != 0:
+            die(f"ffmpeg gif failed:\n{r.stderr[-4000:]}")
+        result["gif"] = str(gif)
+        result["gif_size_bytes"] = gif.stat().st_size
+
+    if args.keyframes:
+        kd = Path(args.keyframes).expanduser().resolve()
+        kd.mkdir(parents=True, exist_ok=True)
+        kfs = []
+        for c in captions:
+            fi = min(nframes - 1, c.get("kf", (c["f0"] + c["f1"]) // 2))
+            base = Image.open(frames_dir / f"f{fi:05d}.png").convert("RGBA")
+            base.alpha_composite(Image.open(c["png"]).convert("RGBA"))
+            p = kd / f"{c['key']}.png"
+            base.convert("RGB").save(p)
+            kfs.append(str(p))
+        result["keyframes"] = kfs
+
+    if args.keep:
+        result["workdir"] = str(work)
+    else:
+        shutil.rmtree(work, ignore_errors=True)
+    print(json.dumps(result, indent=2))
+
+
+if __name__ == "__main__":
+    main()

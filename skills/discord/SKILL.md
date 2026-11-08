@@ -185,3 +185,19 @@ On 2026-11-01 a session deleted 17 channels in the wrong server: a `.env` for a 
 - **Never post about compaction or a still-working status.** Post only results, blockers that need a decision, or replies to unanswered owner messages. (2026-11-04: about 113 "still at it" posts during a loop. Owner: "Compacting messages don't need to go in discord channels".)
 - **In a project channel, the channel IS the context.** Don't ask which project. If a request is truly ambiguous, state a default and start ("I'll assume the card-sorter build and start a draft unless you say otherwise").
 - **A new owner request preempts a running background loop.** Pause the loop and start the request. Never report "still waiting on clarification" when you could start on a default.
+- **Look it up before you ask: history first, then the project's files.** After compaction, or whenever a message refers to something you don't remember, do these BEFORE asking the owner anything:
+  1. `read-discord <channel_id> --limit 100` (page back with `--before`) and find the original request.
+  2. Open the project's own files: its git repo (see PROJECT.md, `~/code/`, `gh repo list`), plus the BOM, docs/ASSEMBLY, CAD and README. Prefer `git pull`/`gh repo clone` over grepping `.compactions/*.md` or old `/tmp` clones.
+  Never ask "can you remind me", "what parts do you have" or "is this for X", and never say "my context was compacted". If something is still unknown, state your assumption and start. Ask at most one specific question, naming what you found. The owner has whatever you ordered. (2026-11-05: the card-sorter session asked the owner to repeat his video request, then asked which parts he had, when both were in its own repo.)
+
+### Keep a PROJECT.md
+The post-compact hook includes `~/transcripts/discord/<channel_id>/PROJECT.md` in the message it sends after every compaction, so where the project lives survives compaction.
+- Write it the first time you create or clone the repo. Keep it a few short lines, under 1500 bytes:
+  ```
+  repo: github.com/<owner>/<name>
+  path: ~/code/<name>
+  docs: BOM.md, docs/ASSEMBLY.md, cad/
+  status: <current focus>
+  ```
+- Work in `~/code/<name>`. `/tmp` is throwaway; never commit from a fresh /tmp clone (2026-11-07: card-sorter work was committed from /tmp clones for 10+ days).
+- If PROJECT.md is missing, look once (`ls ~/code`, `git remote -v`, `read-discord`), then write it. Update `status:` when the focus changes.

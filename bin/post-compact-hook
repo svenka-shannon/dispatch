@@ -95,6 +95,30 @@ if [[ -n "$SESSION_NAME" ]]; then
       ;;
   esac
 
+  # History command: the compaction summary can DROP owner requests (2026-11-05: an
+  # assembly-video ask vanished and the session asked the owner to repeat it).
+  HIST_CMD=""
+  case "$SOURCE" in
+    discord)  HIST_CMD="~/.claude/skills/discord/scripts/read-discord \"$CHAT_ID\" --limit 100" ;;
+    imessage) HIST_CMD="~/.claude/skills/sms-assistant/scripts/read-sms --chat \"$CHAT_ID\" --limit 40" ;;
+  esac
+  HIST_HINT=""
+  if [[ -n "$HIST_CMD" ]]; then
+    HIST_HINT="Before anything else, run ${HIST_CMD} and look for any owner request not yet done or answered, because the compaction summary can drop requests; resume those first, check the project's own repo and docs rather than asking the owner what exists, and never ask the owner to repeat or remind you. "
+  fi
+
+  # PROJECT.md pointer: where the project lives survives compaction (2026-11-07: work was
+  # committed from throwaway /tmp clones for 10+ days because nobody remembered the repo).
+  PROJECT_HINT=""
+  if [[ -n "$CWD" && -f "$CWD/PROJECT.md" ]]; then
+    PROJ_BYTES=$(wc -c < "$CWD/PROJECT.md" | tr -d ' ')
+    if (( PROJ_BYTES > 1500 )); then
+      echo "post-compact-hook: WARNING $CWD/PROJECT.md is ${PROJ_BYTES} bytes (>1500); keep it short" >&2
+    fi
+    PROJ_FLAT=$(tr '\n' ' ' < "$CWD/PROJECT.md" | sed 's/\*\*//g; s/  */ /g')
+    PROJECT_HINT="Project pointer (from PROJECT.md, trust it over guessing): ${PROJ_FLAT} Work only in the clone named there, never a fresh /tmp clone. "
+  fi
+
   # Build skill read hint for sms backends
   SKILL_HINT=""
   if [[ "$SOURCE" == "imessage" || "$SOURCE" == "signal" ]]; then
@@ -107,6 +131,6 @@ if [[ -n "$SESSION_NAME" ]]; then
   # 2026-11-04: "If you owe the user a reply, send it now" made a looping session post
   # ~113 "still at it" messages after compactions. Results and real replies only.
   "$HOME_DIR/dispatch/bin/claude-assistant" inject-prompt "$SESSION_NAME" --admin \
-    "Context was just compacted. If you were mid-task, continue where you left off. Do NOT send any message about the compaction itself or a still-working status update; the user does not want those. Only send a message if a user message is actually unanswered or you have a real result to report. ${SKILL_HINT}In that case reply with: $REPLY_CMD" \
+    "Context was just compacted. If you were mid-task, continue where you left off. Do NOT send any message about the compaction itself or a still-working status update; the user does not want those. Only send a message if a user message is actually unanswered or you have a real result to report. ${HIST_HINT}${PROJECT_HINT}${SKILL_HINT}In that case reply with: $REPLY_CMD" \
     2>/dev/null &
 fi

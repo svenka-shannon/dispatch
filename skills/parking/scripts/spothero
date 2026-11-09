@@ -8,9 +8,18 @@
   spothero "Sacramento Convention Center" --date 2026-10-24 --from 09:00 --to 18:00
   spothero "38.5719,-121.4950" --date today --from 18:30 --to 22:00 --sort price --limit 5
   spothero "Chase Center SF" --date 2026-11-02 --from 17:00 --to 23:30 --json
+  spothero "710 Commercial St, San Francisco, CA" --date tomorrow --from 18:00 --to 21:00 --vehicle "Tesla Model Y"
 
 Prints the cheapest/closest options with total price (fees included), walk time, rating and the
 SpotHero search URL so the user can book. NEVER books: booking needs the user's SpotHero account.
+
+--vehicle "<Make Model>" is a real filter. It looks up SpotHero's vehicle type, asks SpotHero's
+search API which garages report "Vehicle Size Exceeded" for it, and drops those garages. It's the
+same check as the web UI's Vehicle Type filter. If the lookup fails, it prints a loud warning and
+filters NOTHING.
+
+Every run ends with a PRE-BOOK CHECKLIST. With --json it's in "checklist", and
+"free_parking_checked" is always false: this script can't search for free lots.
 """
 from __future__ import annotations
 import argparse, json, re, subprocess, sys, time
@@ -19,6 +28,11 @@ from pathlib import Path
 import httpx
 
 CHROME = Path.home() / ".claude/skills/chrome-control/scripts/chrome"
+UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) dispatch-spothero/1.1"}
+VEHICLE_TYPES = "https://spothero.com/api/v1/vehicle-types/"
+SEARCH_API = "https://api.spothero.com/v2/search/transient"
+SIZE_REASON = "Vehicle Size Exceeded"
+CAP = 100
 
 
 def geocode(q: str) -> tuple[float, float, str]:
@@ -50,8 +64,8 @@ def parse(text: str) -> list[dict]:
                 rec["distance"] = w.strip("()")
             elif re.fullmatch(r"\d\.\d", w) and not rec["rating"]:
                 rec["rating"] = float(w)
-            elif re.fullmatch(r"\(\d+\)", w) and not rec["reviews"]:
-                rec["reviews"] = int(w.strip("()"))
+            elif (m := re.fullmatch(r"\((\d+(?:\.\d+)?)(K?)\)", w)) and not rec["reviews"]:
+                rec["reviews"] = int(float(m.group(1)) * (1000 if m.group(2) else 1))
             elif re.fullmatch(r"\d+(?:\.\d\d)?", w) and rec["total"] is None:
                 rec["total"] = float(w)
             if w == "Book Now":
@@ -65,6 +79,67 @@ def parse(text: str) -> list[dict]:
     return uniq
 
 
+def lookup_vehicle(query: str) -> dict:
+    """Resolve "<Make Model>" to a SpotHero vehicle type. Raises ValueError if no unambiguous match."""
+    r = httpx.get(VEHICLE_TYPES, params={"search": query}, headers=UA, timeout=20)
+    r.raise_for_status()
+    cands = (r.json().get("data") or {}).get("results") or []
+    q = " ".join(query.lower().split())
+    exact = [c for c in cands if (c.get("display_description") or "").lower() == q]
+    if exact:
+        return exact[0]
+    toks = q.split()
+    partial = [c for c in cands if all(t in (c.get("display_description") or "").lower() for t in toks)]
+    if len(partial) == 1:
+        return partial[0]
+    names = ", ".join(c.get("display_description", "?") for c in (partial or cands)) or "none"
+    raise ValueError(f"no unique SpotHero vehicle type for {query!r} (candidates: {names})")
+
+
+def size_check(lat: float, lng: float, s: datetime, e: datetime, info: dict) -> tuple[set[str], set[str]]:
+    """Ask SpotHero's search API, with this vehicle, which garages it doesn't fit.
+    Returns (titles that are too small, all titles the API returned)."""
+    params = {"lat": lat, "lon": lng, "starts": f"{s:%Y-%m-%dT%H:%M:%S}", "ends": f"{e:%Y-%m-%dT%H:%M:%S}",
+              "vehicle_info_id": info["id"], "oversize": str(bool(info.get("oversize"))).lower(),
+              "show_unavailable": "true", "include_walking_distance": "true", "sort_by": "relevance"}
+    r = httpx.get(SEARCH_API, params=params, headers=UA, timeout=30)
+    r.raise_for_status()
+    results = r.json().get("results") or []
+    if not results:
+        raise ValueError("SpotHero search API returned no garages for the vehicle check")
+    too_small, seen = set(), set()
+    for x in results:
+        title = ((x.get("facility") or {}).get("common") or {}).get("title")
+        if not title:
+            continue
+        seen.add(title)
+        if SIZE_REASON in ((x.get("availability") or {}).get("unavailable_reasons") or []):
+            too_small.add(title)
+    return too_small, seen
+
+
+def checklist(place: str, s: datetime, veh: dict | None) -> list[str]:
+    if veh is None:
+        fit = ("Vehicle fit: NOT checked. Rerun with --vehicle \"<Make Model>\" or use the web UI's "
+               "Vehicle Type filter, then read the pick's 'Things You Should Know'.")
+    elif veh["filter_applied"]:
+        fit = (f"Vehicle fit: filtered for {veh['matched']} ({len(veh['hidden'])} garage(s) hidden as too small"
+               + (f"; {len(veh['unverified'])} shown result(s) not in SpotHero's size check, so fit is unverified"
+                  if veh["unverified"] else "")
+               + "). Still read the pick's 'Things You Should Know'.")
+    else:
+        fit = ("Vehicle fit: NOT checked, the --vehicle filter was NOT applied (see warning). Use the web UI's "
+               "Vehicle Type filter before booking.")
+    return [
+        f"Free parking: web/map search done for free, public or validated lots and street rules near {place}? "
+        "SpotHero only lists PAID garages.",
+        fit,
+        f"Live ETA vs start {s:%a %-I:%M%p}: if he'll arrive before the start, move the start time "
+        "(QR gates reject early passes).",
+        f"Owner picked an option (A/B/C text) and the total is under the ${CAP} cap? Never book unprompted.",
+    ]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("place")
@@ -73,6 +148,8 @@ def main() -> int:
     ap.add_argument("--to", dest="end", required=True, help="HH:MM 24h (next day if earlier than --from)")
     ap.add_argument("--sort", choices=["price", "walk", "rating"], default="price")
     ap.add_argument("--limit", type=int, default=6)
+    ap.add_argument("--vehicle", metavar="MAKE MODEL",
+                    help='e.g. "Tesla Model Y": hide garages SpotHero says the car does not fit')
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args()
 
@@ -93,23 +170,60 @@ def main() -> int:
             break
         time.sleep(3)
     res = parse(text)
+
+    veh = None
+    if a.vehicle:
+        veh = {"query": a.vehicle, "matched": None, "vehicle_info_id": None, "oversize": None,
+               "filter_applied": False, "hidden": [], "unverified": [], "warning": None}
+        try:
+            info = lookup_vehicle(a.vehicle)
+            veh.update(matched=info.get("display_description"), vehicle_info_id=info["id"],
+                       oversize=bool(info.get("oversize")))
+            too_small, seen = size_check(lat, lng, s, e, info)
+            veh["hidden"] = sorted(r["name"] for r in res if r["name"] in too_small)
+            res = [r for r in res if r["name"] not in too_small]
+            veh["unverified"] = [r["name"] for r in res if r["name"] not in seen]
+            veh["filter_applied"] = True
+        except (httpx.HTTPError, ValueError, KeyError) as ex:
+            veh["warning"] = (f"VEHICLE FILTER NOT APPLIED ({ex}). These results are NOT filtered by vehicle size. "
+                              "Use the web UI's Vehicle Type filter on the URL below before booking.")
+
     key = {"price": lambda r: r["total"],
            "walk": lambda r: int(r["walk"].split()[0]),
            "rating": lambda r: -(r["rating"] or 0)}[a.sort]
     res.sort(key=key)
     res = res[:a.limit]
+    checks = checklist(a.place, s, veh)
     if a.json:
-        print(json.dumps({"place": label, "start": s.isoformat(), "end": e.isoformat(), "url": url, "results": res}, indent=2))
+        out = {"place": label, "start": s.isoformat(), "end": e.isoformat(), "url": url,
+               "checklist": checks, "free_parking_checked": False, "vehicle": veh, "results": res}
+        print(json.dumps(out, indent=2))
+        if veh and veh["warning"]:
+            print("WARNING: " + veh["warning"], file=sys.stderr)
         return 0 if res else 1
     print(f"{label}\n{s:%a %b %-d %-I:%M%p} → {e:%a %-I:%M%p}")
+    if veh:
+        if veh["filter_applied"]:
+            print(f"vehicle: {veh['matched']} (SpotHero id {veh['vehicle_info_id']}"
+                  f"{', oversize' if veh['oversize'] else ''}): hid {len(veh['hidden'])} garage(s) it doesn't fit"
+                  + (f": {'; '.join(veh['hidden'])}" if veh["hidden"] else ""))
+            if veh["unverified"]:
+                print(f"fit unverified (not in SpotHero's size check): {'; '.join(veh['unverified'])}")
+        else:
+            print("WARNING: " + veh["warning"])
+    rc = 0
     if not res:
         print("no results parsed — open the URL:\n" + url)
-        return 1
+        rc = 1
     for r in res:
         stars = f" ★{r['rating']} ({r['reviews']})" if r["rating"] else ""
         print(f"${r['total']:.2f}  {r['walk']} walk  {r['name']}{stars}")
-    print(url)
-    return 0
+    if res:
+        print(url)
+    print("\nPRE-BOOK CHECKLIST (do all of these before booking):")
+    for c in checks:
+        print(f"  [ ] {c}")
+    return rc
 
 
 if __name__ == "__main__":

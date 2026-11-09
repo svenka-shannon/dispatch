@@ -59,8 +59,11 @@ The discovery subagent:
 
 1. **Reads each transcript** sequentially:
    ```
-   uv run ~/.claude/skills/sms-assistant/scripts/read_transcript.py --session {SESSION_NAME} --limit 50
+   uv run ~/.claude/skills/sms-assistant/scripts/read_transcript.py --session {SESSION_NAME} --current --since 24h --limit 400
    ```
+   - **`--current` is mandatory here.** Without it, read_transcript.py reads the session's PREVIOUS transcript (that default exists for session-startup callers), so a nightly run would analyze stale chats.
+   - `--since 24h` streams the whole file, keeps only entries from the last 24h, and pulls in every transcript file of the session modified in that window (oldest first), so a session that restarted mid-day isn't missed. `--limit 400` keeps the most recent 400 entries in the window.
+   - **Check the header** before analyzing: each `# Modified:` line (local time) should be today, and `# Window: since <UTC ISO> (N entries)` confirms the window. `(No entries since <ISO>)` means the session had no activity in the window: skip it, don't fall back to older transcripts.
    If a transcript read fails, skip it and note the skip.
 
 2. **After reading ALL transcripts**, identifies skill opportunities using these signals:

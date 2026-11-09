@@ -325,3 +325,73 @@ class TestDualPathDivergence:
         assert r["fired_count"] == 1
         assert r["last_error"] is None
         assert r["next_fire"] != "2026-03-14T13:00:00Z"
+
+
+# ─── Injected handling guidance ──────────────────────────────────
+
+
+class TestInjectedHandlingGuidance:
+    """The legacy inject must carry judgment guidance, not a fixed 'Working on it' script."""
+
+    async def _inject_msg(self, r, late=False):
+        session = FakeSession()
+        poller, backend = make_poller(sessions={_normalized("+15551234567"): session})
+        poller.reminders = [r]
+        await poller._fire_reminder(r, late=late)
+        session.inject.assert_called_once()
+        return session.inject.call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_no_fixed_action_required_script(self):
+        msg = await self._inject_msg(make_reminder(title="text Eric: time to go to the bank"))
+        assert "ACTION REQUIRED" not in msg
+        assert "Working on it now" not in msg
+
+    @pytest.mark.asyncio
+    async def test_guidance_appended_verbatim(self):
+        from assistant.manager import REMINDER_HANDLING_GUIDANCE
+        msg = await self._inject_msg(make_reminder())
+        assert msg.endswith(REMINDER_HANDLING_GUIDANCE)
+
+    @pytest.mark.asyncio
+    async def test_guidance_covers_nudge_task_recheck_and_override(self):
+        from assistant.manager import REMINDER_HANDLING_GUIDANCE as g
+        assert "send ONLY that message" in g
+        assert "on it" in g
+        assert "send nothing" in g
+        assert "override these defaults" in g
+
+    @pytest.mark.asyncio
+    async def test_title_block_precedes_guidance(self):
+        msg = await self._inject_msg(make_reminder(title="re-check X; tell Eric only if Y"))
+        assert msg.index("re-check X; tell Eric only if Y") < msg.index("---END REMINDER---")
+        assert msg.index("---END REMINDER---") < msg.index("HOW TO HANDLE THIS REMINDER")
+
+    @pytest.mark.asyncio
+    async def test_cron_and_late_reminders_also_get_guidance(self):
+        r = make_reminder(schedule_type="cron", schedule_value="0 9 * * *",
+                          next_fire="2026-03-14T13:00:00Z")
+        msg = await self._inject_msg(r, late=True)
+        assert "[LATE:" in msg
+        assert "[Schedule: 0 9 * * *" in msg
+        assert "HOW TO HANDLE THIS REMINDER" in msg
+        assert "ACTION REQUIRED" not in msg
+
+    @pytest.mark.asyncio
+    async def test_spawn_target_gets_guidance(self):
+        session = FakeSession()
+        poller, backend = make_poller()
+        r = make_reminder(id="sp1", target="spawn")
+        spawn_id = f"{_normalized('+15551234567')}-spawn-sp1"
+
+        async def _create(contact, name, tier):
+            backend.sessions[name] = session
+        backend.create_session.side_effect = _create
+        poller.reminders = [r]
+
+        await poller._fire_reminder(r)
+
+        assert spawn_id in backend.sessions
+        msg = session.inject.call_args[0][0]
+        assert "HOW TO HANDLE THIS REMINDER" in msg
+        assert "Working on it now" not in msg

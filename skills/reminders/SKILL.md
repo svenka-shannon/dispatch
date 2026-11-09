@@ -32,9 +32,7 @@ Reminders operate in two modes:
 
 ---
 
-**IMPORTANT**: Reminders are TASKS FOR CLAUDE TO EXECUTE, not text notifications to the user. When a reminder fires, Claude should DO the task described in the reminder title, then report results to the user.
-
-Example: "Check the weather and text forecast" → Claude checks weather API, then texts the user the forecast.
+**IMPORTANT**: The reminder title is an instruction to Claude, delivered into the session when it fires. It can be a task ("Check the weather and text forecast" → check, then text the forecast), a simple nudge/relay ("text <person>: time to go to the bank" → send just that), or a quiet re-check ("re-check X; tell <person> only if Y"). Write any reporting rules into the title - they override the defaults below.
 
 ## Add a Reminder (Legacy Mode)
 
@@ -68,7 +66,7 @@ echo "$ID"   # e.g. abc12345
 
 ### Target Types
 
-- **fg** (default): Inject into the contact's foreground session. Session texts the user when starting/finishing.
+- **fg** (default): Inject into the contact's foreground session.
 - **spawn**: Create a fresh agent SDK session for this task. Good for isolated, long-running tasks.
 
 ## Add a Reminder (Event Mode)
@@ -188,10 +186,31 @@ claude-assistant remind next "0 9 * * *" --tz "Asia/Tokyo"
 1. Reminders stored in `~/dispatch/state/reminders.json`
 2. Daemon polls every 5 seconds for due reminders
 3. When due: produces `reminder.due` event to bus ("reminders" topic, keyed by chat_id) AND injects directly into session (dual path during transition)
-4. Session executes task and reports results
+4. Session handles it per the guidance block (see "What the agent receives" below)
 5. On success: `once` reminders deleted, `cron` reminders advance to next fire time
 6. On failure: retries 3 times with exponential backoff (1min, 2min, 4min)
 7. After 3 failures: marked dead, admin alerted
+
+### What the agent receives when a reminder fires
+
+Legacy (contact) reminders are injected into the session as:
+
+```
+---REMINDER [2026-11-08 03:00 PM PST]---
+<reminder title>
+---END REMINDER---
+
+[LATE: N minutes after scheduled time (...)]   <- only if fired late (catch-up)
+[Schedule: <cron> in <tz>]                     <- only for cron reminders
+
+HOW TO HANDLE THIS REMINDER (use judgment):
+- Simple nudge/relay (e.g. "text <person>: ..."): send ONLY that message, naturally worded. No "working on it" text.
+- Real task to execute: you may send one short "on it" text, then do it, then text the result.
+- Re-check where nothing changed or there's nothing to report: send nothing.
+- Reporting rules in the reminder text itself (e.g. "tell X only if...", "don't re-ping") override these defaults.
+```
+
+The guidance block is `REMINDER_HANDLING_GUIDANCE` in `assistant/manager.py` (tests: `tests/unit/test_reminder_bus.py::TestInjectedHandlingGuidance`). There is no fixed "Reminder: X. Working on it now..." script anymore. Generalized (`--event`) reminders don't get this block - they produce their bus event instead.
 
 ### Bus Integration
 

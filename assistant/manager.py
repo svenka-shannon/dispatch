@@ -1089,6 +1089,17 @@ class TestMessageWatcher(threading.Thread):
         return msg
 
 
+# Appended to every legacy (contact) reminder injection. Judgment guidance, not a
+# fixed script: simple nudges and quiet re-checks must not trigger "working on it" texts.
+REMINDER_HANDLING_GUIDANCE = (
+    "\nHOW TO HANDLE THIS REMINDER (use judgment):\n"
+    "- Simple nudge/relay (e.g. \"text <person>: ...\"): send ONLY that message, naturally worded. No \"working on it\" text.\n"
+    "- Real task to execute: you may send one short \"on it\" text, then do it, then text the result.\n"
+    "- Re-check where nothing changed or there's nothing to report: send nothing.\n"
+    "- Reporting rules in the reminder text itself (e.g. \"tell X only if...\", \"don't re-ping\") override these defaults."
+)
+
+
 class ReminderPoller:
     """
     Native reminder poller using JSON-based storage.
@@ -1456,7 +1467,7 @@ class ReminderPoller:
             msg += f"\n[Schedule: {r['schedule']['value']} in {tz}]\n"
 
         target = r.get("target", "fg")
-        msg += "\nACTION REQUIRED:\n1. TEXT the user: \"Reminder: [task]. Working on it now...\"\n2. EXECUTE the task\n3. TEXT the user the results when done"
+        msg += REMINDER_HANDLING_GUIDANCE
 
         # Inject into session based on target
         normalized = normalize_chat_id(chat_id)

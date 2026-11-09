@@ -1,0 +1,139 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pyyaml>=6", "pillow>=10", "kokoro-onnx", "soundfile", "numpy"]
+# ///
+"""Narrated, realistic assembly videos rendered with Blender (Eevee) from STL parts.
+
+Subcommands:
+  narrate narration.yaml AUDIO_DIR        Kokoro TTS per segment -> narration.wav + timeline.json
+  render  config.yaml FRAMES_DIR [--draft] [--step N] [--only F,F] [--procs 3] [--samples 14]
+  mux     FRAMES_DIR AUDIO_DIR OUT.mp4 [--step N] [--crf 24]
+
+narration.yaml: {voice: af_heart, speed: 1.0, segments: [{id, caption, say, title?, subtitle?}]}
+  First segment = intro, last = outro (the finished assembly is shown); the rest are steps.
+  Each segment lasts lead + spoken clip + tail, so animation follows the narration.
+config.yaml: {stl_dir, timeline, parts: {stl_name: "petg:#E2742B"}, movers: [...], cameras: {...}}
+  See ~/.claude/skills/cad/SKILL.md for the full schema.
+"""
+import argparse, json, math, os, subprocess, sys, tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+BLENDER = os.environ.get("BLENDER", "/Applications/Blender.app/Contents/MacOS/Blender")
+
+
+def narrate(a):
+    import numpy as np, soundfile as sf, yaml
+    from kokoro_onnx import Kokoro
+    cfg = yaml.safe_load(open(a.script))
+    out = Path(a.outdir); out.mkdir(parents=True, exist_ok=True)
+    m = Path.home() / ".claude/skills/tts/models"
+    k = Kokoro(str(m / "kokoro-v1.0.onnx"), str(m / "voices-v1.0.bin"))
+    segs = cfg["segments"]; pieces, tl, t, sr = [], [], 0.0, 24000
+    for i, seg in enumerate(segs):
+        audio, sr = k.create(seg["say"], voice=cfg.get("voice", "af_heart"), speed=cfg.get("speed", 1.0), lang="en-us")
+        audio = np.asarray(audio, dtype=np.float32)
+        clip = len(audio) / sr
+        lead = 0.8 if i == 0 else a.lead
+        tail = 2.5 if i == len(segs) - 1 else a.tail
+        pieces += [np.zeros(int(lead * sr), np.float32), audio, np.zeros(int(tail * sr), np.float32)]
+        tl.append({**{k2: seg[k2] for k2 in seg if k2 != "say"}, "say": seg["say"], "start": round(t, 3),
+                   "speech_start": round(t + lead, 3), "speech_end": round(t + lead + clip, 3),
+                   "duration": round(lead + clip + tail, 3)})
+        t += lead + clip + tail
+    sf.write(out / "narration.wav", np.concatenate(pieces), sr)
+    json.dump({"total": round(t, 3), "segments": tl}, open(out / "timeline.json", "w"), indent=1)
+    for s in tl:
+        print(f"{s['id']:14s} start {s['start']:7.2f}  dur {s['duration']:6.2f}")
+    print("total", round(t, 2))
+
+
+def render(a):
+    import yaml
+    cfg = yaml.safe_load(open(a.config))
+    base = Path(a.config).resolve().parent
+    for key in ("stl_dir", "timeline"):
+        cfg[key] = str((base / os.path.expanduser(cfg[key])).resolve())
+    tl = json.load(open(cfg["timeline"]))
+    total = int(math.ceil(tl["total"] * a.fps))
+    cj = Path(tempfile.mkdtemp(prefix="cba_")) / "config.json"; cj.write_text(json.dumps(cfg))
+    Path(a.out).mkdir(parents=True, exist_ok=True)
+    common = [BLENDER, "--background", "--python", str(HERE / "cad_blender_assembly_bpy.py"), "--",
+              "--config", str(cj), "--out", a.out, "--fps", str(a.fps), "--samples", str(a.samples),
+              "--res", a.res, "--step", str(a.step)]
+    if a.draft: common.append("--draft")
+    if a.only:
+        procs = [subprocess.Popen(common + ["--only", a.only])]
+    else:
+        chunk = math.ceil(total / a.procs / a.step) * a.step
+        procs = [subprocess.Popen(common + ["--start", str(s), "--end", str(min(total, s + chunk))],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                 for s in range(0, total, chunk)]
+    rc = [p.wait() for p in procs]
+    print(json.dumps({"frames_dir": a.out, "total_frames": total, "exit_codes": rc}))
+
+
+def mux(a):
+    from PIL import Image, ImageDraw, ImageFont
+    tl = json.load(open(Path(a.audio) / "timeline.json"))
+    W, H = Image.open(sorted(Path(a.frames).glob("f_*.png"))[0]).size
+    S = W / 1280; tmp = Path(tempfile.mkdtemp(prefix="cbacap_"))
+
+    def font(size, bold=True):
+        try: return ImageFont.truetype("/System/Library/Fonts/Avenir Next.ttc", int(size * S), index=2 if bold else 0)
+        except Exception: return ImageFont.load_default()
+
+    segs = tl["segments"]; steps = segs[1:-1]; caps = []
+    for i, seg in enumerate(segs):
+        im = Image.new("RGBA", (W, H), (0, 0, 0, 0)); d = ImageDraw.Draw(im)
+        if i in (0, len(segs) - 1):
+            title = seg.get("title", seg["caption"]); sub = seg.get("subtitle", "")
+            f1, f2 = font(54), font(26, bold=False)
+            bw = max(d.textlength(title, font=f1), d.textlength(sub, font=f2)) + 80 * S
+            x0 = (W - bw) / 2; y0 = H * 0.05; hh = (120 if sub else 80) * S
+            d.rounded_rectangle([x0, y0, x0 + bw, y0 + hh], radius=18 * S, fill=(12, 14, 18, 170))
+            d.text((W / 2, y0 + 44 * S), title, font=f1, fill=(255, 255, 255, 255), anchor="mm")
+            if sub: d.text((W / 2, y0 + 92 * S), sub, font=f2, fill=(225, 228, 232, 255), anchor="mm")
+        else:
+            n = steps.index(seg) + 1
+            text = seg["caption"].split(". ", 1)[-1] if seg["caption"][:3].strip(". ").isdigit() else seg["caption"]
+            f = font(30); bw = d.textlength(text, font=f) + 60 * S; x0 = (W - bw) / 2; y0 = H - 92 * S
+            d.rounded_rectangle([x0, y0, x0 + bw, y0 + 56 * S], radius=14 * S, fill=(12, 14, 18, 178))
+            d.text((W / 2, y0 + 28 * S), text, font=f, fill=(255, 255, 255, 255), anchor="mm")
+            fb = font(24); badge = f"STEP {n} / {len(steps)}"; bw2 = d.textlength(badge, font=fb) + 36 * S
+            d.rounded_rectangle([28 * S, 26 * S, 28 * S + bw2, 70 * S], radius=12 * S, fill=(226, 116, 43, 225))
+            d.text((28 * S + bw2 / 2, 48 * S), badge, font=fb, fill=(255, 255, 255, 255), anchor="mm")
+        p = tmp / f"cap_{i:02d}.png"; im.save(p); caps.append((p, seg))
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-framerate", f"{a.fps / a.step}", "-pattern_type", "glob",
+           "-i", str(Path(a.frames) / "f_*.png"), "-i", str(Path(a.audio) / "narration.wav")]
+    for p, _ in caps: cmd += ["-i", str(p)]
+    fc, last = [], "[0:v]"
+    if a.step > 1: fc.append(f"{last}fps={a.fps}[v0]"); last = "[v0]"
+    for k, (p, seg) in enumerate(caps):
+        st = seg["start"] + (0.4 if k == 0 else 0.15); en = seg["start"] + seg["duration"] - 0.05
+        fc.append(f"{last}[{k + 2}:v]overlay=0:0:enable='between(t,{st:.2f},{en:.2f})'[c{k}]"); last = f"[c{k}]"
+    T = tl["total"]
+    fc.append(f"{last}fade=t=in:st=0:d=0.6,fade=t=out:st={T - 1.0:.2f}:d=1.0,format=yuv420p[vout]")
+    fc.append(f"[1:a]afade=t=in:st=0:d=0.3,afade=t=out:st={T - 1.0:.2f}:d=1.0[aout]")
+    cmd += ["-filter_complex", ";".join(fc), "-map", "[vout]", "-map", "[aout]", "-c:v", "libx264",
+            "-preset", "slow", "-crf", str(a.crf), "-r", str(a.fps), "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart", "-t", f"{T:.2f}", a.out]
+    subprocess.run(cmd, check=True)
+    print(json.dumps({"out": a.out, "bytes": os.path.getsize(a.out), "duration": T}))
+
+
+ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+sub = ap.add_subparsers(dest="cmd", required=True)
+n = sub.add_parser("narrate"); n.add_argument("script"); n.add_argument("outdir")
+n.add_argument("--lead", type=float, default=0.5); n.add_argument("--tail", type=float, default=0.9)
+r = sub.add_parser("render"); r.add_argument("config"); r.add_argument("out")
+r.add_argument("--draft", action="store_true"); r.add_argument("--step", type=int, default=1)
+r.add_argument("--only", default=""); r.add_argument("--procs", type=int, default=3)
+r.add_argument("--samples", type=int, default=14); r.add_argument("--fps", type=int, default=24)
+r.add_argument("--res", default="1280x720")
+m = sub.add_parser("mux"); m.add_argument("frames"); m.add_argument("audio"); m.add_argument("out")
+m.add_argument("--step", type=int, default=1); m.add_argument("--crf", type=int, default=24)
+m.add_argument("--fps", type=int, default=24)
+a = ap.parse_args()
+{"narrate": narrate, "render": render, "mux": mux}[a.cmd](a)

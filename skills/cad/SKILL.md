@@ -190,9 +190,42 @@ Tips:
 - `mode: use` can't see the assembly's top-level variables, so write numbers in `part`, or switch to `mode: include` and silence the top-level geometry with a guard variable in `defines`.
 - STL-only projects can omit the `.scad` argument and use `stl:` + `at:` for every step.
 
-**Fallback: Blender** (`/blender` skill). Use it for photoreal renders, materials, or a model OpenSCAD can't load.
-Export each part to STL, import the parts into Blender, keyframe each object's location from its exploded offset to 0,
-render with Cycles or EEVEE, and encode with ffmpeg the same way.
+**Realistic + narrated: `cad-blender-assembly`** (Blender EEVEE). Use it when someone wants the video to look real
+(PETG plastic with layer lines, brushed-metal rods and screws, a wooden bench, soft area lights, shadows, depth of
+field, a moving camera) and/or wants voice narration. Blender comes from `brew install --cask blender`, and v5.2
+renders headless fine on macOS. The pipeline has three subcommands:
+```bash
+S=~/.claude/skills/cad/scripts/cad-blender-assembly
+$S narrate narration.yaml /tmp/x/audio          # Kokoro TTS -> narration.wav + timeline.json (segment timings)
+$S render  config.yaml /tmp/x/draft --draft --step 3   # half-res, every 3rd frame: check before the final
+$S render  config.yaml /tmp/x/frames --procs 3 --samples 14   # 1280x720 @24fps, 3 Blender processes in parallel
+$S mux     /tmp/x/frames /tmp/x/audio out.mp4 [--step 3 for a draft]   # subtitles + step badge + AAC narration
+```
+- **narration.yaml** is `{voice: af_heart, segments: [{id, caption, say, title?, subtitle?}]}`. The first segment is
+  the intro and the last is the outro (both show the finished model, with a title card from `title`/`subtitle`).
+  Every other segment is one step. Each segment lasts lead (0.5 s) + spoken clip + tail (0.9 s), so the animation is
+  timed by the narration. Spell out the spoken text phonetically (`M three by eight`, `H X seven eleven`), or Kokoro
+  reads part numbers as huge numbers. Keep the compact form (`M3 x 8`) in `caption`.
+- **config.yaml**: `stl_dir`, `timeline`, and `scene_radius` (mm; scales the bench and the light rig, which is tuned
+  for about 600). Also `floor_z` (mm, the bench top) and `parts: {stl_name: material}`. Materials are `petg[:#hex]`,
+  `petg_matte`, `steel`, `alu`, `screw`, `brass`, `rubber`, `pcb[:#hex]`, `chip` and `mdf`.
+  `movers:` is a list of `{step, parts: [stl names], offset: [x,y,z] mm, delay, dur, split, sort_axis, stagger, mirror, spin}`.
+  Each mover appears when its step starts, sits at `offset`, then eases home over `dur` seconds, starting `delay`
+  seconds after that step's speech begins. With `split: true`, each loose piece of the first STL becomes its own
+  mover, staggered by `stagger`, and loose pieces of the other listed STLs attach to the nearest one (for example,
+  O-rings to their roller). `mirror: y` flips the offset for pieces on the -y side. `spin: 3` turns a screw 3 times
+  as it drives in. Any part not named in a mover stays static (a backing board, for example).
+  `cameras: {segment_id: [[tx,ty,tz], dist, azimuth, elevation, drift_deg_per_s, fstop]}`: azimuth 0 looks from -Y;
+  set the distance to about 250 mm for close-ups of small parts. The camera eases between framings, drifts and dollies in slowly.
+- STLs must already be at their assembled positions (mm). The easiest way is one OpenSCAD wrapper with
+  `part = "..."` switches that call the assembly's `asm_*` modules, exported with `openscad --backend=manifold -D 'part="x"'`.
+  Export a separate STL per material, and add visual-only hardware (rods, screws, PCBs) there.
+- Performance on an M4: about 2.5 frames/s at 1280x720 with 14 samples and 3 processes, so a 130 s video renders in
+  about 21 min. A draft (`--draft --step 3`) takes about 3 min. Extract frames from the draft MP4 with
+  `ffmpeg -ss T -i draft.mp4 -frames:v 1` and READ them.
+  Typical draft fixes: overexposure (lower the light power), a close-up hidden behind a big part (orbit the camera
+  to the other side, e.g. azimuth 158), title cards covering the model (they go at the top), floating parts (add the mount/bracket).
+- Worked example: `~/code/riftbound-sorter/cad/render_v2/` (parts.scad, export_stls.sh, narration.yaml, blender-config.yaml).
 
 ## Rule: a requested video must be a video
 If the owner asks for a **video** (assembly guide, "show me how to put it together", animation), send an **MP4**, plus a

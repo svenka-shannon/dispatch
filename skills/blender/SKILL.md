@@ -1,11 +1,13 @@
 ---
 name: blender
-description: 3D rendering and animation with Blender. Build from source for macOS Tahoe compatibility. Trigger words - blender, 3d, render, animation, murmuration.
+description: 3D rendering and animation with Blender (Homebrew cask, headless EEVEE works). Trigger words - blender, 3d, render, animation, murmuration.
 ---
 
 # Blender Skill
 
-Blender is a free 3D creation suite for modeling, animation, rendering, and more. On macOS Tahoe (26.x), the official binaries hang on CLI startup due to dyld compatibility issues. **Building from source fixes this.**
+Blender is a free 3D creation suite for modeling, animation, rendering, and more.
+
+**Update (2026-11): the official Homebrew cask works headless on macOS 26.** `brew install --cask blender` installs 5.2.x, and `/Applications/Blender.app/Contents/MacOS/Blender --background --python script.py` renders EEVEE frames fine on Apple Silicon. Use that binary. The `~/blender-git` source build described below is historical and may not exist; only use it if the cask binary hangs in dyld_start. For narrated assembly videos, see `cad-blender-assembly` in the `/cad` skill.
 
 ## Quick Reference
 

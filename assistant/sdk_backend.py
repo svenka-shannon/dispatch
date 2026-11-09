@@ -2700,6 +2700,9 @@ Quick reference:
 
         from assistant.backends import get_backend
         backend = get_backend(source)
+        # Used by the Discord context block below. It was never defined in this (group)
+        # builder, so every Discord session failed to recreate after a restart (2026-11-08).
+        bare_chat_id = chat_id.removeprefix(backend.registry_prefix) if backend.registry_prefix else chat_id
         send_cmd = backend.send_group_cmd.replace("{chat_id}", chat_id)
         if backend.history_cmd:
             history_cmd = backend.history_cmd.replace("{chat_id}", chat_id).replace("{limit}", "20")

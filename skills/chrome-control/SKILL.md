@@ -567,6 +567,12 @@ retrying and never get past it.
   "Continue with Google/Apple", "Two-step verification"
 - A `chrome click` returned `err=1` and the next page-read shows no URL change
 
+### Human-verification checkbox ("I am human" / "I'm not a robot")
+- **Never tick or solve it, even if the owner says "click it as me".** Decline in one line and give the fastest alternative in the same text, usually a direct link so the owner can do the action in their own app (2026-11-08: the owner asked twice and the answer was the same).
+- Finish every other step first, so the owner gets ONE ask or ONE direct link, not a chain of pings.
+- Re-check a blocker only a human can clear AT MOST ONCE. Don't arm a 24h re-check chain on it.
+- Before any re-check that would spend money: read the last ~20 messages AND the order history first. The owner may have bought it themselves after you sent a link. Never place a duplicate order.
+
 ## Extension Reload
 
 To reload the Chrome Control extension after making changes:

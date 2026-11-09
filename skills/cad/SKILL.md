@@ -27,7 +27,7 @@ Generate 3D CAD models programmatically using CadQuery (Python) with Blender ren
 
 - **Parametric modeling**: Dimensions, hole patterns, arrays all adjustable
 - **Export formats**: STL (3D printing), STEP (CAD interchange)
-- **Rendering**: Blender Cycles GPU rendering for previews
+- **Rendering**: Blender Cycles GPU rendering for previews (`cad-render`; the `cad-blender-assembly` videos use EEVEE)
 - **Common parts**: Brackets, enclosures, mounts, spacers, adapters
 
 ## Architecture
@@ -91,7 +91,7 @@ cq.exporters.export(result, "bracket.step")
 
 ## Rendering
 
-Uses Blender Cycles with:
+`cad-render` previews use Blender Cycles (assembly videos use EEVEE, see below) with:
 - GPU acceleration (Metal on macOS)
 - 64 samples for quick preview
 - Blue metallic material
@@ -182,7 +182,7 @@ steps:
     intro_explode: [0, 0, 120]            # optional override of the intro layout position
   - caption: "Flip it over and check the feet"   # a step with no part = a camera move + caption only
     camera: "0,0,10,120,0,30,400"          # raw tx,ty,tz,rx,ry,rz,dist also accepted
-outro: {spin: true, seconds: 4, caption: "Assembly complete"}   # turntable of the finished model; false = none
+outro: {spin: true, seconds: 4, caption: "Assembly complete", zoom: 1.0}   # turntable of the finished model; false = none; zoom >1 = closer
 ```
 Tips:
 - Each `part` must already be at its assembled position. `explode` is the direction it comes **from**: screws come from `+z`, a bottom plate from `-z`.
@@ -226,6 +226,15 @@ $S mux     /tmp/x/frames /tmp/x/audio out.mp4 [--step 3 for a draft]   # subtitl
   Typical draft fixes: overexposure (lower the light power), a close-up hidden behind a big part (orbit the camera
   to the other side, e.g. azimuth 158), title cards covering the model (they go at the top), floating parts (add the mount/bracket).
 - Worked example: `~/code/riftbound-sorter/cad/render_v2/` (parts.scad, export_stls.sh, narration.yaml, blender-config.yaml).
+
+## Rule: BOM / consistency audit before sending any assembly video or guide
+Before an assembly video or guide goes to the owner (2026-11-08: the owner spotted missing items himself while watching v2):
+1. List every part, fastener, tool and consumable mentioned anywhere: narration.yaml (caption and say), steps.yaml, and the written guide.
+2. Compare that list with BOM.md, the order history (Amazon orders, package-watch) and the repo. Build a table: item | in video | in BOM | ordered | status.
+3. Check the specs: PSU amps against the summed load with headroom, calibration mass within the load-cell rating, and screw sizes against the screws actually bought.
+4. Name any placeholder or stand-in shapes in the message to the owner (e.g. "arm post is a placeholder cylinder, no CAD in repo").
+5. Verify the audio. Run `uv run ~/.claude/skills/transcribe/scripts/transcribe.py <AUDIO_DIR>/narration.wav` and compare it with the `say` text. Watch for mangled part numbers, skipped lines and drift.
+6. Report MISSING items and spec issues up front, and fix what you can BEFORE sending. Don't let the owner find them.
 
 ## Rule: a requested video must be a video
 If the owner asks for a **video** (assembly guide, "show me how to put it together", animation), send an **MP4**, plus a

@@ -321,7 +321,7 @@ If account goes on hold ("Account on hold temporarily"):
 ### Anti-bot detection
 - Use `chrome` (real browser) not scrapling for purchase flows
 - Wait 2-3 seconds between actions
-- If CAPTCHA appears, screenshot and solve manually
+- If an "I am human" checkbox/CAPTCHA appears: don't tick or solve it. See chrome-control, "Human-verification checkbox".
 
 ### Cart contamination
 Always clear cart before purchasing. Stale items hijack checkout.
@@ -362,6 +362,8 @@ chrome js <tab> "document.querySelector('[data-action=\"prime-upsell-decline\"],
 ## Keep owner round-trips to one (2026-11-02 lesson)
 
 A simple litter-bag reorder took 6 owner touches, and the owner was rightly annoyed. Rules:
+- **If the owner says "click it as me":** still decline, in one line. Send the direct `amazon.com/dp/<ASIN>` link so they can buy it in their own app in 2 taps.
+- **Pending order after you've sent a link:** before any later re-check places the order, read the recent messages and `your-orders` to see whether they already bought it. Never re-order blindly.
 - **Small consumable reorders (< $50):** pick the best-reviewed sensible option yourself. Don't send an A/B choice; state your pick in the single confirmation.
 - **Get the REAL checkout total before you quote anything.** Add to cart and go to checkout (decline Prime with `#prime-decline-button`). Read the shipping, tax and delivery date there, and check the $35 free-shipping minimum (pet supplies and similar). If adding one unit crosses that minimum, propose it in the same message. Quoting the item price alone guarantees a second "over 15%" re-approval.
 - The assistant account hits an "I am human" checkbox on product pages and at checkout, sometimes both in one order. Do every step that can trip it (add to cart, proceed to checkout) BEFORE you message the owner, so all the asks go out in one text. Do NOT pitch Subscribe & Save (owner declined it 2026-11-02).

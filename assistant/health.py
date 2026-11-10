@@ -17,7 +17,7 @@ import re
 import shutil
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -925,7 +925,12 @@ def check_quota_thresholds(usage: dict) -> list[dict[str, Any]]:
         if resets_at != "unknown":
             try:
                 _rt = datetime.fromisoformat(resets_at)
-                normalized_resets = _rt.replace(second=0, microsecond=0).isoformat()
+                # Round to the NEAREST HOUR, not just drop seconds. Resets are
+                # hour-aligned, but the API jitters around the boundary
+                # (19:59:59.9 vs 20:00:00.1), and minute precision split those into two keys,
+                # so the owner got the same 90% alert twice (2026-11-09).
+                normalized_resets = (_rt + timedelta(minutes=30)).replace(
+                    minute=0, second=0, microsecond=0).isoformat()
             except (ValueError, TypeError):
                 pass
 

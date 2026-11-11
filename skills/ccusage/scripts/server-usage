@@ -256,7 +256,7 @@ def print_summary(usage, rate_limits, method, updated_at=None):
     print(f"\n═══ Claude Server-Side Usage (via {source_label}) ═══\n")
 
     # 5-hour block
-    fh = usage.get("five_hour", {})
+    fh = (usage.get("five_hour") or {})
     fh_util = fh.get("utilization", 0)
     fh_reset = fh.get("resets_at")
     if fh_util is not None and fh_util > 0:
@@ -265,27 +265,27 @@ def print_summary(usage, rate_limits, method, updated_at=None):
         print("  5-hour block:    not active")
 
     # 7-day all models
-    sd = usage.get("seven_day", {})
+    sd = (usage.get("seven_day") or {})
     sd_util = sd.get("utilization", 0) or 0
     sd_reset = sd.get("resets_at")
     print(f"  7-day all:       {sd_util:.0f}% used  →  resets {format_reset_time(sd_reset)} {time_until(sd_reset)}")
 
     # 7-day sonnet
-    ss = usage.get("seven_day_sonnet", {})
+    ss = (usage.get("seven_day_sonnet") or {})
     if ss:
         ss_util = ss.get("utilization", 0) or 0
         ss_reset = ss.get("resets_at")
         print(f"  7-day sonnet:    {ss_util:.0f}% used  →  resets {format_reset_time(ss_reset)} {time_until(ss_reset)}")
 
     # 7-day opus
-    so = usage.get("seven_day_opus", {})
+    so = (usage.get("seven_day_opus") or {})
     if so:
         so_util = so.get("utilization", 0) or 0
         so_reset = so.get("resets_at")
         print(f"  7-day opus:      {so_util:.0f}% used  →  resets {format_reset_time(so_reset)} {time_until(so_reset)}")
 
     # Extra usage
-    eu = usage.get("extra_usage", {})
+    eu = (usage.get("extra_usage") or {})
     if eu and eu.get("is_enabled"):
         used = eu.get("used_credits", 0) or 0
         limit = eu.get("monthly_limit", 0) or 0
@@ -340,7 +340,7 @@ def main():
         return
 
     if args.reset_time:
-        reset = usage.get("seven_day", {}).get("resets_at")
+        reset = (usage.get("seven_day") or {}).get("resets_at")
         if reset:
             print(reset)
         else:
@@ -349,7 +349,7 @@ def main():
         return
 
     if args.hours_until_reset:
-        reset = usage.get("seven_day", {}).get("resets_at")
+        reset = (usage.get("seven_day") or {}).get("resets_at")
         if reset:
             dt = datetime.fromisoformat(reset)
             now = datetime.now(timezone.utc)
@@ -361,7 +361,7 @@ def main():
         return
 
     if args.check is not None:
-        util = usage.get("seven_day", {}).get("utilization", 0) or 0
+        util = (usage.get("seven_day") or {}).get("utilization", 0) or 0
         if util < args.check:
             print(f"OK: weekly usage at {util:.0f}% (under {args.check:.0f}% threshold)")
             sys.exit(0)

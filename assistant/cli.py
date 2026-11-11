@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import os
 import signal
 import socket as sock_module
@@ -612,8 +613,8 @@ def cmd_set_model(args):
 
     # Validate model
     valid_models = ["opus", "sonnet", "haiku"]
-    if model not in valid_models:
-        print(f"Error: Invalid model '{model}'. Must be one of: {', '.join(valid_models)}")
+    if model not in valid_models and not re.fullmatch(r"claude-[a-z0-9-]+", model):
+        print(f"Error: Invalid model '{model}'. Use one of {', '.join(valid_models)} or a full model ID (e.g. claude-fable-5-2)")
         return 1
 
     chat_id = _session_name_to_chat_id(session)
@@ -1521,7 +1522,7 @@ def main():
     compact_session_parser.add_argument("session", nargs="?", help="Session name (ignored — compaction is automatic)")
 
     # set-model (per-session)
-    set_model_parser = subparsers.add_parser("set-model", help="Set model for a session (opus, sonnet, haiku)")
+    set_model_parser = subparsers.add_parser("set-model", help="Set model for a session (opus, sonnet, haiku, or a full claude-* model ID)")
     set_model_parser.add_argument("session", help="Session name (imessage/_15555550100), chat_id, or contact name")
     set_model_parser.add_argument("model", help="Model to use: opus, sonnet, or haiku")
 

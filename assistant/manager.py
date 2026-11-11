@@ -1648,7 +1648,9 @@ class IPCServer:
             model = request.get("model")
             if not chat_id:
                 return {"ok": False, "error": "Missing chat_id"}
-            if model not in ("opus", "sonnet", "haiku"):
+            # Aliases, or a full model ID like "claude-fable-5-2" (2026-11-11: the owner asked
+            # to move to Fable 5.2 and the alias-only check made that impossible).
+            if model not in ("opus", "sonnet", "haiku") and not re.fullmatch(r"claude-[a-z0-9-]+", model or ""):
                 return {"ok": False, "error": f"Invalid model: {model}"}
             # Update registry with new model
             existing = self.registry.get(chat_id)

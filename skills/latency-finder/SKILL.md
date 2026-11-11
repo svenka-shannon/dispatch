@@ -204,7 +204,7 @@ You can UNION ALL across both tables for complete coverage.
             datetime(timestamp/1000,'unixepoch','localtime') as time,
             substr(payload, 1, 200) as payload_preview
      FROM sdk_events
-     WHERE event_type = 'tool_use'
+     WHERE event_type = 'tool_result'
        AND timestamp > (strftime('%s','now','-24 hours') * 1000)
        AND duration_ms IS NOT NULL
      ORDER BY duration_ms DESC
@@ -220,7 +220,7 @@ You can UNION ALL across both tables for complete coverage.
             SUM(CASE WHEN is_error = 1 THEN 1 ELSE 0 END) as error_count,
             ROUND(SUM(duration_ms), 0) as total_ms
      FROM sdk_events
-     WHERE event_type = 'tool_use'
+     WHERE event_type = 'tool_result'
        AND timestamp > (strftime('%s','now','-24 hours') * 1000)
        AND duration_ms IS NOT NULL
      GROUP BY tool_name
@@ -235,7 +235,7 @@ You can UNION ALL across both tables for complete coverage.
             ROUND(AVG(duration_ms), 1) as avg_ms,
             ROUND(MAX(duration_ms), 1) as max_ms
      FROM sdk_events
-     WHERE event_type = 'tool_use'
+     WHERE event_type = 'tool_result'
        AND timestamp > (strftime('%s','now','-24 hours') * 1000)
        AND duration_ms IS NOT NULL
      GROUP BY session_name
@@ -248,7 +248,7 @@ You can UNION ALL across both tables for complete coverage.
             COUNT(*) as count,
             ROUND(AVG(duration_ms), 1) as avg_ms
      FROM sdk_events
-     WHERE event_type = 'tool_use'
+     WHERE event_type = 'tool_result'
        AND timestamp > (strftime('%s','now','-24 hours') * 1000)
        AND duration_ms IS NOT NULL
      GROUP BY tool_name, is_error
@@ -807,7 +807,12 @@ This enables `bus reports --scanner latency-finder` to query historical scan res
 
 ## Graceful Degradation
 
-- **DuckDB not installed** — Fall back to jq/awk pipelines for perf JSONL analysis. Note the degradation.
+- **DuckDB not installed** (true on this Mac) — use `uv run --with duckdb python -c "import duckdb; print(duckdb.sql('...'))"` (same SQL), else jq/awk. Note the degradation.
+- **Daemon log location** — the daemon logs to `~/dispatch/logs/launchd.log`; `manager.log` is stale (last written Oct 3 2026). Grep launchd.log for prune/lock/compaction/LOOP_LAG lines.
+- **sdk_events duration** — `duration_ms` is only populated on `event_type='tool_result'` rows (not `tool_use`); duration queries must filter on tool_result. Gap queries can use tool_use timestamps.
+- **Self-measurement** — the weekly bug-finder/latency-finder ephemeral sessions often run at the same time and dominate the day's `tool_execution` p95 and top-20 slowest list. Exclude `session LIKE '%ephemeral-%'` before calling a tool regression.
+- **Bash command text** — sdk_events `tool_use` payload holds only the Bash *description*, not the command. To classify Bash calls (chrome, send-sms, curl…), join `tool_use_id` against the session transcripts in `~/.claude/projects/**/*.jsonl`.
+- **Discord sends** — until FIX-103 (2026-11-02 scan) lands, `send-discord` produces no `message.sent`; bus-based Discord response/unanswered numbers are inflated. Cross-check with session transcripts.
 - **No perf JSONL for today** — Fall back to yesterday's file, or most recent available. Note the data gap.
 - **Empty sdk_events** — Explorer 2 reports "no sdk_events data available" and skips. Other explorers continue.
 - **bus.db locked/missing** — Skip bus-dependent explorers, continue with perf JSONL analysis.

@@ -111,8 +111,8 @@ Prompt for the Explore subagent:
 You are a system health bug discovery agent for the Dispatch personal assistant.
 
 1. Run the debug CLI to check system health:
-   debug status 2>/dev/null
-   debug incident --since 24h 2>/dev/null
+   ~/.claude/skills/debug/scripts/debug status   # `debug` is NOT on PATH; no 2>/dev/null so a failure is visible
+   ~/.claude/skills/debug/scripts/debug incident --since 24h
 
 2. Check recent logs for errors:
    tail -100 ~/dispatch/logs/manager.log 2>/dev/null | grep -i "error\|exception\|traceback\|failed"
@@ -599,7 +599,7 @@ RUN_ID=$(date +%Y%m%d-%H%M)
 
 The `findings` array should include all ACCEPT and REFINE verdicts with their full details (id, title, severity, category, file, root_cause, suggested_fix, etc.). Refuted items go in `summary.refuted` count only, not in findings.
 
-This enables `bus reports --scanner bug-finder` to query historical scan results (stored in archive indefinitely).
+This enables `uv run python -m bus.cli reports --scanner bug-finder` (bin/bus has no `reports`) to query historical scan results (stored in archive indefinitely).
 
 ## Graceful Degradation
 
@@ -671,7 +671,7 @@ Check git history for recent changes that provide context on what was built, fix
 
 ```bash
 cd ~/dispatch && git log --oneline --since="7 days ago" -- assistant/ bus/
-cd ~/dispatch && git log --oneline --since="7 days ago" -- ~/.claude/skills/
+cd ~/dispatch && git log --oneline --since="7 days ago" -- skills/   # ~/.claude/skills is a symlink; git rejects it as outside the repo
 ```
 
 This helps you:

@@ -481,7 +481,7 @@ def main():
         spin = 360.0 if outro.get("spin", True) else 0.0
         r_end = [final["r"][0], final["r"][1], final["r"][2] + spin]
         # final assembly framing: assembled bbox (s1 camera) looks better than exploded framing
-        d_fin = s1["camera"]["distance"] * MARGIN * 1.1 if spin else final["d"]
+        d_fin = s1["camera"]["distance"] * MARGIN * 1.1 / float(outro.get("zoom", 1.0)) if spin else final["d"]
         t_fin = lift(s1["camera"]["translation"], final["r"], d_fin) if spin else final["t"]
         cams.append({"f0": f + settle, "f1": f + od, "r0": final["r"], "t0": final["t"], "d0": final["d"],
                      "r1": r_end, "t1": t_fin, "d1": d_fin, "linear": True})

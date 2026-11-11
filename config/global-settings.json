@@ -7,7 +7,7 @@
     ],
     "defaultMode": "auto"
   },
-  "model": "opus",
+  "model": "claude-fable-5-2",
   "hooks": {
     "PreToolUse": [
       {
@@ -27,6 +27,11 @@
   "skipDangerousModePermissionPrompt": true,
   "skipAutoPermissionPrompt": true,
   "autoMode": {
+    "soft_deny": [
+      "$defaults",
+      "Bash(git push upstream:*) in ~/dispatch — CLAUDE.md states upstream is fetch/PR-only and must never be pushed directly",
+      "Bash(gh pr create --repo svenflow/dispatch:*) without --web/explicit review — upstream PRs should go through the documented cherry-pick branch flow, not casual direct creation"
+    ],
     "environment": [
       "### Org-wide",
       "**Organization**: None configured",
@@ -53,11 +58,6 @@
       "**Trusted repo**: ~/dispatch (svenka-shannon/dispatch fork, public) — only this repo's own work belongs here; upstream (svenflow/dispatch) is fetch/PR-only, never a direct push target",
       "**Org-specific CLIs**: claude-assistant (dispatch daemon control: start/stop/status/restart-session/remind/commitment/health-history), uv (Python package/script runner — never bare python3/pip), chrome CLI (~/.claude/skills/chrome-control/scripts/chrome), bus CLI (python -m bus.cli), fact CLI (~/dispatch/scripts/fact)",
       "**routine under ~/dispatch/ prefix**: daemon code edits, pytest runs, uv sync/pyproject edits, reminder/task management via claude-assistant"
-    ],
-    "soft_deny": [
-      "$defaults",
-      "Bash(git push upstream:*) in ~/dispatch — CLAUDE.md states upstream is fetch/PR-only and must never be pushed directly",
-      "Bash(gh pr create --repo svenflow/dispatch:*) without --web/explicit review — upstream PRs should go through the documented cherry-pick branch flow, not casual direct creation"
     ]
   }
 }

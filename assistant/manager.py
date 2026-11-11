@@ -3866,6 +3866,15 @@ class Manager:
           - nobody has touched the Mac for >5 min (don't cut a Remote Desktop
             session out from under the owner)
           - at most once per 8 min
+
+        IDLE KEEPALIVE (2026-11-11): the gate above never covers the first text
+        after a long quiet stretch — a 09:02 text sat at Apple until the owner
+        clicked into Messages at 09:07 (socket open 35 min, 0 bytes, RST on
+        first send); the previous traffic was 9h earlier. So also bounce when
+        nothing has proven the socket alive (a message in or out, or a bounce)
+        for `idle_interval_s` (default 20 min; 0 disables). Same busy-session /
+        HID-idle / cooldown guards, so worst-case inbound lag while the Mac is
+        unattended is about one interval.
         """
         from assistant import config
         cfg = "imessage.aps_bounce"
@@ -3875,6 +3884,7 @@ class Manager:
         quiet_inbound = config.get(f"{cfg}.quiet_inbound_s", 360)
         cooldown = config.get(f"{cfg}.cooldown_s", 480)
         min_hid_idle = config.get(f"{cfg}.min_hid_idle_s", 300)
+        idle_interval = config.get(f"{cfg}.idle_interval_s", 1200)
         iface = config.get(f"{cfg}.interface", "en1")
 
         now = time.time()
@@ -3892,7 +3902,13 @@ class Manager:
             return
         since_any = now - max(last_in, last_out)
         since_in = now - last_in
-        if not (since_any < active_window and last_out > last_in and since_in > quiet_inbound):
+        stalled = since_any < active_window and last_out > last_in and since_in > quiet_inbound
+        since_alive = now - max(last_in, last_out, self._last_aps_bounce)
+        if stalled:
+            reason = "stalled"
+        elif idle_interval and since_alive > idle_interval:
+            reason = "idle_keepalive"
+        else:
             return
         busy = [n for n, s in self.sessions.sessions.items() if s.is_busy]
         if busy:
@@ -3905,7 +3921,7 @@ class Manager:
 
         self._last_aps_bounce = now
         log.warning(
-            f"APS_BOUNCE | cycling {iface} | inbound quiet {since_in:.0f}s, "
+            f"APS_BOUNCE | cycling {iface} ({reason}) | inbound quiet {since_in:.0f}s, "
             f"last outbound {now - last_out:.0f}s ago, hid_idle={hid_idle:.0f}s"
         )
         t0 = time.monotonic()
@@ -3941,6 +3957,7 @@ class Manager:
                 self._producer, "system", "imessage.aps_bounce",
                 {
                     "interface": iface,
+                    "reason": reason,
                     "inbound_quiet_seconds": round(since_in, 1),
                     "since_last_outbound_seconds": round(now - last_out, 1),
                     "hid_idle_seconds": round(hid_idle, 1),

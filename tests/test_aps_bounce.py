@@ -64,7 +64,8 @@ async def test_bounces_when_agent_waiting_and_inbound_quiet(bounces):
 @pytest.mark.parametrize("kwargs", [
     dict(last_in_ago=900, last_out_ago=950),          # user had the last word
     dict(last_in_ago=120, last_out_ago=60),           # inbound not quiet long enough
-    dict(last_in_ago=4000, last_out_ago=3600),        # conversation not active
+    # conversation not active, and a bounce 10 min ago proved the socket alive
+    dict(last_in_ago=4000, last_out_ago=3600, last_bounce=NOW - 600),
     dict(last_in_ago=900, last_out_ago=600, busy=True),       # session mid-turn
     dict(last_in_ago=900, last_out_ago=600, hid_idle=30.0),   # someone at the Mac
     dict(last_in_ago=900, last_out_ago=600, hid_idle=None),   # idle unknown → be safe
@@ -72,5 +73,24 @@ async def test_bounces_when_agent_waiting_and_inbound_quiet(bounces):
 ])
 @pytest.mark.asyncio
 async def test_does_not_bounce(bounces, kwargs):
+    await Manager._aps_bounce_if_stalled(make_self(**kwargs))
+    assert networksetup_calls(bounces) == []
+
+
+@pytest.mark.asyncio
+async def test_idle_keepalive_bounces_after_long_quiet(bounces):
+    """First-text-after-idle case (2026-11-11): no recent conversation at all."""
+    fake = make_self(last_in_ago=32000, last_out_ago=31990, last_bounce=NOW - 1300)
+    await Manager._aps_bounce_if_stalled(fake)
+    assert len(networksetup_calls(bounces)) == 2
+
+
+@pytest.mark.parametrize("kwargs", [
+    dict(last_in_ago=32000, last_out_ago=31990, last_bounce=NOW - 1300, busy=True),
+    dict(last_in_ago=32000, last_out_ago=31990, last_bounce=NOW - 1300, hid_idle=30.0),
+    dict(last_in_ago=700, last_out_ago=800),  # inbound 12 min ago proved the socket alive
+])
+@pytest.mark.asyncio
+async def test_idle_keepalive_does_not_bounce(bounces, kwargs):
     await Manager._aps_bounce_if_stalled(make_self(**kwargs))
     assert networksetup_calls(bounces) == []
